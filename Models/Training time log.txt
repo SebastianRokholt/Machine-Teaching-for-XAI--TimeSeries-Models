@@ -1,0 +1,4 @@
+Time - Epochs, num_workers, batch_size, pin_memory, approx GPU CUDA utilization
+8:37 - 5, 1, 32, False, 60%
+x:xx - 5, 1, 32, True
+x:xx - 5, 20, 32, True
