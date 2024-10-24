@@ -1,8 +1,9 @@
 # Python stuff
 venv/
+linux_venv/
 .*__pycache__.*
+.ipynb_checkpoints/
 
 # Data
 Data/
-
-
+*.parquet
