@@ -1,3 +1,6 @@
+# Environment vars
+*.env
+
 # Python stuff
 venv/
 linux_venv/
