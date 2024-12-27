@@ -1,0 +1,7 @@
+LSTM varseq 50 epochs - test metrics (skipping the first real timestep of each session):
+MSE_power : 24.675957
+RMSE_power : 4.96748998248353
+R2_power : 0.9813594968896892
+MSE_soc : 0.30558085
+RMSE_soc : 0.5527936815991058
+R2_soc : 0.9993176712946792

@@ -1,4 +1,4 @@
-Time - Epochs, num_workers, batch_size, pin_memory, approx GPU CUDA utilization
-8:37 - 5, 1, 32, False, 60%
-x:xx - 5, 1, 32, True
-x:xx - 5, 20, 32, True
+Time - Model, epochs, num_workers, batch_size, pin_memory, approx GPU CUDA utilization, approx RAM usage
+30:00 - LSTM varseq 2, 20, 8, 128, False, 50%, 3675MB + 800MB (VScode)
+58:00 - LSTM varseq 2, 50, 8, 128, False, 50%, 3675MB + 800MB (VScode)
+
