@@ -1,0 +1,5 @@
+Time - Model, epochs, num_workers, batch_size, pin_memory, approx GPU CUDA utilization, approx RAM usage
+30:00 - LSTM varseq 2, 20, 8, 128, False, 50%, 3675MB + 800MB (VScode)
+58:00 - LSTM varseq 2, 50, 8, 128, False, 50%, 3675MB + 800MB (VScode)
+ - LSTM varseq_multistep_1, 100, 24, 128, False, 45%, 2100MB + 600MB (VScode)
+ - LSTM varseq_multistep_2, 100, 32, 384, True, xxx, xxxxMB + xxxMB (VScode)

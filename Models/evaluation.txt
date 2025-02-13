@@ -1,7 +1,17 @@
 LSTM varseq 50 epochs - test metrics (skipping the first real timestep of each session):
-MSE_power : 24.675957
-RMSE_power : 4.96748998248353
-R2_power : 0.9813594968896892
-MSE_soc : 0.30558085
-RMSE_soc : 0.5527936815991058
-R2_soc : 0.9993176712946792
+Test metrics:
+MSE_power : 23.976574
+RMSE_power : 4.8965879900285465
+R2_power : 0.9821405241859751
+MSE_soc : 0.31000978
+RMSE_soc : 0.5567852167092163
+R2_soc : 0.9993076415840318
+
+
+LSTM varseq_multistep_1
+Test Macro-Averaged MSE: 27.3982 (across 12340 sequences)
+
+
+LSTM varseq_multistep_2
+Test Macro-Averaged MSE: 25.1549 (across 12341 sequences)
+
