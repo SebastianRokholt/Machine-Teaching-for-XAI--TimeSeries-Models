@@ -14,4 +14,47 @@ Test Macro-Averaged MSE: 27.3982 (across 12340 sequences)
 
 LSTM varseq_multistep_2
 Test Macro-Averaged MSE: 25.1549 (across 12341 sequences)
+RANDOM_SEED = 777
+BATCH_SIZE = 512
+NUM_WORKERS = 8
+TRAIN_MODEL = True
+MODEL_PATH = '../Models/LSTM_varseq_multistep_model_2.pth'
+HORIZON = 5  # The number of next time steps to predict
+HIDDEN_DIM = 128
+NUM_LAYERS = 4
+NUM_EPOCHS = 200
+
+
+LSTM varseq_multistep_3a
+Test Macro-Averaged MSE: 22.1597 (across 12340 sequences)  (but I have no idea what the settings were...)
+
+LSTM varseq_multistep_3b
+Test Macro-Averaged MSE: 27.7432 (across 12340 sequences)
+RANDOM_SEED = 42
+BATCH_SIZE = 256
+NUM_WORKERS = 8
+TRAIN_MODEL = True
+MODEL_PATH = '../Models/LSTM_varseq_multistep_model_4.pth'
+HORIZON = 5 
+HIDDEN_DIM = 256
+NUM_LAYERS = 3
+NUM_EPOCHS = 70
+
+
+LSTM varseq_multi-horizon_raytuned_model_1
+Test Macro-Averaged MSE: XXXX
+RANDOM_SEED = 42
+BATCH_SIZE = 256
+NUM_WORKERS = 8
+TRAIN_MODEL = True
+MODEL_PATH = '../Models/LSTM_varseq_multi-horizon_raytuned_model_1.pth'
+HORIZON = 5 
+HIDDEN_DIM = 256
+NUM_LAYERS = 4
+NUM_EPOCHS = 80
+
+
+
+
+
 

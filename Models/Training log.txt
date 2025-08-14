@@ -1,5 +1,7 @@
-Time - Model, epochs, num_workers, batch_size, pin_memory, approx GPU CUDA utilization, approx RAM usage
+watch -n0.5 -c gpustat -cp
+
+Time - Model, epochs, num_workers, batch_size, pin_memory, approx GPU CUDA utilization, approx VRAM usage, approx RAM usage
 30:00 - LSTM varseq 2, 20, 8, 128, False, 50%, 3675MB + 800MB (VScode)
 58:00 - LSTM varseq 2, 50, 8, 128, False, 50%, 3675MB + 800MB (VScode)
- - LSTM varseq_multistep_1, 100, 24, 128, False, 45%, 2100MB + 600MB (VScode)
- - LSTM varseq_multistep_2, 100, 32, 384, True, xxx, xxxxMB + xxxMB (VScode)
+96:00 - LSTM varseq_multistep_1, 100, 24, 128, False, 45%, 1.1GB, 2200MB + 600MB (VScode)
+02:45 - LSTM varseq_multistep_2, 100, 32, 512, True, 25%, 1.3GB, 4060MB + 670MB (VScode)
