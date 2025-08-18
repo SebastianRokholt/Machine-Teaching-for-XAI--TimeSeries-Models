@@ -41,18 +41,19 @@ NUM_LAYERS = 3
 NUM_EPOCHS = 70
 
 
-LSTM varseq_multi-horizon_raytuned_model_1
-Test Macro-Averaged MSE: XXXX
+LSTM_multihorizon_raytuned_model_1
+Test Macro-Averaged MSE: 25.9649 (across 12340 sequences)
 RANDOM_SEED = 42
-BATCH_SIZE = 256
+BATCH_SIZE = 64
 NUM_WORKERS = 8
 TRAIN_MODEL = True
-MODEL_PATH = '../Models/LSTM_varseq_multi-horizon_raytuned_model_1.pth'
+MODEL_PATH = '../Models/LSTM_multihorizon_raytuned_model_1.pth'
 HORIZON = 5 
-HIDDEN_DIM = 256
-NUM_LAYERS = 4
-NUM_EPOCHS = 80
-
+HIDDEN_DIM = 64
+NUM_LAYERS = 1
+NUM_EPOCHS = 
+DROPOUT = 0.0758789811305
+GRAD_CLIP_NORM = 5.0
 
 
 
