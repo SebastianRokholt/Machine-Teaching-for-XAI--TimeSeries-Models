@@ -6,7 +6,7 @@ venv/
 linux_venv/
 .*__pycache__.*
 .ipynb_checkpoints/
-bohb_lstm_tuning*/
+bohb_*_tuning*/
 
 # Data
 Data/

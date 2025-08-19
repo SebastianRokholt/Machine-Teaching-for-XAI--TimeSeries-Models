@@ -105,6 +105,7 @@ best val loss: -1.6169
 The best model's metrics were: {'epoch': 54, 'train_loss': -1.2979518801955703, 'val_loss': -1.6169393128559209, 'val_metric': 4.382302150493456, 'val_rmse_power': 6.2825125102605295, 'val_rmse_soc': 0.547973198876273, 'lr': 0.000449175275425, 'alpha_h': 0.4391422315889, 'prec_power': 2.706012010574341, 'prec_soc': 32.102298736572266, 'timestamp': 1755518645, 'checkpoint_dir_name': 'checkpoint_000026', 'should_checkpoint': True, 'done': True, 'training_iteration': 81, 'trial_id': '84126c75', 'date': '2025-08-18_14-04-05', 'time_this_iter_s': 9.791353702545166, 'time_total_s': 854.184045791626, 'pid': 13441, 'hostname': 'SR-Legion-7', 'node_ip': '172.31.29.69', 'config': {'alpha_h': 0.4391422315889, 'batch_size': np.int64(64), 'dropout': 0.164013083803, 'grad_clip_norm': np.float64(1.0), 'hidden_dim': np.int64(512), 'lr': 0.0017967011017, 'num_epochs': 100, 'num_layers': np.int64(4), 'power_weight': 0.6686376609199, 'weight_decay': 0.0006846336882}, 'time_since_restore': 589.5045168399811, 'iterations_since_restore': 54, 'experiment_tag': '2_alpha_h=0.4391,batch_size=64,dropout=0.1640,grad_clip_norm=1.0000,hidden_dim=512,lr=0.0018,num_epochs=100,num_layers=4,power_weight=0.6686,weight_decay=0.0007'}
 Running for:	00:53:41.84
 
+
 LSTM_multihorizon_raytuned_model_6
 Summary: predicts residuals with uncertainty weighting, horizon weights and Huber loss.
          with additional feature engineering (normalize power, minutes_elapsed)
@@ -117,3 +118,15 @@ NUM_EPOCHS (actual trained) = 72
 best val loss: -1.613
 The best model's metrics were: {'epoch': 72, 'train_loss': -1.3701691166830792, 'val_loss': -1.6129649872298466, 'val_metric': 4.24194259639036, 'val_rmse_power': 6.2188368471822, 'val_rmse_soc': 0.5542586522985996, 'lr': 5.008666034375e-05, 'alpha_h': 0.426515798082, 'prec_power': 2.8990845680236816, 'prec_soc': 34.74010467529297, 'timestamp': 1755528070, 'checkpoint_dir_name': 'checkpoint_000026', 'should_checkpoint': True, 'done': False, 'training_iteration': 81, 'trial_id': 'da34a3c5', 'date': '2025-08-18_16-41-11', 'time_this_iter_s': 6.602386951446533, 'time_total_s': 554.1707558631897, 'pid': 8952, 'hostname': 'SR-Legion-7', 'node_ip': '172.31.29.69', 'config': {'alpha_h': 0.426515798082, 'batch_size': np.int64(64), 'dropout': 0.0189193107502, 'grad_clip_norm': np.float64(5.0), 'hidden_dim': np.int64(256), 'lr': 0.001602773131, 'num_epochs': 150, 'num_layers': np.int64(5), 'power_weight': 0.651007686225, 'weight_decay': 1.6406025e-05}, 'time_since_restore': 485.23275876045227, 'iterations_since_restore': 72, 'experiment_tag': '51_alpha_h=0.4265,batch_size=64,dropout=0.0189,grad_clip_norm=5.0000,hidden_dim=256,lr=0.0016,num_epochs=150,num_layers=5,power_weight=0.6510,weight_decay=0.0000'}
 Running for:	00:80:00.00
+
+
+TCN_multihorizon_raytuned_model_1
+Summary: Wide TCN architecture with skip connections 
+Test Macro-Averaged MSE: 22.2621 (across 12340 sequences)
+NUM_WORKERS = 16
+HORIZON = 5 
+NUM_EPOCHS (max) = 150
+NUM_EPOCHS (actual trained) = 72
+best val loss: -1.613
+The best TCN hyperparameters are:  {'alpha_h': 0.2813091149034, 'batch_size': np.int64(32), 'dropout': 0.2485661415667, 'grad_clip_norm': np.float64(1.0), 'hidden_dim': np.int64(160), 'kernel_size': np.int64(7), 'lr': 0.0008086471705, 'num_epochs': 150, 'num_layers': np.int64(6), 'power_weight': 0.6051952415595, 'weight_decay': 3.9434847e-05}
+Running for:	01:56:05.58
