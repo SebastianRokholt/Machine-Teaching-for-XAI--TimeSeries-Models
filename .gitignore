@@ -6,6 +6,7 @@ venv/
 linux_venv/
 .*__pycache__.*
 .ipynb_checkpoints/
+.pyc
 
 # Ray Tune and BOHB results
 bohb_*_tuning*/
@@ -16,3 +17,6 @@ Data/
 
 # Notebook backups
 Notebooks/Backups/
+
+# VS Code
+.vscode

@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import MinMaxScaler
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Sampler
 
 RANDOM_SEED = 42  # same as modelling notebook
@@ -188,20 +189,59 @@ def get_session_from_loader(test_loader: DataLoader,
         if session_id is not None:
             if session_id in batch_session_ids:
                 idx = batch_session_ids.index(session_id)
-                session_id = [batch_session_ids[idx]]
+                session_id = batch_session_ids[idx]
                 X = Xb[idx:idx+1]
                 Y = Yb[idx:idx+1]
                 L = lengths[idx:idx+1]
-                return [(session_id, X, Y, L)]
+                return (session_id, X, Y, L)
         elif batch_idx is not None and session_idx is not None:
             if i == batch_idx:
-                session_id = [batch_session_ids[session_idx]]
+                session_id = batch_session_ids[session_idx]
                 X = Xb[session_idx:session_idx+1]
                 Y = Yb[session_idx:session_idx+1]
                 L = lengths[session_idx:session_idx+1]
-                return [(session_id, X, Y, L)]
+                return (session_id, X, Y, L)
 
     if session_id is not None:
         raise ValueError(f"Session ID {session_id} not found in any batch.")
     else:
         raise IndexError(f"Batch index {batch_idx} or session index {session_idx} out of range.")
+    
+
+@torch.inference_mode()
+def make_bundle_from_session(model: nn.Module, df_scaled,
+                             sid: str,
+                             device: torch.device,
+                             input_features: List[str],
+                             target_features: List[str],
+                             horizon: int,
+                             power_scaler, soc_scaler,
+                             idx_power_inp: int, idx_soc_inp: int,
+                             sort_by: str = "timestamp") -> SampleBundle:
+    """
+    Build a SampleBundle directly from a single session DataFrame (for anomaly notebook).
+    Ensures the same alignment as the modelling bundle.
+    """
+    g = df_scaled[df_scaled["charging_id"] == sid].sort_values(sort_by)
+    X = torch.tensor(g[input_features].to_numpy(np.float32))                 # (T, F)
+    y_abs = g[target_features].to_numpy(np.float32)                          # (T, C)
+    T = y_abs.shape[0]
+    Y = np.zeros((T, horizon, len(target_features)), dtype=np.float32)       # residuals
+    for h in range(1, horizon+1):
+        Y[:-h, h-1, :] = y_abs[h:, :] - y_abs[:-h, :]
+
+    X_dev = X.unsqueeze(0).to(device, non_blocking=True)    # (1, T, F)
+    L_cpu = torch.tensor([T], dtype=torch.long, device="cpu")
+    P_dev, _ = model(X_dev, L_cpu)                          # (1, T, H, C)
+    P = P_dev.squeeze(0).cpu()                              # (T, H, C)
+
+    power_true = power_scaler.inverse_transform(X[:, [idx_power_inp]].numpy()).ravel()
+    soc_true   = soc_scaler.inverse_transform(  X[:, [idx_soc_inp  ]].numpy()).ravel()
+
+    return SampleBundle(
+        batch_index=0, sample_index=0,
+        length=T, horizon=horizon, num_targets=len(target_features),
+        X_sample=X.cpu(), Y_sample=torch.from_numpy(Y), P_sample=P,
+        true_power_unscaled=power_true, true_soc_unscaled=soc_true,
+        session_id=sid
+    )
