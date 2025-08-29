@@ -134,35 +134,46 @@ def rwse_score_from_bundle(
 
 def compute_session_MRMSE(model, loader, device: torch.device, power_scaler: MinMaxScaler,
                            soc_scaler: MinMaxScaler, power_weight: float, idx_power_inp: int, 
-                           idx_soc_inp: int,  t_min_eval: int=0) -> pd.DataFrame:
+                           idx_soc_inp: int,  t_min_eval: int=0,
+                           horizon_weights_decay: float | None=None) -> pd.DataFrame:
     """
-    Returns a DataFrame with columns: session_id, error, len, and optionally per-target RMSEs.
-    Only predictions for t >= t_min_eval + 1 count towards the error metric.
+    returns a dataframe with columns: charging_id, error, length.
+    supports optional horizon weighting (exponential decay).
     """
     rows = []
+
+    H = None
+    try:
+        H = int(getattr(getattr(loader, "dataset", None), "horizon", None))
+    except Exception:
+        H = None
+
+    w_h = None
+    if H is not None and horizon_weights_decay is not None:
+        from .ad import make_horizon_weights
+        w_h = make_horizon_weights(H, decay=float(horizon_weights_decay))
+
     for session_ids, Xb, Yb, lengths in loader:
         P_res = predict_residuals(model, Xb, lengths, device=device)
-        # residuals -> absolute in scaled space
-        P_abs_scaled = reconstruct_abs_from_residuals_batch(Xb, P_res, idx_power_inp, idx_soc_inp)
-        # true absolute in scaled space: base + residual Y
-        base = torch.stack([Xb[..., idx_power_inp], Xb[..., idx_soc_inp]], dim=-1)  # (B, T, 2)
-        base = base.unsqueeze(2)  # (B, T, 1, 2) so it broadcasts over H
-        Y_abs_scaled = base + Yb  # (B, T, H, 2)
 
-        # inverse-transform only targets to original units
+        P_abs_scaled = reconstruct_abs_from_residuals_batch(Xb, P_res, idx_power_inp, idx_soc_inp)
+        base = torch.stack([Xb[..., idx_power_inp], Xb[..., idx_soc_inp]], dim=-1).unsqueeze(2)
+        Y_abs_scaled = base + Yb
+
         P_abs_np = inverse_targets_np(P_abs_scaled.cpu().numpy(), power_scaler, soc_scaler)
         Y_abs_np = inverse_targets_np(Y_abs_scaled.cpu().numpy(), power_scaler, soc_scaler)
 
-        # compute macro-RMSE per session
         errs = macro_rmse_per_session(torch.from_numpy(P_abs_np),
                                       torch.from_numpy(Y_abs_np),
                                       lengths,
                                       power_weight=power_weight, 
-                                      t_min_eval=t_min_eval)
+                                      t_min_eval=t_min_eval,
+                                      w_h=w_h)
 
         for sid, e, L in zip(session_ids, errs, lengths.tolist()):
             rows.append({"charging_id": sid, "error": float(e), "length": int(L)})
     return pd.DataFrame(rows)
+
 
 
 def compute_session_RWSE(model, df_scaled: pd.DataFrame, 

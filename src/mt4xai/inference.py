@@ -66,24 +66,33 @@ def macro_rmse_per_session(P_abs: torch.Tensor,
                            Y_abs: torch.Tensor,
                            lengths: torch.Tensor,
                            power_weight: float = 0.5, 
-                           t_min_eval: int = 0) -> np.ndarray:
+                           t_min_eval: int = 0,
+                           w_h: np.ndarray | None = None) -> np.ndarray:
     """
-    Compute a single scalar error per session:
-       (1/H) * sum_h [ w*RMSE_power(h) + (1-w)*RMSE_soc(h) ], across valid t >= t_min_eval + 1
-    Returns shape (B,) array.
+    computes one scalar error per session:
+       sum_h w_h[h] * [ w*rmse_power(h) + (1-w)*rmse_soc(h) ]
+    only timesteps t >= t_min_eval + 1 are included.
+    if w_h is None, uses uniform weights across horizons.
     """
     B, T, H, C = P_abs.shape
     errs = np.zeros(B, dtype=np.float64)
+    if w_h is None:
+        w_h = np.ones(H, dtype=np.float64) / max(1, H)
+
     for b in range(B):
         L = int(lengths[b])
-        per_h = []
+        vals, hs = [], []
         for h in range(H):
             end = L - (h + 1)
-            if end <= t_min_eval: continue
-            diff = (P_abs[b, t_min_eval:end, h, :] - Y_abs[b, t_min_eval:end, h, :]).cpu().numpy()  # (..., 2)
-            # RMSE per channel
-            rmse_c = np.sqrt(np.mean(diff**2, axis=(0,)))
-            val = power_weight * rmse_c[0] + (1.0 - power_weight) * rmse_c[1]
-            per_h.append(val)
-        errs[b] = np.mean(per_h) if per_h else np.nan
+            if end <= t_min_eval:
+                continue
+            diff = (P_abs[b, t_min_eval:end, h, :] - Y_abs[b, t_min_eval:end, h, :]).cpu().numpy()
+            rmse_c = np.sqrt(np.mean(diff**2, axis=0))
+            v = power_weight * rmse_c[0] + (1.0 - power_weight) * rmse_c[1]
+            vals.append(v); hs.append(h)
+        if vals:
+            errs[b] = float(np.sum([w_h[h] * v for v, h in zip(vals, hs)]))
+        else:
+            errs[b] = np.nan
     return errs
+
