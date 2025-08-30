@@ -1,73 +1,12 @@
 # src/mt4xai/plot.py
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import seaborn as sns
-from .ad import compute_bundle_error
 from .data import SampleBundle
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def _get_nth_batch(loader, n: int):
-    it = iter(loader)
-    for _ in range(n):
-        next(it)
-    return next(it)
-
-@torch.no_grad()
-def fetch_sample_bundle(model: nn.Module, loader,
-                        batch_index: int, sample_index: int, device: torch.device,
-                        power_scaler, soc_scaler,
-                        idx_power_inp: int, idx_soc_inp: int) -> SampleBundle:
-    """
-    Build a SampleBundle from a DataLoader batch (mirrors modelling notebook).
-    - Forward pass on GPU, lengths kept on CPU int64 (pack_padded requirement).
-    - Returns CPU tensors inside the bundle for plotting/post-proc.
-    """
-    model.eval()
-    batch = _get_nth_batch(loader, batch_index)
-
-    session_ids = None
-    if len(batch) == 4:
-        session_ids, Xb, Yb, Ls = batch
-    else:
-        Xb, Yb, Ls = batch
-
-    if sample_index >= Xb.shape[0]:
-        raise IndexError(f"sample_index {sample_index} out of range for batch {batch_index} (size={Xb.shape[0]}).")
-
-    X_dev = Xb.to(device, non_blocking=True)
-    Ls_cpu = Ls.to(dtype=torch.long, device="cpu")  # lengths must be CPU int64
-    P_dev, _ = model(X_dev, Ls_cpu)
-
-    T = Ls[sample_index].item()
-    P_s = P_dev[sample_index, :T].cpu()
-    Y_s = Yb[sample_index, :T].cpu()
-    X_s = Xb[sample_index, :T].cpu()
-
-    power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
-    soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
-
-    H, C = P_s.shape[1], P_s.shape[2]
-    sid = None if session_ids is None else session_ids[sample_index]
-    return SampleBundle(
-        batch_index=batch_index, sample_index=sample_index,
-        length=T, horizon=H, num_targets=C,
-        X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
-        true_power_unscaled=power_true, true_soc_unscaled=soc_true,
-        session_id=sid
-    )
-
-
-def _valid_time_bounds(T: int, H: int) -> Tuple[int, int]:
-    """Valid i0 indices for predicting at i0+h (< T). Returns [start, end_exclusive]."""
-    return 1, max(1, T - H)
 
 
 def plot_full_session(bundle: SampleBundle, power_scaler, soc_scaler,
@@ -124,22 +63,22 @@ def plot_full_session(bundle: SampleBundle, power_scaler, soc_scaler,
         preds_all.append(preds)
         t_abs_all.append(t_abs)
 
-    # ---- Seaborn plot on a Matplotlib Axes with autoscale disabled ----
+    # Seaborn plot on a Matplotlib Axes with autoscale disabled
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
 
-    # Lock y-axis BEFORE drawing, and disable autoscale so Seaborn can't expand it.
+    # Locks the y-axis before drawing, and disables autoscaling
     if y_lim is None:
         if tgt_idx == 0:  # power, per-session scale if global not passed
             pred_max = float(np.max(np.concatenate(preds_all))) if preds_all else 0.0
             y_max = max(float(np.max(true)), pred_max, 1.0)
             y_lim = (0.0, y_max * 1.02)
-        else:             # soc
+        else:  # SOC is always in range [0, 100] (%)
             y_lim = (0.0, 100.0)
 
     # True series
     sns.lineplot(x=t, y=true, color="black", linewidth=2.5, label=f"True {target.title()}", ax=ax)
 
-    # Horizon curves with labels h=1, h=2, ...
+    # Horizon curves with labels
     palette = sns.color_palette("deep", n_colors=H)
     for h0 in range(H):
         if h0 >= len(preds_all):
@@ -149,7 +88,7 @@ def plot_full_session(bundle: SampleBundle, power_scaler, soc_scaler,
         # line with legend label
         sns.lineplot(x=t_abs, y=preds, linestyle="--", linewidth=1.8,
                      color=palette[h0], label=f"h={h0+1}", ax=ax)
-        # scatter without legend entry
+        # scatterplot without legend entry
         ax.scatter(t_abs, preds, s=10, color=palette[h0], alpha=0.5, label="_nolegend_")
 
     ax.set_ylim(*y_lim)
@@ -165,4 +104,3 @@ def plot_full_session(bundle: SampleBundle, power_scaler, soc_scaler,
 
     fig.tight_layout()
     plt.show()
-

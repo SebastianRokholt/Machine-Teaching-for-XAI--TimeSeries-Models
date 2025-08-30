@@ -1,6 +1,6 @@
 # src/mt4xai/data.py
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict, Optional
 import math, random
 import numpy as np
 import pandas as pd
@@ -33,6 +33,58 @@ class SampleBundle:
     true_power_unscaled: np.ndarray
     true_soc_unscaled:   np.ndarray
     session_id: Optional[str] = None  # new: carry charging_id when available
+
+
+# def get_nth_batch(loader, n: int):
+#     it = iter(loader)
+#     for _ in range(n):
+#         next(it)
+#     return next(it)
+
+
+# @torch.no_grad()
+# def fetch_sample_bundle(model: nn.Module, loader,
+#                         batch_index: int, sample_index: int, device: torch.device,
+#                         power_scaler, soc_scaler,
+#                         idx_power_inp: int, idx_soc_inp: int) -> SampleBundle:
+#     """
+#     Build a SampleBundle from a DataLoader batch (mirrors modelling notebook).
+#     - Forward pass on GPU, lengths kept on CPU int64 (pack_padded requirement).
+#     - Returns CPU tensors inside the bundle for plotting/post-proc.
+#     """
+#     model.eval()
+#     batch = get_nth_batch(loader, batch_index)
+
+#     session_ids = None
+#     if len(batch) == 4:
+#         session_ids, Xb, Yb, Ls = batch
+#     else:
+#         Xb, Yb, Ls = batch
+
+#     if sample_index >= Xb.shape[0]:
+#         raise IndexError(f"sample_index {sample_index} out of range for batch {batch_index} (size={Xb.shape[0]}).")
+
+#     X_dev = Xb.to(device, non_blocking=True)
+#     Ls_cpu = Ls.to(dtype=torch.long, device="cpu")  # lengths must be CPU int64
+#     P_dev, _ = model(X_dev, Ls_cpu)
+
+#     T = Ls[sample_index].item()
+#     P_s = P_dev[sample_index, :T].cpu()
+#     Y_s = Yb[sample_index, :T].cpu()
+#     X_s = Xb[sample_index, :T].cpu()
+
+#     power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
+#     soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
+
+#     H, C = P_s.shape[1], P_s.shape[2]
+#     sid = None if session_ids is None else session_ids[sample_index]
+#     return SampleBundle(
+#         batch_index=batch_index, sample_index=sample_index,
+#         length=T, horizon=H, num_targets=C,
+#         X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
+#         true_power_unscaled=power_true, true_soc_unscaled=soc_true,
+#         session_id=sid
+#     )
 
 
 def reconstruct_abs_from_bundle(bundle: SampleBundle, idx_power_inp: int, idx_soc_inp: int) -> torch.Tensor:
