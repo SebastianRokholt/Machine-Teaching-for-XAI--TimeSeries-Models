@@ -5,8 +5,9 @@
 venv/
 linux_venv/
 .*__pycache__.*
+__pycache__/
+*.pyc
 .ipynb_checkpoints/
-.pyc
 
 # Ray Tune and BOHB results
 bohb_*_tuning*/
