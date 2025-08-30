@@ -9,16 +9,16 @@ import torch.nn.functional as F
 # LSTM
 class MultiHorizonLSTM(nn.Module):
     """LSTM multi-horizon residual model"""
-    def __init__(self, input_size: int, hidden_size: int, horizon: int, num_targets: int,
+    def __init__(self, input_size: int, hidden_dim: int, horizon: int, num_targets: int,
                  num_layers: int, dropout: float=0.0):
         super().__init__()
         self.horizon = horizon
         self.num_targets = num_targets
         self.lstm = nn.LSTM(
-            input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
+            input_size=input_size, hidden_size=hidden_dim, num_layers=num_layers,
             batch_first=True, dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.linear = nn.Linear(hidden_size, horizon * num_targets)
+        self.linear = nn.Linear(hidden_dim, horizon * num_targets)
 
     def forward(self, x: torch.Tensor, seq_lengths: torch.Tensor):
         packed_x = rnn_utils.pack_padded_sequence(x, seq_lengths, batch_first=True, enforce_sorted=False)
@@ -30,12 +30,23 @@ class MultiHorizonLSTM(nn.Module):
         return out, out_lengths
     
 
+def build_model_lstm(cfg):
+    return MultiHorizonLSTM(
+        input_size=len(cfg["input_features"]),
+        hidden_dim=int(cfg["hidden_dim"]),
+        horizon=cfg["horizon"],
+        num_targets=len(cfg["target_features"]),
+        num_layers=int(cfg["num_layers"]),
+        dropout=float(cfg.get("dropout", 0.0)),
+    ).to(cfg["device"])
+
+
 def load_lstm_model(path, device="cpu"):
     checkpoint = torch.load(path, map_location=device)
     cfg = checkpoint["config"]
     model = MultiHorizonLSTM(
         input_size=len(checkpoint["input_features"]),
-        hidden_size=int(cfg["hidden_dim"]),
+        hidden_dim=int(cfg["hidden_dim"]),
         horizon=cfg["horizon"],
         num_targets=len(checkpoint["target_features"]),
         num_layers=cfg["num_layers"],
@@ -131,3 +142,15 @@ class DSConv1d(nn.Module):
 def _causal_pad(x, k, d):
     # Left-pad so output stays length T and remains causal
     return F.pad(x, ((k-1)*d, 0 ))
+
+
+def build_model_tcn(cfg):
+    return MultiHorizonTCN(
+        input_size=len(cfg["input_features"]),
+        hidden_dim=int(cfg["hidden_dim"]),
+        num_layers=int(cfg["num_layers"]),
+        kernel_size=int(cfg["kernel_size"]),
+        horizon=cfg["horizon"],
+        num_targets=len(cfg["target_features"]),
+        dropout=float(cfg.get("dropout", 0.0)),
+    ).to(cfg["device"])

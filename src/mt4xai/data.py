@@ -97,23 +97,27 @@ def reconstruct_abs_from_bundle(bundle: SampleBundle, idx_power_inp: int, idx_so
     return bundle.P_sample + base
 
 
-def split_data(df: pd.DataFrame, test_size: float=0.2, validation_size: float=0.1):
+def split_data(df: pd.DataFrame, test_size: float=0.2, validation_size: float=0.1, random_seed: int | None=None):
     """
     Reproduce the modelling split: group by `charging_id`, first carve out test,
     then split the remainder into train/val. Keeps sessions intact.
     Returns train_df, val_df, test_df.
     """
-    gss_test = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=RANDOM_SEED)
+    if not random_seed:
+        random_seed = RANDOM_SEED
+
+    gss_test = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_seed)
     train_val_idx, test_idx = next(gss_test.split(df, groups=df["charging_id"]))
     train_val_df = df.iloc[train_val_idx]
     test_df = df.iloc[test_idx]
 
     adj_val = validation_size / (1 - test_size)
-    gss_val = GroupShuffleSplit(n_splits=1, test_size=adj_val, random_state=RANDOM_SEED)
+    gss_val = GroupShuffleSplit(n_splits=1, test_size=adj_val, random_state=random_seed)
     train_idx, val_idx = next(gss_val.split(train_val_df, groups=train_val_df["charging_id"]))
     train_df = train_val_df.iloc[train_idx]
     val_df   = train_val_df.iloc[val_idx]
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True), test_df.reset_index(drop=True)
+
 
 def fit_scalers_on_train(train_df: pd.DataFrame, cols_to_scale: List[str]) -> Dict[str, MinMaxScaler]:
     """
