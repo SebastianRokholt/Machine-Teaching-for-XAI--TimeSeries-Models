@@ -1,6 +1,6 @@
 # src/mt4xai/data.py
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple, Optional
 import math, random
 import numpy as np
 import pandas as pd
@@ -14,10 +14,28 @@ RANDOM_SEED = 42  # same as modelling notebook
 
 
 @dataclass
-class SampleBundle:
+class Session:
+    """stores one session in scaled space for fast perturbation inference.
+    fields
+    - X_scaled: (T,F) scaled inputs
+    - T, F, H: length, input size, horizon
+    - idx_power, idx_soc: input indices in X
+    - power_scaler, soc_scaler: fitted scalers for inverse transforms
+    """
+    X_scaled: torch.Tensor
+    T: int
+    F: int
+    H: int
+    idx_power: int
+    idx_soc: int
+    power_scaler: MinMaxScaler
+    soc_scaler: MinMaxScaler
+
+
+@dataclass
+class SessionPredsBundle:
     """
     Compact container for a single sample's tensors and metadata in *scaled* space.
-    Mainly used for plotting purposes.
     - X_sample: (T, F)
     - Y_sample: (T, H, C) residual targets (delta to add to base @ t)
     - P_sample: (T, H, C) residual predictions (model output)
@@ -36,6 +54,29 @@ class SampleBundle:
     session_id: Optional[str] = None 
 
 
+def make_session_template_df(df_scaled,
+                             sid: int,
+                             *,
+                             input_features: list[str],
+                             horizon: int,
+                             power_scaler: MinMaxScaler,
+                             soc_scaler: MinMaxScaler,
+                             idx_power_inp: int,
+                             idx_soc_inp: int,
+                             sort_by: str = "minutes_elapsed") -> Session:
+    """
+    builds a Session from a scaled DataFrame.
+    """
+    s = df_scaled[df_scaled["charging_id"] == sid].sort_values(sort_by)
+    X = torch.tensor(s[input_features].to_numpy(np.float32))  # (T,F) scaled
+    T, F = int(X.shape[0]), int(X.shape[1])
+    return Session(
+        X_scaled=X.contiguous(), T=T, F=F, H=int(horizon),
+        idx_power=int(idx_power_inp), idx_soc=int(idx_soc_inp),
+        power_scaler=power_scaler, soc_scaler=soc_scaler,
+    )
+
+
 def get_nth_batch(loader, n: int):
     it = iter(loader)
     for _ in range(n):
@@ -44,17 +85,58 @@ def get_nth_batch(loader, n: int):
 
 
 @torch.no_grad()
-def fetch_sample_bundle(model: nn.Module, loader,
-                        batch_index: int, sample_index: int, device: torch.device,
-                        power_scaler, soc_scaler,
-                        idx_power_inp: int, idx_soc_inp: int) -> SampleBundle:
+def fetch_session_preds_bundle(model: nn.Module, loader,
+                               batch_index: int | None, sample_index: int | None,
+                               device: torch.device,
+                               power_scaler, soc_scaler,
+                               idx_power_inp: int, idx_soc_inp: int,
+                               session_id: int | None = None) -> SessionPredsBundle:
     """
-    Build a SampleBundle from a DataLoader batch (mirrors modelling notebook).
-    - Forward pass on GPU, lengths kept on CPU int64 (pack_padded requirement).
-    - Returns CPU tensors inside the bundle for plotting/post-proc.
+    builds a SessionPredsBundle from a loader by either:
+      - selecting a specific (batch_index, sample_index), or
+      - selecting a specific charging session by 'session_id'
+    the two modes are mutually exclusive.
+
+    params
+    - model, loader, device, scalers, idx_power_inp/idx_soc_inp: as before
+    - batch_index, sample_index: choose a sample by indices
+    - session_id: choose a sample by charging_id
+
+    returns
+    - SessionPredsBundle with CPU tensors for plotting/post-proc
     """
+    use_id = session_id is not None
+    use_idx = (batch_index is not None) and (sample_index is not None)
+    if (use_id and use_idx) or (not use_id and not use_idx):
+        raise ValueError("provide either session_id OR (batch_index, sample_index), not both.")
+
     model.eval()
-    batch = get_nth_batch(loader, batch_index)
+
+    if use_id:
+        sid, Xb, Yb, Ls = get_session_from_loader(loader, session_id=session_id)
+        # shapes from helper are batched (1, T, F) etc.
+        X_dev = Xb.to(device, non_blocking=True)
+        L_cpu = Ls.to(dtype=torch.long, device="cpu")
+        P_dev, _ = model(X_dev, L_cpu)  # (1, T, H, C)
+
+        T = int(Ls[0].item())
+        P_s = P_dev[0, :T].cpu()
+        Y_s = Yb[0, :T].cpu()
+        X_s = Xb[0, :T].cpu()
+
+        power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
+        soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
+
+        H, C = P_s.shape[1], P_s.shape[2]
+        return SessionPredsBundle(
+            batch_index=0, sample_index=0,
+            length=T, horizon=H, num_targets=C,
+            X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
+            true_power_unscaled=power_true, true_soc_unscaled=soc_true,
+            session_id=int(sid) if isinstance(sid, (int, np.integer)) else sid
+        )
+
+    batch = get_nth_batch(loader, int(batch_index))
 
     session_ids = None
     if len(batch) == 4:
@@ -62,25 +144,25 @@ def fetch_sample_bundle(model: nn.Module, loader,
     else:
         Xb, Yb, Ls = batch
 
-    if sample_index >= Xb.shape[0]:
+    if int(sample_index) >= Xb.shape[0]:
         raise IndexError(f"sample_index {sample_index} out of range for batch {batch_index} (size={Xb.shape[0]}).")
 
     X_dev = Xb.to(device, non_blocking=True)
-    Ls_cpu = Ls.to(dtype=torch.long, device="cpu")  # lengths must be CPU int64
-    P_dev, _ = model(X_dev, Ls_cpu)
+    L_cpu = Ls.to(dtype=torch.long, device="cpu")  # lengths must be CPU int64
+    P_dev, _ = model(X_dev, L_cpu)
 
-    T = Ls[sample_index].item()
-    P_s = P_dev[sample_index, :T].cpu()
-    Y_s = Yb[sample_index, :T].cpu()
-    X_s = Xb[sample_index, :T].cpu()
+    T = Ls[int(sample_index)].item()
+    P_s = P_dev[int(sample_index), :T].cpu()
+    Y_s = Yb[int(sample_index), :T].cpu()
+    X_s = Xb[int(sample_index), :T].cpu()
 
     power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
     soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
 
     H, C = P_s.shape[1], P_s.shape[2]
-    sid = None if session_ids is None else session_ids[sample_index]
-    return SampleBundle(
-        batch_index=batch_index, sample_index=sample_index,
+    sid = None if session_ids is None else session_ids[int(sample_index)]
+    return SessionPredsBundle(
+        batch_index=int(batch_index), sample_index=int(sample_index),
         length=T, horizon=H, num_targets=C,
         X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
         true_power_unscaled=power_true, true_soc_unscaled=soc_true,
@@ -88,7 +170,8 @@ def fetch_sample_bundle(model: nn.Module, loader,
     )
 
 
-def reconstruct_abs_from_bundle(bundle: SampleBundle, idx_power_inp: int, idx_soc_inp: int) -> torch.Tensor:
+
+def reconstruct_abs_from_bundle(bundle: SessionPredsBundle, idx_power_inp: int, idx_soc_inp: int) -> torch.Tensor:
     """
     Reconstruct absolute predictions in *scaled* space:
       P_abs[t, h, c] = X[t, c_base] + P_res[t, h, c], aligned at t+h.
@@ -98,11 +181,12 @@ def reconstruct_abs_from_bundle(bundle: SampleBundle, idx_power_inp: int, idx_so
     return bundle.P_sample + base
 
 
-def split_data(df: pd.DataFrame, test_size: float=0.2, validation_size: float=0.1, random_seed: int | None=None):
+def split_data(df: pd.DataFrame, test_size: float=0.2, 
+               validation_size: float=0.1, random_seed: int | None=None) -> Tuple[pd.DataFrame]:
     """
-    Reproduce the modelling split: group by `charging_id`, first carve out test,
-    then split the remainder into train/val. Keeps sessions intact.
-    Returns train_df, val_df, test_df.
+    Uses GroupShuffleSplit to create train/val/test sets.
+    Groups by `charging_id`, first carve out test, then split the remainder into train/val. Keeps sessions intact.
+    Returns DataFrames train_df, val_df, test_df.
     """
     if not random_seed:
         random_seed = RANDOM_SEED
@@ -266,36 +350,33 @@ def get_session_from_loader(test_loader: DataLoader,
     
 
 @torch.inference_mode()
-def make_bundle_from_session(model: nn.Module, df_scaled,
-                             sid: str,
+def make_bundle_from_session_df(model: nn.Module, df_scaled, sid: str,
                              device: torch.device,
                              input_features: List[str],
                              target_features: List[str],
                              horizon: int,
                              power_scaler, soc_scaler,
-                             idx_power_inp: int, idx_soc_inp: int,
-                             sort_by: str = "timestamp") -> SampleBundle:
+                             idx_power_inp: int, idx_soc_inp: int) -> SessionPredsBundle:
     """
-    Build a SampleBundle directly from a single session DataFrame (for anomaly notebook).
-    Ensures the same alignment as the modelling bundle.
+    Build a SessionPredsBundle directly from a single session DataFrame.
     """
-    g = df_scaled[df_scaled["charging_id"] == sid].sort_values(sort_by)
-    X = torch.tensor(g[input_features].to_numpy(np.float32))                 # (T, F)
-    y_abs = g[target_features].to_numpy(np.float32)                          # (T, C)
+    g = df_scaled[df_scaled["charging_id"] == sid].sort_values("minutes_elapsed")
+    X = torch.tensor(g[input_features].to_numpy(np.float32)) # (T, F)
+    y_abs = g[target_features].to_numpy(np.float32)  # (T, C)
     T = y_abs.shape[0]
-    Y = np.zeros((T, horizon, len(target_features)), dtype=np.float32)       # residuals
+    Y = np.zeros((T, horizon, len(target_features)), dtype=np.float32)   # residuals
     for h in range(1, horizon+1):
         Y[:-h, h-1, :] = y_abs[h:, :] - y_abs[:-h, :]
 
-    X_dev = X.unsqueeze(0).to(device, non_blocking=True)    # (1, T, F)
+    X_dev = X.unsqueeze(0).to(device, non_blocking=True)  # (1, T, F)
     L_cpu = torch.tensor([T], dtype=torch.long, device="cpu")
-    P_dev, _ = model(X_dev, L_cpu)                          # (1, T, H, C)
-    P = P_dev.squeeze(0).cpu()                              # (T, H, C)
+    P_dev, _ = model(X_dev, L_cpu)   # (1, T, H, C)
+    P = P_dev.squeeze(0).cpu()  # (T, H, C)
 
     power_true = power_scaler.inverse_transform(X[:, [idx_power_inp]].numpy()).ravel()
-    soc_true   = soc_scaler.inverse_transform(  X[:, [idx_soc_inp  ]].numpy()).ravel()
+    soc_true = soc_scaler.inverse_transform( X[:, [idx_soc_inp  ]].numpy()).ravel()
 
-    return SampleBundle(
+    return SessionPredsBundle(
         batch_index=0, sample_index=0,
         length=T, horizon=horizon, num_targets=len(target_features),
         X_sample=X.cpu(), Y_sample=torch.from_numpy(Y), P_sample=P,

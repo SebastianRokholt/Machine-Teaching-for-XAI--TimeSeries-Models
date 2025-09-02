@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from typing import Iterable
 from sklearn.preprocessing import MinMaxScaler
-from .data import SampleBundle, reconstruct_abs_from_bundle, make_bundle_from_session
+from .data import Session, SessionPredsBundle, reconstruct_abs_from_bundle, make_bundle_from_session_df
 
 @torch.no_grad()
 def predict_residuals(model, X: torch.Tensor, lengths: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -123,13 +123,11 @@ def _bundle_iter(model,
                  t_min_eval: int):
     """Yields (sid, residuals[T,H,C], T) for each session id, residuals in original units cropped at t>=t_min_eval."""
     for sid in sids:
-        b = make_bundle_from_session(
+        b = make_bundle_from_session_df(
             model=model, df_scaled=df_scaled, sid=int(sid), device=device,
             input_features=input_features, target_features=target_features, horizon=horizon,
             power_scaler=power_scaler, soc_scaler=soc_scaler,
-            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-            sort_by="minutes_elapsed"
-        )
+            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp)
         # b.Y_sample and b.P_sample are residual targets/preds in *scaled* units.
         # Convert to residuals in original units by inverse-transforming absolute series.
         # Reuse inverse logic via your existing helpers:
@@ -184,7 +182,7 @@ def fit_rwse_robust_scalers(model,
 
 
 def rwse_score_from_bundle(
-    bundle: SampleBundle,
+    bundle: SessionPredsBundle,
     m: np.ndarray,
     mad: np.ndarray,
     *,
@@ -289,12 +287,11 @@ def compute_session_RWSE(model, df_scaled: pd.DataFrame,
     w_c = make_feature_weights(target_features)
 
     for sid in session_ids:
-        b = make_bundle_from_session(
+        b = make_bundle_from_session_df(
             model=model, df_scaled=df_scaled, sid=int(sid), device=device,
             input_features=input_features, target_features=target_features, horizon=horizon,
             power_scaler=power_scaler, soc_scaler=soc_scaler,
-            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp, sort_by="minutes_elapsed"
-        )
+            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp)
         s, L = rwse_score_from_bundle(
             b, m, mad,
             power_scaler=power_scaler, soc_scaler=soc_scaler,
@@ -316,7 +313,7 @@ def make_feature_weights(target_features: list[str]) -> np.ndarray:
     return np.ones(C, dtype=float) / float(C)
 
 
-def compute_bundle_error(bundle: SampleBundle,
+def compute_bundle_error(bundle: SessionPredsBundle,
                          power_scaler, soc_scaler,
                          power_weight: float,
                          idx_power_inp: int, idx_soc_inp: int, 
@@ -371,3 +368,63 @@ def classify_by_threshold(df_errs: pd.DataFrame, threshold: float) -> pd.DataFra
     df["label"] = np.where(df["error"] > threshold, "abnormal", "normal")
     return df.sort_values("error", ascending=True).reset_index(drop=True)
 
+
+# TODO: Write a new function that is more user-friendly (less parameters)
+# for classifying a single charging session
+def classify_session(model,
+                           df_scaled: pd.DataFrame,
+                           sid: int,
+                           *,
+                           device: torch.device,
+                           input_features: list[str],
+                           target_features: list[str],
+                           horizon: int,
+                           power_scaler: MinMaxScaler,
+                           soc_scaler: MinMaxScaler,
+                           idx_power_inp: int,
+                           idx_soc_inp: int,
+                           power_weight: float = 1.0,
+                           decay: float = 0.2,
+                           t_min_eval: int = 1,
+                           threshold: float = 10.0) -> tuple[int, float]:
+    """
+    classifies a single charging session by Macro-RMSE with horizon decay.
+    returns (label, error), where label=1 means abnormal (error > threshold), else 0.
+
+    re-uses existing helpers make_bundle_from_session, compute_bundle_error, make_horizon_weights
+    pass power_weight=1.0 to only classify based on power predictions.
+    """
+    bundle = make_bundle_from_session_df(
+        model=model, df_scaled=df_scaled, sid=int(sid), device=device,
+        input_features=input_features, target_features=target_features, horizon=horizon,
+        power_scaler=power_scaler, soc_scaler=soc_scaler,
+        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp
+    )
+
+    # compute macro-rmse with horizon decay via compute_bundle_error by injecting weights
+    # compute_bundle_error internally averages horizons uniformly, so we map decay to weights
+    # by temporarily scaling per-horizon errors before averaging.
+    # simplest route: reuse compute_bundle_error and set power_weight; decay handled by weights below
+    # we reconstruct absolute preds/targets and compute rmse horizon-wise
+    T, H = bundle.length, bundle.horizon
+    w_h = make_horizon_weights(H, decay=decay)
+
+    # re-implement the averaging with w_h 
+    P_abs_scaled = reconstruct_abs_from_bundle(bundle, idx_power_inp, idx_soc_inp)  # (T,H,2)
+    base = bundle.X_sample[:, [idx_power_inp, idx_soc_inp]].unsqueeze(1)  # (T,1,2)
+    Y_abs_scaled = base + bundle.Y_sample  # (T,H,2)
+    P_abs = inverse_targets_np(P_abs_scaled.numpy(), power_scaler, soc_scaler)  # (T,H,2)
+    Y_abs = inverse_targets_np(Y_abs_scaled.numpy(), power_scaler, soc_scaler)  # (T,H,2)
+
+    per_h = []
+    for h in range(H):
+        end = T - (h + 1)
+        if end <= t_min_eval:
+            continue
+        diff = P_abs[t_min_eval:end, h, :] - Y_abs[t_min_eval:end, h, :]
+        rmse_c = np.sqrt(np.mean(diff**2, axis=0))
+        per_h.append(w_h[h] * (power_weight * rmse_c[0] + (1.0 - power_weight) * rmse_c[1]))
+
+    error = float(np.sum(per_h)) if per_h else float("nan")
+    label = int(error > float(threshold))
+    return label, error
