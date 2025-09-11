@@ -1050,7 +1050,7 @@ plt.show()
 
 
     
-![png](01__Data_Wrangling_%26_FE_v2_files/01__Data_Wrangling_%26_FE_v2_24_0.png)
+![png](01__Data_Wrangling_and_FE_files/01__Data_Wrangling_and_FE_24_0.png)
     
 
 
@@ -1075,7 +1075,7 @@ plt.show()
 
 
     
-![png](01__Data_Wrangling_%26_FE_v2_files/01__Data_Wrangling_%26_FE_v2_25_0.png)
+![png](01__Data_Wrangling_and_FE_files/01__Data_Wrangling_and_FE_25_0.png)
     
 
 
@@ -1315,7 +1315,7 @@ plt.show()
 
 
     
-![png](01__Data_Wrangling_%26_FE_v2_files/01__Data_Wrangling_%26_FE_v2_32_0.png)
+![png](01__Data_Wrangling_and_FE_files/01__Data_Wrangling_and_FE_32_0.png)
     
 
 
@@ -1334,7 +1334,7 @@ plt.show()
 
 
     
-![png](01__Data_Wrangling_%26_FE_v2_files/01__Data_Wrangling_%26_FE_v2_33_0.png)
+![png](01__Data_Wrangling_and_FE_files/01__Data_Wrangling_and_FE_33_0.png)
     
 
 
@@ -4145,8 +4145,3 @@ df.head()
 </div>
 
 
-
-
-```python
-
-```

@@ -81,6 +81,7 @@ mistune==3.0.2
 more-itertools==10.7.0
 mpmath==1.3.0
 msgpack==1.1.1
+-e git+ssh://git@github-personal/SebastianRokholt/Machine-Teaching-for-XAI--TimeSeries-Models.git@1c2f7069e5b49738daff81a9989291ab319511b4#egg=mt4xai
 multidict==6.1.0
 nbclient==0.10.0
 nbconvert==7.16.4
@@ -109,12 +110,15 @@ opencensus-context==0.1.3
 overrides==7.7.0
 packaging==24.1
 pandas==2.2.3
+pandoc==2.4
 pandocfilters==1.5.1
 parso==0.8.4
 patsy==1.0.1
 pexpect==4.9.0
 pillow==11.0.0
 platformdirs==4.3.6
+plumbum==1.9.0
+ply==3.11
 pooch==1.8.2
 prometheus_client==0.21.0
 prompt_toolkit==3.0.48
@@ -145,6 +149,7 @@ pytz==2024.2
 PyYAML==6.0.2
 pyzmq==26.2.0
 ray==2.48.0
+rdp==0.8
 referencing==0.35.1
 requests==2.32.3
 rfc3339-validator==0.1.4

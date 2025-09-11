@@ -1430,7 +1430,7 @@ Utility functions handle tasks such as loss computation, gradient clipping, and 
 
 
 ```python
-# -- Optimizer with decoupled weight decay, no decay on biases/1D params --
+# Optimizer with decoupled weight decay, no decay on biases/1D params
 def _build_adamw(named_params, lr, weight_decay):
     decay, no_decay = [], []
     for _, p in named_params:
@@ -1441,7 +1441,6 @@ def _build_adamw(named_params, lr, weight_decay):
         lr=lr
     )
 
-# -- Ray ObjectRef duck-typing for dataset resolution (robust to versions) --
 try:
     from ray import ObjectRef  # type: ignore
 except Exception:
@@ -1454,11 +1453,11 @@ def _resolve_dataset_ref(maybe_ref):
         raise ValueError("Got a class instead of a dataset instance/ObjectRef. Use ray.put(dataset).")
     raise ValueError(f"Invalid dataset ref type: {type(maybe_ref)}")
 
-# -- Inverse MinMax for a specific channel of shape (B,T,H,C) to (B,T,H,1) --
+# Inverse MinMax for a specific channel of shape (B,T,H,C) to (B,T,H,1)
 def inv_minmax_channel_torch(t_scaled: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor, ch: int):
     return t_scaled[..., ch:ch+1] * (max_val - min_val) + min_val
 
-# -- Valid mask 1 <= i < len-horizon → (B,T,H,1) --
+# Valid mask 1 <= i < len-horizon --> (B,T,H,1)
 def _vectorized_mask(lengths: torch.Tensor, T_max: int, horizon: int, device):
     B = lengths.shape[0]
     t = torch.arange(T_max, device=device).unsqueeze(0).expand(B, -1)
@@ -1466,12 +1465,12 @@ def _vectorized_mask(lengths: torch.Tensor, T_max: int, horizon: int, device):
     mask_2d = (t >= 1) & (t < end)
     return mask_2d.unsqueeze(-1).expand(-1, -1, horizon).unsqueeze(-1)
 
-# -- Residual → absolute (scaled space) using current inputs X --
+# Residual → absolute (scaled space) using current inputs X
 def reconstruct_abs_from_residuals_batch(pred_resid: torch.Tensor, X_batch: torch.Tensor, idx_power: int, idx_soc: int):
     base = torch.stack([X_batch[..., idx_power], X_batch[..., idx_soc]], dim=-1).unsqueeze(2)
     return pred_resid + base
 
-# -- Loader builders per trial (supports batch size tuning) --
+# Loader builders per trial (supports batch size tuning)
 def _build_loaders_for_trial_from_datasets(train_dataset_local, val_dataset_local, batch_size: int):
     train_sampler_local = BucketBatchSampler(train_dataset_local, batch_size=batch_size, shuffle=True)
     val_sampler_local   = BucketBatchSampler(val_dataset_local,   batch_size=batch_size, shuffle=False)
@@ -1503,7 +1502,7 @@ def tune_status_df(result_grid):
     df = pd.DataFrame(rows); cols = [c for c in preferred if c in df.columns]
     return df[cols].sort_values(by="val_metric") if cols else df
 
-# -- Restore a Ray ResultGrid from a run folder (if present) --
+# Restore a Ray ResultGrid from a run folder. if present
 def restore_resultgrid(path: str):
     try:
         ea = ExperimentAnalysis(path)
@@ -1539,7 +1538,7 @@ def plot_best_curves(best_result, title_prefix=""):
     plt.title(f"{title_prefix} Validation RMSE"); plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
 
-# --- Global column indices (used in training/tuning loop and plotting) ---
+# Global column indices (used in training/tuning loop and plotting)
 IDX_TEMP  = input_features.index("temp")
 IDX_NOM   = input_features.index("nominal_power")
 IDX_POWER = input_features.index("power")
@@ -1931,25 +1930,25 @@ if best_tcn  is not None: plot_best_curves(best_tcn,  title_prefix="TCN")
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_38_0.png)
+![png](03__Modelling_files/03__Modelling_38_0.png)
     
 
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_38_1.png)
+![png](03__Modelling_files/03__Modelling_38_1.png)
     
 
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_38_2.png)
+![png](03__Modelling_files/03__Modelling_38_2.png)
     
 
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_38_3.png)
+![png](03__Modelling_files/03__Modelling_38_3.png)
     
 
 
@@ -2168,7 +2167,7 @@ if bundle_lstm is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_48_0.png)
+![png](03__Modelling_files/03__Modelling_48_0.png)
     
 
 
@@ -2182,7 +2181,7 @@ if bundle_tcn is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_49_0.png)
+![png](03__Modelling_files/03__Modelling_49_0.png)
     
 
 
@@ -2227,7 +2226,7 @@ if bundle_lstm is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_52_0.png)
+![png](03__Modelling_files/03__Modelling_52_0.png)
     
 
 
@@ -2237,7 +2236,7 @@ if bundle_lstm is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_52_2.png)
+![png](03__Modelling_files/03__Modelling_52_2.png)
     
 
 
@@ -2254,7 +2253,7 @@ if bundle_tcn is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_53_0.png)
+![png](03__Modelling_files/03__Modelling_53_0.png)
     
 
 
@@ -2264,7 +2263,7 @@ if bundle_tcn is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_53_2.png)
+![png](03__Modelling_files/03__Modelling_53_2.png)
     
 
 
@@ -2331,7 +2330,7 @@ if model_lstm is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_55_0.png)
+![png](03__Modelling_files/03__Modelling_55_0.png)
     
 
 
@@ -2350,7 +2349,7 @@ if model_tcn is not None:
 
 
     
-![png](03__Modelling_v10_files/03__Modelling_v10_56_0.png)
+![png](03__Modelling_files/03__Modelling_56_0.png)
     
 
 

@@ -420,7 +420,7 @@ plt.show()
 
 
     
-![png](04__Anomaly_Detection_v5_files/04__Anomaly_Detection_v5_20_0.png)
+![png](04__Anomaly_Detection_files/04__Anomaly_Detection_20_0.png)
     
 
 

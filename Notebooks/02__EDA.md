@@ -575,7 +575,7 @@ plt.show()
 
 
     
-![png](02__EDA_v1_files/02__EDA_v1_12_0.png)
+![png](02__EDA_files/02__EDA_12_0.png)
     
 
 
@@ -594,7 +594,7 @@ plt.show()
 
 
     
-![png](02__EDA_v1_files/02__EDA_v1_13_0.png)
+![png](02__EDA_files/02__EDA_13_0.png)
     
 
 
@@ -656,7 +656,7 @@ def autocorr_per_horizon(df: pd.DataFrame, max_H: int=1):
     H = range(1, max_H)  # Autocorr from 1 to H minutes
     rows = []
     for h in H:
-        # Autocorr at lag h (average across sessions)
+        # Autocorr at lag h
         autocorr_pwr = df.groupby("charging_id")["power"].apply(lambda s: s.autocorr(lag=h)).mean()
         autocorr_soc = df.groupby("charging_id")["soc"].apply(lambda s: s.autocorr(lag=h)).mean()
         rows.append({"h":h, "ACF_power(h)":autocorr_pwr, "ACF_soc(h)":autocorr_soc})

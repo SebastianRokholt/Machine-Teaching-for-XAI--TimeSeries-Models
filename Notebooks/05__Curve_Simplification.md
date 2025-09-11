@@ -30,7 +30,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mt4xai.data import split_data, apply_scalers, build_loader, fit_scalers_on_train
 from mt4xai.model import load_lstm_model
-
+from mt4xai.ors import ORSParams, ors_optimal_mrmse, ors_candidates, base_label_from_bundle, classify_macro_rmse_from_power
+from mt4xai.plot import plot_session_with_simplification
 RANDOM_SEED = 42
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), os.pardir))
@@ -136,10 +137,11 @@ print(f"[info] test bundle -> T={T}, H={bundle_test.horizon}, session_id={bundle
     [info] test bundle -> T=60, H=5, session_id=8203265
 
 
+### ORS with Dynamic Programming (DP) for Simplifications
+Runs slowly, but works better - tends to find solutions with fewer k
+
 
 ```python
-from mt4xai.ors import ORSParams, ors_optimal_mrmse, base_label_from_bundle
-from mt4xai.plot import plot_session_with_simplification
 # macro-rmse params
 LAMBDA_DECAY = 0.2
 MRC_THRESHOLD = 8.5962
@@ -185,7 +187,7 @@ print(base_lbl)
 
 
     
-![png](05__Curve_Simplification_v3_files/05__Curve_Simplification_v3_11_1.png)
+![png](05__Curve_Simplification_files/05__Curve_Simplification_12_1.png)
     
 
 
@@ -195,7 +197,7 @@ print(base_lbl)
 
 
 ```python
-# what k did stage-1 actually generate?
+# Checks what k stage-1 actually generated
 from mt4xai.ors import ors_candidates
 y = np.asarray(bundle_test.true_power_unscaled, float)
 cands = ors_candidates(y, dp_params)
@@ -220,9 +222,6 @@ for cost,piv in cands[:10]:
 
 
 ```python
-import numpy as np
-from mt4xai.ors import ors_candidates, base_label_from_bundle, classify_macro_rmse_from_power
-
 # stage-1 candidates (which k’s DP/RDP produced)
 y = np.asarray(bundle_test.true_power_unscaled, dtype=float)
 cands = ors_candidates(y, dp_params)  # or rdp_params
@@ -262,9 +261,12 @@ print("Stage-2 evaluated ks:", sorted(set(k_stage2)))
     Stage-2 evaluated ks: [5, 6, 7]
 
 
+### ORS with Ramer-Douglas-Pecker (RDP) simplifications
+Runs a lot faster
+
 
 ```python
-# --- run with RDP (fast heuristic)
+# run ORS with RDP (fast heuristic)
 rdp_params = ORSParams(stage1_mode="rdp", **common_params)
 res_rdp = ors_optimal_mrmse(bundle_test, model, rdp_params,
                             power_scaler=power_scaler, soc_scaler=soc_scaler,
@@ -287,7 +289,7 @@ plot_session_with_simplification(bundle_test, power_scaler, soc_scaler,
 
 
     
-![png](05__Curve_Simplification_v3_files/05__Curve_Simplification_v3_14_1.png)
+![png](05__Curve_Simplification_files/05__Curve_Simplification_16_1.png)
     
 
 
