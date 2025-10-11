@@ -1,7 +1,10 @@
 # mt4xai/ors.py
+# Portions adapted from: https://github.com/BrigtHaavardstun/kSimplification (MIT License)
+# Copyright (c) 2024 Brigt Håvardstun, Cèsar Ferri, Jan Arne Telle
+
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Callable, List, Tuple
+from typing import Optional, List
 import heapq
 import numpy as np
 import pandas as pd
@@ -16,21 +19,26 @@ from .inference import inverse_targets_np, predict_residuals, reconstruct_abs_fr
 @dataclass
 class ORSParams:
     """
-    holds tunable parameters for the ors procedure.
+    holds configuration for optimal robust simplification.
 
-    stage1_mode: "dp" uses the exact dynamic-programming + heaps from the paper; "rdp" uses a fast heuristic.
-    q: number of least-cost candidates to keep in stage-1 (paper: top-q).
-    stage1_candidates: number of rdp candidates to sample if stage1_mode="rdp".
-    alpha, beta, gamma: objective weights on error, simplicity (k), and fragility respectively.
-    R: number of perturbations for fragility estimation (paper default uses large R, e.g. 10_000).
-    epsilon_mode: "fraction" uses epsilon_value * (ymax - ymin); "kw" uses epsilon in kW directly.
-    epsilon_value: epsilon value as described by epsilon_mode.
-    enforce_same_label: require h(sts) = h(ts) (matches the paper’s constraint).
-    seed: rng seed.
-    min_k, max_k: candidate k range to consider in stage-2.
-    t_min_eval: number of initial time steps to ignore when computing macro-rmse.
+    the stage-1 generator is chosen via stage1_mode: 
+    - "dp": vanilla dynamic programming with heaps (paper-exact; no prefix sums), 
+    - "dp_prefix": same dp + heaps but with prefix-sum error tables (faster), 
+    - "rdp": ramer-douglas-peucker heuristic.
+
+    in stage-2, stage2_err_metric selects the error used in the final objective:
+    - "l2": squared euclidean distance,
+    - "mrmse": macro-rmse from the forecasting/classification pipeline.
+
+    all computations operate in original units (kW / %soc).
     """
-    stage1_mode: str = "dp"
+
+    # which stage-1 generator to use: "dp" (paper-exact, no prefix sums), "dp_prefix" (faster DP), or "rdp" (RDP-generated candidates)
+    stage1_mode: str = "dp"   # default is paper-exact/vanilla: DP with no prefix sums
+
+    # which error to use in the *final objective* (stage-2 selection): "l2" or "mrmse"
+    stage2_err_metric: str = "l2"  # default to squared euclidean (paper-exact)
+
     q: int = 100
     stage1_candidates: int = 40
 
@@ -41,7 +49,6 @@ class ORSParams:
     R: int = 10_000
     epsilon_mode: str = "fraction"
     epsilon_value: float = 0.1
-    enforce_same_label: bool = True
 
     seed: Optional[int] = 1337
     min_k: int = 1
@@ -51,7 +58,10 @@ class ORSParams:
 
 @dataclass
 class ORSOutcome:
-    """stores a single candidate evaluation for inspection and debugging."""
+    """
+    stores one evaluated candidate for diagnostics.
+    includes pivot mask, simplified series, l2 error, macro-rmse error, robustness and objective value.
+    """
     k_opt: int
     keep_mask: np.ndarray
     simplified_power: np.ndarray
@@ -66,7 +76,7 @@ class ORSOutcome:
 
 def build_true_abs_from_series(power_true: np.ndarray, soc_true: np.ndarray, H: int) -> np.ndarray:
     """
-    builds absolute ground-truth targets Y_abs[t,h,c] aligned with horizon h (no scaling).
+    builds absolute targets Y_abs[t,h,c] aligned with horizon h in original units.
     """
     T = power_true.size
     Y = np.zeros((T, H, 2), dtype=float)
@@ -83,7 +93,7 @@ def build_true_abs_from_series(power_true: np.ndarray, soc_true: np.ndarray, H: 
 def macro_rmse_from_abs(P_abs: np.ndarray, Y_abs: np.ndarray, power_weight: float,
                         decay_lambda: float, t_min_eval: int) -> float:
     """
-    computes the Macro-RMSE with horizon decay on absolute targets/predictions.
+    computes macro-rmse across horizons with an exponential decay, in original units.
     """
     T, H, _ = P_abs.shape
     w_h = np.exp(-float(decay_lambda) * np.arange(H, dtype=float))
@@ -107,9 +117,8 @@ def macro_rmse_for_power_batch(bundle, model: torch.nn.Module, power_batch_kw: n
                                power_weight: float, decay_lambda: float, t_min_eval: int,
                                Y_abs_true: np.ndarray) -> np.ndarray:
     """
-    runs a single batched forward pass for a batch of perturbed power series in kW and
-    returns a vector of macro-rmse values (length R). uses the modelling helpers to
-    reconstruct absolute predictions and inverse-transform to original units.
+    runs a batched forward pass for perturbed power series and returns macro-rmse per perturbation.
+    uses reconstruction + inverse-transform helpers to stay in original units.
     """
     T = bundle.length
     R = power_batch_kw.shape[0]
@@ -135,8 +144,8 @@ def classify_macro_rmse_from_power(bundle, model, power_kw: np.ndarray, *,
                                    power_weight: float, decay_lambda: float, t_min_eval: int,
                                    Y_abs_true: np.ndarray, threshold: float) -> tuple[int, float]:
     """
-    classifies a power curve (kW) by Macro-RMSE threshold. returns (label_int, err), where
-    label_int is 1 for abnormal and 0 for normal.
+    classifies a single power curve by macro-rmse threshold.
+    returns (label_int, err).
     """
     errs = macro_rmse_for_power_batch(bundle, model, power_kw[None, :], power_scaler=power_scaler,
                                       soc_scaler=soc_scaler, idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
@@ -150,8 +159,7 @@ def base_label_from_bundle(bundle, *, power_scaler, soc_scaler, idx_power_inp: i
                            power_weight: float, decay_lambda: float, t_min_eval: int,
                            threshold: float) -> tuple[int, float, np.ndarray]:
     """
-    computes the base label h(ts) and its error using the predictions already stored in the bundle.
-    returns (label_int, err, Y_abs_true).
+    obtains the base label and error of the unmodified session using stored predictions.
     """
     power_true = np.asarray(bundle.true_power_unscaled, dtype=float)
     soc_true = np.asarray(bundle.true_soc_unscaled, dtype=float)
@@ -169,6 +177,10 @@ def base_label_from_bundle(bundle, *, power_scaler, soc_scaler, idx_power_inp: i
 # ----------------------------------------- stage-1: dp and rdp ---------------------------------------- #
 
 def precompute_prefix_sums(y: np.ndarray) -> tuple[np.ndarray, ...]:
+    """
+    precomputes segment errors for lines through endpoints using prefix sums for O(1) queries.
+    identical in spirit to the paper's error tables; we only accelerate the segment sse query.
+    """
     t = np.arange(len(y), dtype=float)
     S1 = np.cumsum(np.ones_like(t))
     Sy = np.cumsum(y)
@@ -196,10 +208,10 @@ def line_through(i: int, yi: float, j: int, yj: float) -> tuple[float, float]:
     return a, b
 
 
-def build_error_tables(y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def build_error_tables_with_prefix(y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     precomputes segment errors err, err_left, err_right, err_all for lines through endpoints.
-    source: authors’ kSimplification repo and paper appendix; implemented with prefix sums for O(1) segment queries.
+    source: authors' kSimplification repo and paper appendix. Implemented with prefix sums for O(1) segment queries.
     """
     n = len(y)
     t = np.arange(n, dtype=float)
@@ -226,89 +238,175 @@ def build_error_tables(y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return err, errL, errR, errA
 
 
-def stage1_dp(y: np.ndarray, q: int, alpha: float, beta: float) -> list[tuple[float, np.ndarray]]:
+def build_error_tables_no_prefix(y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    returns the q least-cost candidates under alpha*err + beta*k using dp + heaps.
-    source: Optimal Robust Simplifications for Explaining Time Series Classifications (paper) and
-    the kSimplification repository; adapted to python.
+    precomputes segment errors for lines through endpoints by direct summation (O(n^3) build).
+    matches the paper's baseline arithmetic.
     """
     n = len(y)
+    t = np.arange(n, dtype=float)
+
+    err  = np.full((n, n), 0.0, dtype=float)
+    errL = np.full((n, n), 0.0, dtype=float)
+    errR = np.full((n, n), 0.0, dtype=float)
+    errA = np.full((n, n), 0.0, dtype=float)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a = (y[j] - y[i]) / (j - i)
+            b = y[i] - a * i
+
+            # segment [i..j]
+            yhat = a * t[i:j+1] + b
+            err[i, j] = float(np.sum((y[i:j+1] - yhat)**2))
+
+            # extend to left [0..j]
+            yhatL = a * t[:j+1] + b
+            errL[i, j] = float(np.sum((y[:j+1] - yhatL)**2))
+
+            # extend to right [i..n-1]
+            yhatR = a * t[i:] + b
+            errR[i, j] = float(np.sum((y[i:] - yhatR)**2))
+
+            # extend both [0..n-1]
+            yhatA = a * t + b
+            errA[i, j] = float(np.sum((y - yhatA)**2))
+
+    return err, errL, errR, errA
+
+
+def _dp_with_heaps_and_ranks(err: np.ndarray, errL: np.ndarray, errR: np.ndarray, errA: np.ndarray,
+                             alpha: float, beta: float, q: int) -> list[tuple[float, np.ndarray]]:
+    """
+    stage-1 dp with heaps and ranks (paper-exact). for each end index j, maintains a heap H_j seeded
+    from the left-extended first segment and from D[i][1] transitions; on each pop, pushes the 'next rank'
+    successor from D[i][r+1]. final heap H_n extends to n-1 and adds single-line both-ends candidates.
+    Note: Added "uid" as a strict tiebreaker so no two entries are identical for comparison. 
+    source: Optimal Robust Simplifications for Explaining Time Series Classifications (Appendix 7.1)
+    and authors' repo: https://github.com/BrigtHaavardstun/kSimplification
+    """
+    n = err.shape[0]
     if n < 2:
         return [(0.0, np.array([0], dtype=int))]
-    err, errL, errR, errA = build_error_tables(y)
 
-    # per-end heaps with up to q candidates each; store as max-heaps via (-cost, (cost, pivots))
-    heaps: List[List[tuple[float, tuple[float, List[int]]]]] = [[] for _ in range(n)]
-    global_heap: List[tuple[float, tuple[float, List[int]]]] = []
+    # D[j]: list of (cost_es, pivots_ndarray) for the j-th endpoint (1-indexed ranks)
+    D: list[list[tuple[float, np.ndarray]]] = [[] for _ in range(n)]
 
-    # initialize with first segment extended left
+    uid = 0  # strict tiebreaker for heap entries
+
+    # helper: push into Hj with heap-safe payload
+    def push_Hj(Hj, cost: float, i: int, r: int, piv: np.ndarray):
+        nonlocal uid
+        uid += 1
+        heapq.heappush(Hj, (float(cost), uid, int(i), int(r), tuple(int(x) for x in piv)))
+
+    # helper: push into Hn with heap-safe payload
+    def push_Hn(Hn, cost: float, i: int, r: int, piv: np.ndarray):
+        nonlocal uid
+        uid += 1
+        heapq.heappush(Hn, (float(cost), uid, int(i), int(r), tuple(int(x) for x in piv)))
+
+    # build D[j] for j = 1..n-1
     for j in range(1, n):
-        for i in range(j):
-            cost = alpha * errL[i, j] + beta
-            piv = [0, j] if i == 0 else [0, i, j]
-            cand = (cost, piv)
-            heapq.heappush(heaps[j], (-cost, cand))
-            if len(heaps[j]) > q:
-                heapq.heappop(heaps[j])
+        Hj: list[tuple[float, int, int, int, tuple[int, ...]]] = []
 
-    # dp transitions
-    for j in range(1, n):
-        for i in range(j):
-            for _, (c_prev, piv_prev) in heaps[i]:
-                cost = c_prev + alpha * err[i, j] + beta
-                piv = piv_prev + [j]
-                cand = (cost, piv)
-                heapq.heappush(heaps[j], (-cost, cand))
-                if len(heaps[j]) > q:
-                    heapq.heappop(heaps[j])
+        # seed from pseudo-start (i == 0) → left-extended first segment to j
+        cost0 = alpha * errL[0, j] + beta
+        push_Hj(Hj, cost0, 0, 0, np.array([0, j], dtype=int))  # r==0 => no DP successor
 
-    # finalize by extending to the end
-    for i in range(n - 1):
-        for _, (c_prev, piv_prev) in heaps[i]:
-            cost = c_prev + alpha * errR[i, n - 1] + beta
-            piv = piv_prev + [n - 1]
-            cand = (cost, piv)
-            heapq.heappush(global_heap, (-cost, cand))
-            if len(global_heap) > q:
-                heapq.heappop(global_heap)
+        # seed from DP predecessors: for each i<j, combine D[i][1] with segment i→j
+        for i in range(1, j):
+            if not D[i]:
+                continue
+            prev_cost, prev_piv = D[i][0]  # rank-1 (index 0)
+            cost = prev_cost + alpha * err[i, j] + beta
+            push_Hj(Hj, cost, i, 1, np.append(prev_piv, j))
 
-    # also consider a single segment through (i,k) extended both ways
-    for i in range(n - 1):
+        # pop best q items for D[j]; when an item came from D[i][r], push successor (r+1)
+        while Hj and len(D[j]) < q:
+            val, _, i, r, piv_t = heapq.heappop(Hj)
+            piv = np.array(piv_t, dtype=int)
+            D[j].append((float(val), piv))
+
+            if r >= 1 and r < len(D[i]):
+                next_prev_cost, next_prev_piv = D[i][r]
+                nxt_cost = next_prev_cost + alpha * err[i, j] + beta
+                push_Hj(Hj, nxt_cost, i, r + 1, np.append(next_prev_piv, j))
+
+    # final heap H_n: extend to the end (n-1) and add both-ends single-segment options
+    Hn: list[tuple[float, int, int, int, tuple[int, ...]]] = []
+
+    # extend each D[i][1] to n-1 with a right extension; again push successors r+1 on pop
+    for i in range(1, n - 1):
+        if not D[i]:
+            continue
+        prev_cost, prev_piv = D[i][0]
+        cost = prev_cost + alpha * errR[i, n - 1] + beta
+        push_Hn(Hn, cost, i, 1, np.append(prev_piv, n - 1))
+
+    # also consider all single-line "both-ends" candidates (no DP successor)
+    for i in range(0, n - 1):
         for k in range(i + 1, n):
             cost = alpha * errA[i, k] + beta
-            piv = [0, k, n - 1] if (i > 0 and k < n - 1) else [0, k, n - 1]
-            cand = (cost, piv)
-            heapq.heappush(global_heap, (-cost, cand))
-            if len(global_heap) > q:
-                heapq.heappop(global_heap)
+            push_Hn(Hn, cost, -1, 0, np.array([0, k, n - 1], dtype=int))
 
-    results = [cand for _, cand in global_heap]
-    # ensure pivots are strictly increasing and within [0, n-1]
-    cleaned: list[tuple[float, np.ndarray]] = []
-    for cost, piv in results:
-        piv = np.unique(np.clip(np.asarray(piv, dtype=int), 0, n - 1))
+    # extract top-q final candidates, pushing successors for DP-derived items
+    finals: list[tuple[float, np.ndarray]] = []
+    seen_keys: set[tuple[int, ...]] = set()
+    while Hn and len(finals) < q:
+        val, _, i, r, piv_t = heapq.heappop(Hn)
+        piv = np.array(piv_t, dtype=int)
+
+        # normalise pivots: ensure [0, ..., n-1], strictly increasing, unique
+        piv = np.unique(np.clip(piv, 0, n - 1))
         if piv[0] != 0:
             piv = np.insert(piv, 0, 0)
         if piv[-1] != n - 1:
             piv = np.append(piv, n - 1)
-        cleaned.append((float(cost), piv))
-    cleaned.sort(key=lambda x: x[0])
-    # deduplicate by identical pivot sets
-    uniq = []
-    seen = set()
-    for cost, piv in cleaned:
+
         key = tuple(piv.tolist())
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append((cost, piv))
-    return uniq[:q]
+        if key not in seen_keys:
+            finals.append((float(val), piv))
+            seen_keys.add(key)
+
+        # push successor when derived from D[i][r] (r>=1) and next rank exists
+        if i >= 1 and r < len(D[i]):
+            next_prev_cost, next_prev_piv = D[i][r]
+            nxt_cost = next_prev_cost + alpha * errR[i, n - 1] + beta
+            push_Hn(Hn, nxt_cost, i, r + 1, np.append(next_prev_piv, n - 1))
+
+    finals.sort(key=lambda x: x[0])
+    return finals[:q]
+
+
+def stage1_dp(y: np.ndarray, q: int, alpha: float, beta: float) -> list[tuple[float, np.ndarray]]:
+    """
+    stage-1 "vanilla" DP exactly as in the paper/repo: uses O(n^3) error-table build (no prefix sums)
+    and the heap+rank loop to produce the top-q candidates under alpha*err + beta*k.
+    """
+    if len(y) < 2:
+        return [(0.0, np.array([0], dtype=int))]
+    err, errL, errR, errA = build_error_tables_no_prefix(y)
+    return _dp_with_heaps_and_ranks(err, errL, errR, errA, alpha=alpha, beta=beta, q=q)
+
+
+
+def stage1_dp_prefix(y: np.ndarray, q: int, alpha: float, beta: float) -> list[tuple[float, np.ndarray]]:
+    """
+    fast stage-1: same dp+heaps but with prefix-sum error tables for O(1) segment sse.
+    """
+    if len(y) < 2:
+        return [(0.0, np.array([0], dtype=int))]
+    err, errL, errR, errA = build_error_tables_with_prefix(y)
+    return _dp_with_heaps_and_ranks(err, errL, errR, errA, alpha=alpha, beta=beta, q=q)
+
 
 
 def stage1_rdp(y: np.ndarray, stage1_candidates: int, beta: float) -> list[tuple[float, np.ndarray]]:
     """
-    returns a pool of candidates by varying the rdp epsilon and computing cost_es = err + beta*k.
-    source: RDP; used here as a speed-oriented heuristic (not part of the original paper).
+    heuristic stage-1 using ramer-douglas-peucker to propose pivot sets; scored by l2+beta*k.
+    Generates candidates more efficiently than DP, however, optimal candidate not guaranteed. 
+    Yields faster results but candidates tend to have higher k than with DP. 
     """
     n = len(y)
     x = np.arange(n)
@@ -342,20 +440,24 @@ def stage1_rdp(y: np.ndarray, stage1_candidates: int, beta: float) -> list[tuple
 
 def ors_candidates(y: np.ndarray, params: ORSParams) -> list[tuple[float, np.ndarray]]:
     """
-    dispatches stage-1 according to params.stage1_mode and returns a list of (cost_es, pivots).
+    stage-1 dispatcher that returns a list of (cost_es, pivots). dp modes use l2 by construction.
     """
-    if params.stage1_mode == "dp":
+    mode = params.stage1_mode.lower()
+    if mode == "dp":
         return stage1_dp(y, q=params.q, alpha=params.alpha, beta=params.beta)
-    if params.stage1_mode == "rdp":
+    elif mode == "dp_prefix":
+        return stage1_dp_prefix(y, q=params.q, alpha=params.alpha, beta=params.beta)   # your existing fast DP
+    elif mode == "rdp":
         return stage1_rdp(y, stage1_candidates=params.stage1_candidates, beta=params.beta)
-    raise ValueError(f"unknown stage1_mode: {params.stage1_mode}")
+    else:
+        raise ValueError(f"unknown stage1_mode: {params.stage1_mode}")
 
 
 # ----------------------------------------- stage-2: robustness --------------------------------------- #
 
 def interpolate_from_pivots(T: int, pivots: np.ndarray, pv: np.ndarray) -> np.ndarray:
     """
-    builds a series of length T by linear interpolation between pivot values pv at indices pivots.
+    interpolates a length-T series linearly between pivot values.
     """
     x = np.arange(T, dtype=float)
     return np.interp(x, pivots, pv)
@@ -363,8 +465,7 @@ def interpolate_from_pivots(T: int, pivots: np.ndarray, pv: np.ndarray) -> np.nd
 
 def interpolate_batch_from_pivots(T: int, pivots: np.ndarray, pv_batch: np.ndarray) -> np.ndarray:
     """
-    builds a batch (R, T) by linear interpolation between row-wise pivot values.
-    implements a compact loop over segments for efficiency.
+    vectorised linear interpolation for a batch of pivot-value sets.
     """
     R = pv_batch.shape[0]
     out = np.empty((R, T), dtype=float)
@@ -391,10 +492,8 @@ def fragility_uniform_band_batched(bundle, model, pivots: np.ndarray, sts_y: np.
                                    power_weight: float, decay_lambda: float, t_min_eval: int,
                                    Y_abs_true: np.ndarray, threshold: float, seed: Optional[int]) -> float:
     """
-    estimates fragility as in the paper: sample R perturbations by adding iid Unif[-eps, +eps]
-    to the k+1 pivot values and classify each perturbed series. batches model inference for speed.
-    source: kSimplification repo / paper section on local robustness (uniform band around pivots).
-    """
+    estimates fragility by sampling uniform ±epsilon noise at pivot values and classifying each perturbation.
+    identical to the paper's "uniform band at pivots", batched for efficiency."""
     rng = np.random.default_rng(seed)
     k = len(pivots) - 1
     T = sts_y.size
@@ -415,16 +514,12 @@ def fragility_uniform_band_batched(bundle, model, pivots: np.ndarray, sts_y: np.
 
 # ----------------------------------------- main driver ------------------------------------------------ #
 
-def ors_optimal_mrmse(bundle, model: torch.nn.Module, params: ORSParams, *,
+def ors(bundle, model: torch.nn.Module, params: ORSParams, *,
                       power_scaler, soc_scaler, idx_power_inp: int, idx_soc_inp: int,
                       power_weight: float, decay_lambda: float, threshold: float) -> dict:
     """
-    performs the ors optimization exactly as in the paper:
-    stage-1 generates candidates minimizing alpha*err + beta*k (dp top-q or rdp pool);
-    stage-2 adds gamma*frag with perturbations in a uniform band at pivots and selects the minimum.
-    the classifier h is the macro-rmse threshold rule used in your anomaly detection.
-
-    returns a dict with keys: 'obj', 'k', 'piv', 'sts', 'frag', 'err', 'label'.
+    runs ors end-to-end: stage-1 candidate generation, same-label filtering, robustness estimation,
+    and final selection with objective alpha*err + beta*k + gamma*frag in original units.
     """
     T = bundle.length
     y = np.asarray(bundle.true_power_unscaled, dtype=float)
@@ -454,12 +549,12 @@ def ors_optimal_mrmse(bundle, model: torch.nn.Module, params: ORSParams, *,
     else:
         raise ValueError(f"unknown epsilon_mode: {params.epsilon_mode}")
 
-    # paper theorem 2 gap diagnostic (only meaningful for dp)
+    # paper-exact theorem 2 gap diagnostic (only meaningful for dp)
     if params.stage1_mode == "dp" and len(cands) >= 2:
         q_eff = min(params.q, len(cands))
         d = float(cands[q_eff - 1][0] - cands[0][0]) if q_eff >= 2 else float("inf")
         if params.gamma > d:
-            print(f"[ORS] warning: gamma={params.gamma:.4g} > gap d={d:.4g}; optimality may not be guaranteed. "
+            print(f"[ORS] warning: gamma={params.gamma:.4g} > gap d={d:.4g}; optimality not guaranteed. "
                   f"consider increasing q or reducing gamma.")
 
     # evaluate all candidates
@@ -480,7 +575,7 @@ def ors_optimal_mrmse(bundle, model: torch.nn.Module, params: ORSParams, *,
             power_weight=power_weight, decay_lambda=decay_lambda,
             t_min_eval=params.t_min_eval, Y_abs_true=Y_abs_true, threshold=threshold
         )
-        if params.enforce_same_label and (lbl_sts != base_lbl):
+        if lbl_sts != base_lbl:
             # skip candidates that do not keep the original classification
             continue
 
@@ -514,6 +609,7 @@ def ors_optimal_mrmse(bundle, model: torch.nn.Module, params: ORSParams, *,
             if k < int(params.min_k) or k > int(params.max_k):
                 continue
             sts = interpolate_from_pivots(T, piv, y[piv])
+            l2_err = float(np.sum((y - sts) ** 2)) 
             lbl_sts, err_sts = classify_macro_rmse_from_power(
                 bundle, model, sts, power_scaler=power_scaler, soc_scaler=soc_scaler,
                 idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
@@ -528,7 +624,17 @@ def ors_optimal_mrmse(bundle, model: torch.nn.Module, params: ORSParams, *,
                 t_min_eval=params.t_min_eval, Y_abs_true=Y_abs_true, threshold=threshold,
                 seed=params.seed
             )
-            total = float(cost_es + params.gamma * frag)
+
+             # compute the error metric for the unperturbed simplification
+            if params.stage2_err_metric == "l2":
+                err_for_obj = l2_err
+            elif params.stage2_err_metric == "mrmse":
+                err_for_obj = err_sts
+            else:
+                raise ValueError(f"unknown stage2_err_metric: {params.stage2_err_metric}")
+
+            # final objective recomputed with chosen metric
+            total = float(params.alpha * err_for_obj + params.beta * k + params.gamma * frag)
             cand = dict(obj=total, k=int(len(piv) - 1), piv=piv, sts=sts, frag=float(frag),
                         err=float(err_sts), label=("abnormal" if lbl_sts == 1 else "normal"))
             if (best is None) or (cand["obj"] < best["obj"]):

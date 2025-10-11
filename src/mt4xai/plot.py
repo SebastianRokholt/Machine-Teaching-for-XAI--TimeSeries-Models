@@ -1,12 +1,10 @@
 # src/mt4xai/plot.py
-from typing import Optional, Tuple
 import numpy as np
-import torch
-import torch.nn as nn
+import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-import seaborn as sns
-from .data import SessionPredsBundle
+from typing import Optional, Tuple
+from .data import SessionPredsBundle, reconstruct_abs_from_bundle
 
 
 def plot_full_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
@@ -106,41 +104,30 @@ def plot_full_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
     plt.show()
 
 # ------------------------------- Curve simplification ------------------------------------------ #
-from typing import Optional, Tuple
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from .data import SessionPredsBundle, reconstruct_abs_from_bundle
 
 
-def plot_session_with_simplification(bundle: SessionPredsBundle,
-                                     power_scaler, soc_scaler,
-                                     idx_power_inp: int, idx_soc_inp: int,
-                                     simpl_power_unscaled: np.ndarray,
-                                     *,
-                                     session_id: int | None = None,
-                                     k: int | None = None,
-                                     threshold: float | None = None,
-                                     simp_error: float | None = None,
-                                     orig_error: float | None = None, 
-                                     label: str | None = None,
-                                     decay_lambda: float | None = None,
-                                     noise_std_kw: float | None = None,
-                                     robust_tau: float | None = None,
-                                     figsize: Tuple[float, float] = (12.0, 5.0),
-                                     dpi: int = 110, 
-                                     t_min_eval: int = 1):
+def plot_session_with_simplification(
+    bundle: SessionPredsBundle, power_scaler, soc_scaler, idx_power_inp: int, idx_soc_inp: int,
+    simpl_power_unscaled: np.ndarray, *, session_id: int | None = None, k: int | None = None,
+    threshold: float | None = None, simp_error: float | None = None, orig_error: float | None = None,
+    label: str | None = None, decay_lambda: float | None = None, noise_std_kw: float | None = None,
+    robust_tau: float | None = None, figsize: tuple[float, float] = (12.0, 5.0), dpi: int = 110,
+    t_min_eval: int = 1
+    ) -> tuple[plt.Figure, plt.Axes]:
     """
     plots true power, all-horizon predicted power, and an ors-simplified power curve.
-    adds a descriptive title and a caption with classifier/ors settings.
+    returns the matplotlib figure and axes so callers can manage rendering.
     """
     T, H = bundle.length, bundle.horizon
     t = np.arange(T)
     true = np.asarray(bundle.true_power_unscaled, dtype=float)
     sid = int(session_id) if session_id is not None else bundle.session_id
 
-    plt.figure(figsize=figsize, dpi=dpi)
-    sns.lineplot(x=t, y=true, color="black", linewidth=2.2, label="True power")
+    # create figure/axes explicitly and apply all config to them
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+    # true power
+    sns.lineplot(x=t, y=true, color="black", linewidth=2.2, label="True power", ax=ax)
 
     # multi-horizon predictions (power)
     palette = sns.color_palette("deep", n_colors=H)
@@ -150,34 +137,45 @@ def plot_session_with_simplification(bundle: SessionPredsBundle,
         if i_valid.size == 0:
             continue
         t_pred = i_valid + (h0 + 1)
-        preds = power_scaler.inverse_transform(P_abs[i_valid, h0, 0].numpy().reshape(-1, 1)).ravel()
-        sns.lineplot(x=t_pred, y=preds, linestyle="--", linewidth=1.6, color=palette[h0],
-                     label=f"H={h0+1}", marker="o", markersize=2.5)
+        preds = power_scaler.inverse_transform(
+            P_abs[i_valid, h0, 0].numpy().reshape(-1, 1)
+        ).ravel()
+        sns.lineplot(
+            x=t_pred, y=preds, linestyle="--", linewidth=1.6, color=palette[h0],
+            label=f"H={h0+1}", marker="o", markersize=2.5, ax=ax
+        )
 
     # ors simplification
-    sns.lineplot(x=t, y=simpl_power_unscaled, color="tab:red", linewidth=2.6, label="ORS simplification")
+    sns.lineplot(
+        x=t, y=simpl_power_unscaled, color="tab:red", linewidth=2.6, label="ORS simplification", ax=ax
+    )
 
-    # required title format
+    # title
     ttl = f"ORS Simplification of Charging Session {sid}. Classification = {label}, k = {k}"
-    plt.title(ttl)
+    ax.set_title(ttl)
 
-    # figure description (caption)
-    cap_parts = []
-    if label is not None: cap_parts.append(f"Classification: {label}")
-    if simp_error is not None:  cap_parts.append(f"prediction error on simplification = {simp_error:.3f}")
-    if orig_error is not None:  cap_parts.append(f"prediction error on original = {orig_error:.3f}")
-    if threshold is not None: cap_parts.append(f"classification threshold = {threshold}")
-    if k is not None:  cap_parts.append(f"k = {k}")
+    # caption string
+    cap_parts: list[str] = []
+    if label is not None:        cap_parts.append(f"Classification: {label}")
+    if simp_error is not None:   cap_parts.append(f"prediction error on simplification = {simp_error:.3f}")
+    if orig_error is not None:   cap_parts.append(f"prediction error on original = {orig_error:.3f}")
+    if threshold is not None:    cap_parts.append(f"classification threshold = {threshold}")
+    if k is not None:            cap_parts.append(f"k = {k}")
     if decay_lambda is not None: cap_parts.append(f"λ = {decay_lambda}")
     if noise_std_kw is not None: cap_parts.append(f"noise_std_kw = {noise_std_kw}")
-    if robust_tau is not None: cap_parts.append(f"robust_tau = {robust_tau}")
+    if robust_tau is not None:   cap_parts.append(f"robust_tau = {robust_tau}")
     fig_desc = ", ".join(cap_parts)
 
-    plt.xlabel("Time index"); plt.ylabel("Power (kW)")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    # add bottom caption with a little extra bottom margin
-    plt.subplots_adjust(bottom=0.18)
-    plt.gcf().text(0.01, 0.02, fig_desc, fontsize=9, ha="left")
-    plt.show()
+    # axes formatting
+    ax.set_xlabel("Time index")
+    ax.set_ylabel("Power (kW)")
+    ax.grid(True)
+    ax.legend()
+
+    # layout and caption placement belong to the figure object
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.18)
+    fig.text(0.01, 0.02, fig_desc, fontsize=9, ha="left")
+
+    return fig, ax
+
