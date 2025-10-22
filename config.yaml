@@ -1,0 +1,48 @@
+# ===========================================================
+# MT4XAI Project Configuration
+# Stores tunable parameters and empirically derived constants
+# ===========================================================
+
+project:
+  random_seed: 42
+  # root_dir is dynamically resolved automatically in config.py
+  root_dir: null
+
+paths:
+  # Data paths
+  dataset: "Data/etron55-charging-sessions.parquet"
+  teaching_pool: "Data/teaching_pool"
+  # Model paths
+  models: "Models" 
+  final_model: "Models/final/final_model.pth"
+  # Other dir paths
+  figures: "Figures"
+  logs: "Logs"
+
+modelling:
+  horizon: 5
+  # final model hyperparams derived from model tuning
+  final_model_name: "final_model.pth"
+  # hidden_dim: 
+  # num_layers: 
+  # dropout: 
+  power_weight: 0.6522982410461 
+  decay_lambda: 0.4
+
+anomaly_detection:
+  # values derived from anomaly detection exploration in notebook 4
+  t_min_eval: 1  
+  rmse_threshold: 8.5962  
+  ad_pct_threshold: 0.95  
+  metric: "macro_rmse"
+
+ors:
+  # values derived from ORS exploration in notebook 5
+  # alpha: 
+  # beta:
+  # gamma: 
+  # epsilon: 
+
+teaching:
+  teaching_pool_dir: "../Data/teaching_pool"
+  teaching_set_size: 200  # balanced across two classes

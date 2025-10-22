@@ -9,15 +9,31 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 
-# Ray Tune and BOHB results
+# Data
+Data/map_data_for_plotting/
+Data/teaching_pool/*.json
+*.parquet
+*.png
+*.gif
+*.cpg
+*.cpg:Zone.Identifier
+*.prj
+*.shp
+*.shx
+*.pkl
+*.jpeg
+*.npy
+*.db
+*.db-wal
+*.db-shm
+
+
+# Models
+/Models
 bohb_*_tuning*/
 
-# Data
-Data/
-*.parquet
-
 # Notebook backups
-Notebooks/Backups/
+Backups/
 
 # VS Code
 .vscode
