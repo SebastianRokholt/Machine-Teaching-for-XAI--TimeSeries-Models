@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from typing import Iterable
 from sklearn.preprocessing import MinMaxScaler
-from .data import Session, SessionPredsBundle, reconstruct_abs_from_bundle, make_bundle_from_session_df
+from .data import SessionPredsBundle, reconstruct_abs_from_bundle, make_bundle_from_session_df
 
 @torch.no_grad()
 def predict_residuals(model, X: torch.Tensor, lengths: torch.Tensor, device: torch.device) -> torch.Tensor:

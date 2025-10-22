@@ -1,11 +1,11 @@
 # src/mt4xai/plot.py
+from __future__ import annotations
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from typing import Optional, Tuple
 from .data import SessionPredsBundle, reconstruct_abs_from_bundle
-
 
 def plot_full_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
                       idx_power_inp: int, idx_soc_inp: int,
@@ -103,8 +103,6 @@ def plot_full_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
     fig.tight_layout()
     plt.show()
 
-# ------------------------------- Curve simplification ------------------------------------------ #
-
 
 def plot_session_with_simplification(
     bundle: SessionPredsBundle, power_scaler, soc_scaler, idx_power_inp: int, idx_soc_inp: int,
@@ -179,3 +177,60 @@ def plot_session_with_simplification(
 
     return fig, ax
 
+
+def plot_raw_power(*, t: np.ndarray, power_kw: np.ndarray, title: str | None = None,
+                       y_lim: tuple[float, float] | None = None, show_soc: bool = False,
+                       soc_pct: np.ndarray | None = None):
+    t = np.asarray(t, dtype=float)
+    power_kw = np.asarray(power_kw, dtype=float)
+
+    sns.set_theme(style="whitegrid")
+    sns.set_palette("deep")
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    # raw power: dotted black
+    sns.lineplot(x=t, y=power_kw, ax=ax, color="black", linestyle=":", linewidth=2.6, label="raw power")
+
+    # optional SOC overlay (kept off in teaching by default)
+    if show_soc and soc_pct is not None:
+        sns.lineplot(x=t, y=np.asarray(soc_pct, dtype=float), ax=ax, linewidth=2.0, label="soc (%)")
+
+    ax.set_xlabel("minutes elapsed")
+    ax.set_ylabel("kW")
+    if y_lim is not None:
+        ax.set_ylim(*y_lim)
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_raw_and_simpl(*, t: np.ndarray, power_kw: np.ndarray, simp_power_kw: np.ndarray,
+                           title: str | None = None, y_lim: tuple[float, float] | None = None,
+                           show_soc: bool = False, soc_pct: np.ndarray | None = None):
+    t = np.asarray(t, dtype=float)
+    power_kw = np.asarray(power_kw, dtype=float)
+    simp_power_kw = np.asarray(simp_power_kw, dtype=float)
+
+    sns.set_theme(style="whitegrid")
+    sns.set_palette("deep")
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    # raw power: dotted black
+    sns.lineplot(x=t, y=power_kw, ax=ax, color="black", linestyle=":", linewidth=2.6, label="raw power")
+    # simplification: red solid
+    sns.lineplot(x=t, y=simp_power_kw, ax=ax, color="tab:red", linewidth=2.6, label="simplified")
+
+    if show_soc and soc_pct is not None:
+        sns.lineplot(x=t, y=np.asarray(soc_pct, dtype=float), ax=ax, linewidth=2.0, label="soc (%)")
+
+    ax.set_xlabel("minutes elapsed")
+    ax.set_ylabel("kW")
+    if y_lim is not None:
+        ax.set_ylim(*y_lim)
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig, ax
