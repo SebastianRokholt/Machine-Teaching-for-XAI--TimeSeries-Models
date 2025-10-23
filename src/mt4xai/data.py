@@ -2,6 +2,8 @@
 from dataclasses import dataclass
 from typing import Any, List, Dict, Literal, Sequence, Tuple, Optional
 import math, random
+from matplotlib.figure import Figure
+from matplotlib.pylab import Axes
 import numpy as np
 import pandas as pd
 import sklearn
@@ -195,47 +197,45 @@ class ChargingSession:
         return t
     
     def plot(
-        self, *, show_soc: bool = False, title: str | None = None, y_lim: tuple[float, float] | None = None
-    ):
-        """Plot raw power (optionally SOC) with an overlay of the densified simplification if present.
-        This method never scales data. If a simplification is attached, the power overlay is
-        built by densifying the stored knots on the session's sample grid. 
+        self, *, 
+        soc_mode: Literal["none", "raw", "simpl"] = "none", 
+        title: str | None = None, 
+        y_lim: tuple[float, float] | None = None
+        ) -> tuple[Figure, Axes]:
+        """Plots session with optional SOC overlay on a right 0–100% axis.
         Args:
-            show_soc: Whether to draw the SOC series alongside power.
+            soc_mode: Controls SOC visibility. "none" hides SOC, "raw" uses self.soc_pct,
+                "simpl" uses knots from self.simplification to densify SOC.
             title: Optional plot title.
-            y_lim: Optional fixed y-limits (min, max) in original units.
-        Returns: (fig, ax): Matplotlib Figure and Axes.
+            y_lim: Optional y-axis limit for power in kW as (ymin, ymax).
+        Returns:
+            Matplotlib figure and axis.
         """
         # local import to avoid circular dependency
-        from .plot import plot_raw_power, plot_raw_and_simpl
+        from .plot import plot_raw_session, plot_raw_simpl_session
 
         self.validate(check_knots=True)
-        T = int(np.asarray(self.power_kw).shape[0])
-        t = np.arange(T, dtype=float)
-
-        simp_dense = None
-        if self.simplification is not None:
-            simp_dense = self.simplification.densify_power(T)
-
-        if simp_dense is None:
-            return plot_raw_power(
-                t=t,
-                power_kw=np.asarray(self.power_kw, dtype=float),
-                soc_pct=(np.asarray(self.soc_pct, dtype=float) if (show_soc and self.soc_pct is not None) else None),
-                title=title,
-                y_lim=y_lim,
-                show_soc=show_soc,
-            )
+        power = np.asarray(self.power_kw, dtype=float).reshape(-1)
+        T = power.size
+        # decide SOC series once
+        soc: np.ndarray | None = None
+        if soc_mode == "raw" and self.soc_pct is not None:
+            soc = np.asarray(self.soc_pct, dtype=float).reshape(-1)
+            if soc.size != T:
+                raise ValueError("power_kw and soc_pct must have equal length")
+        elif soc_mode == "simpl" and self.simplification is not None and getattr(self.simplification, "soc_knot_idx", None) is not None:
+            sidx = np.asarray(self.simplification.soc_knot_idx, dtype=int)
+            sval = np.asarray(self.simplification.soc_knot_val_pct, dtype=float)
+            xs = np.arange(T, dtype=float); soc = np.interp(xs, sidx.astype(float), sval).astype(float)
         else:
-            return plot_raw_and_simpl(
-                t=t,
-                power_kw=np.asarray(self.power_kw, dtype=float),
-                simp_power_kw=np.asarray(simp_dense, dtype=float),
-                soc_pct=(np.asarray(self.soc_pct, dtype=float) if (show_soc and self.soc_pct is not None) else None),
-                title=title,
-                y_lim=y_lim,
-                show_soc=show_soc,
-            )
+            soc_mode = "none"
+
+        if self.simplification is None or getattr(self.simplification, "power_knot_idx", None) is None:
+            return plot_raw_session(power_kw=power, soc=soc, soc_mode=soc_mode, title=title, y_lim=y_lim)
+        else:
+            idx = np.asarray(self.simplification.power_knot_idx, dtype=int)
+            val = np.asarray(self.simplification.power_knot_val_kw, dtype=float)
+            return plot_raw_simpl_session(power_kw=power, idx=idx, val_kw=val, soc=soc, soc_mode=soc_mode, title=title, y_lim=y_lim)
         
     def validate(self, *, check_knots: bool = True) -> None:
         """Validate internal consistency (length alignment, optional knots checks).

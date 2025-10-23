@@ -16,7 +16,7 @@ def load_config():
     cfg["project"]["root_dir"] = str(root)
 
     # detect device (gpu / cpu)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg["project"]["device"] = device
 
     # makes all entries under 'paths' absolute
@@ -27,6 +27,10 @@ def load_config():
     # Return config object with dot access
     return _to_ns(cfg)
 
+
+def validate_config(cfg): 
+    # TODO: implement validation checks
+    pass
 
 # Enables dot access
 def _to_ns(obj):

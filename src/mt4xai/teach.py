@@ -22,7 +22,7 @@ from .ors import ORSParams, ors, build_true_abs_from_series, macro_rmse_from_abs
 from .inference import predict_residuals, inverse_targets_np, reconstruct_abs_from_residuals_batch
 from .data import fetch_session_preds_bundle, ChargingSession, ChargingSessionSimplification
 from .model import load_lstm_model
-from .plot import plot_session_with_simplification, plot_raw_and_simpl, plot_raw_power
+from .plot import plot_raw_pred_simp_session, plot_raw_simpl_session, plot_raw_session
 
 
 # ----------------- Teaching Pool construction ------------------------- #
@@ -209,7 +209,7 @@ class TeachingPoolConfig:
         output_dir: Directory for parquet/sqlite/arrays.
         threshold: Macro-RMSE threshold used for base labels.
         seed: RNG seed for reproducibility.
-        device_str: Device string accepted by torch.
+        device: Device string accepted by torch.
         export_every: Write cache rows every n items.
         L: Resampling length used in embeddings.
         P: Number of top peaks used in embeddings.
@@ -221,7 +221,7 @@ class TeachingPoolConfig:
     output_dir: str = "../Data/teaching_pool"
     threshold: float = 8.5962
     seed: int = 42
-    device_str: str = "cuda"
+    device: torch.device = torch.device("cuda"),
     export_every: int = 10
     L: int = 128
     P: int = 4
@@ -255,11 +255,15 @@ def ensure_dirs(root: Path) -> dict[str, Path]:
         "sts_full": root / "sts_full",
         "piv": root / "piv",
         "raw_power": root / "raw_power",
+        "raw_soc": root / "raw_soc",
+        "piv_soc": root / "piv_soc",
+        "sts_soc": root / "sts_soc",
     }
     for p in d.values():
         if p != root:
             p.mkdir(parents=True, exist_ok=True)
     return d
+
 
 
 def _db_connect(db_path: Path) -> sqlite3.Connection:
@@ -279,7 +283,7 @@ def construct_teaching_pool(
     soc_scaler: sklearn.preprocessing.MinMaxScaler,
     idx_power_inp: int,
     idx_soc_inp: int,
-) -> None:
+    ) -> None:
     """
     Builds and caches the Optimal Robust Simplification (ORS) teaching pool used in the MT4XAI pipeline.
 
@@ -329,9 +333,8 @@ def construct_teaching_pool(
               session_id, label_text/int, k, err, frag, robust_prob, margin,
               threshold, model_id, timestamps, paths to saved arrays, and binary-encoded embeddings.
     """
-    device = torch.device(config.device_str if torch.cuda.is_available() and config.device_str == "cuda" else "cpu")
     if model is None:
-        model, ckpt = load_lstm_model(config.model_path, device=device)
+        model, ckpt = load_lstm_model(config.model_path, device=config.device)
         model.eval()
         cfg_model = ckpt["config"]
         config.power_weight = float(cfg_model.get("power_weight", config.power_weight))
@@ -354,7 +357,7 @@ def construct_teaching_pool(
         abn_ids, norm_ids, err_by_id = compute_base_labels(
             test_loader,
             model,
-            device,
+            config.device,
             power_scaler=power_scaler,
             soc_scaler=soc_scaler,
             idx_power_inp=idx_power_inp,
@@ -393,18 +396,26 @@ def construct_teaching_pool(
             batch_index=None,
             sample_index=None,
             session_id=int(sid),
-            device=device,
+            device=config.device,
             power_scaler=power_scaler,
             soc_scaler=soc_scaler,
             idx_power_inp=idx_power_inp,
             idx_soc_inp=idx_soc_inp,
         )
 
-        # persist raw power for overlays
+        # persist raw power and raw SOC for overlays
         try:
             np.save(dirs["raw_power"] / f"{sid}.npy", np.asarray(b.true_power_unscaled, dtype=np.float32))
         except Exception as e:
             print(f"[teach][warn] cannot save raw power sid={sid}: {e}")
+        try:
+            soc_arr = np.asarray(b.true_soc_unscaled, dtype=np.float32).reshape(-1)
+            if soc_arr.size == 0 or not np.all(np.isfinite(soc_arr)):
+                raise ValueError("missing or invalid SOC series")
+            np.save(dirs["raw_soc"] / f"{sid}.npy", soc_arr)
+        except Exception as e:
+            # SOC is required in teaching flow
+            raise RuntimeError(f"[teach] session {sid}: SOC missing or cannot save: {e}") from e
 
         # clamp ORS params to sequence length
         try:
@@ -446,7 +457,7 @@ def construct_teaching_pool(
             print(f"[teach][warn] metric cast failure sid={sid}: {e}; skipping.")
             continue
 
-        # save arrays
+        # save power arrays
         try:
             sts = np.asarray(res["sts"], dtype=np.float32)
             piv = np.asarray(res["piv"], dtype=np.int32)
@@ -457,6 +468,23 @@ def construct_teaching_pool(
         except Exception as e:
             print(f"[teach][warn] saving arrays failed sid={sid}: {e}; skipping.")
             continue
+        # save soc arrays
+        piv_soc_path: Path | None = None
+        sts_soc_path: Path | None = None
+        try:
+            piv_soc = res.get("piv_soc", None)
+            sts_soc = res.get("sts_soc", None)
+            if piv_soc is not None and sts_soc is not None:
+                piv_soc = np.asarray(piv_soc, dtype=np.int32)
+                sts_soc = np.asarray(sts_soc, dtype=np.float32)
+                piv_soc_path = dirs["piv_soc"] / f"{sid}.npy"
+                sts_soc_path = dirs["sts_soc"] / f"{sid}.npy"
+                np.save(piv_soc_path, piv_soc)
+                np.save(sts_soc_path, sts_soc)
+        except Exception as e:
+            print(f"[teach][warn] saving soc simplification arrays failed for sid={sid}," 
+                    "proceeding with only raw SOC ")
+            piv_soc_path, sts_soc_path = None, None
 
         # embedding
         try:
@@ -478,8 +506,12 @@ def construct_teaching_pool(
             threshold=float(config.threshold),
             model_id=p_local.model_id,
             ts_unix=float(time.time()),
+            raw_power_path=str((dirs["raw_power"] / f"{sid}.npy").as_posix()),
+            raw_soc_path=str((dirs["raw_soc"] / f"{sid}.npy").as_posix()),
             sts_full_path=str(sts_path.as_posix()),
+            sts_soc_path=(str(sts_soc_path.as_posix()) if sts_soc_path is not None else None),
             piv_path=str(piv_path.as_posix()),
+            piv_soc_path=(str(piv_soc_path.as_posix()) if piv_soc_path is not None else None),
             emb_dim=int(2 * config.L + 2 * config.P),
             emb=emb_blob,
         )
@@ -796,8 +828,12 @@ def bin_pool(
         "threshold",
         "emb_dim",
         "emb",
+        "raw_power_path",
         "sts_full_path",
         "piv_path",
+        "raw_soc_path",
+        "sts_soc_path",
+        "piv_soc_path",
         "model_id",
     ]
     cols = [c for c in cols if c in df.columns]
@@ -924,12 +960,12 @@ class TeachingSet:
 
     Attributes:
         pool: Source `TeachingPool`.
-        selected_df: Selection in decision order with metadata columns.
+        teaching_set_df: Selected sessions/examples/witnesses in selection order with metadata columns.
         meta: Selection config and diagnostics (budgets, coverage, spillovers).
     """
 
     pool: TeachingPool
-    selected_df: pd.DataFrame | None = None
+    teaching_set_df: pd.DataFrame | None = None
     meta: dict = field(default_factory=dict)
     # iterators for serving examples, set by build_group_iterators
     iter_A: Optional[TeachIterator] = None
@@ -975,7 +1011,7 @@ class TeachingSet:
             output_dir=out_dir,
         )
         self.pool = pool
-        self.selected_df = selected_df
+        self.teaching_set_df = selected_df
         self.meta = meta
     
     def build_group_iterators(self, *, max_per_class: int | None = 100, seed: int = 42) -> dict[str, TeachIterator]:
@@ -983,7 +1019,7 @@ class TeachingSet:
         Builds and stores group iterators on this TeachingSet.
         Alternation N/A/N/A… is handled inside TeachIterator.
         """
-        if self.selected_df is None:
+        if self.teaching_set_df is None:
             raise ValueError("selected_df is None; run selection first.")
 
         rng = np.random.default_rng(seed)
@@ -1004,13 +1040,13 @@ class TeachingSet:
 
     def ids(self) -> np.ndarray:
         """Returns the unique selected session IDs."""
-        if self.selected_df is None:
+        if self.teaching_set_df is None:
             return np.array([], dtype=int)
-        return self.selected_df["session_id"].unique()
+        return self.teaching_set_df["session_id"].unique()
 
     def sample_group_A(self, *, max_per_class: int | None = 100) -> pd.DataFrame:
         """Curriculum: order by k ascending within class, then margin descending."""
-        df = self.selected_df.copy()
+        df = self.teaching_set_df.copy()
         if max_per_class is not None:
             df = df.groupby("class_label", group_keys=False).apply(
                 lambda g: g.sort_values(["k", "margin"], ascending=[True, False]).head(max_per_class)
@@ -1021,7 +1057,7 @@ class TeachingSet:
 
     def sample_group_B(self, *, max_per_class: int | None = 100, seed: int = 42) -> pd.DataFrame:
         """Random order within class; show simplification overlay."""
-        df = self.selected_df.copy()
+        df = self.teaching_set_df.copy()
         if max_per_class is not None:
             df = df.groupby("class_label", group_keys=True).head(max_per_class)
         df = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
@@ -1048,25 +1084,25 @@ class TeachingSet:
             raise ValueError(f"unknown group '{group}'")
 
         # plotting is performed inside the iterator; y_lim kept for future extension
-        meta = next(it)  # may raise StopIteration, which is fine
+        meta = next(it)  # TODO: Handle StopIteration
         return meta
     
     def save(self, *, output_dir: str | Path | None = None) -> None:
         """Writes `selection.parquet` and `selection_config.json` beside the pool files."""
-        if self.selected_df is None:
+        if self.teaching_set_df is None:
             raise ValueError("selected_df is None.")
         root = Path(output_dir) if output_dir is not None else self.pool.paths.get("root", Path("."))
         root.mkdir(parents=True, exist_ok=True)
-        self.selected_df.to_parquet(root / "selection.parquet", index=False)
+        self.teaching_set_df.to_parquet(root / "selection.parquet", index=False)
         with open(root / "selection_config.json", "w") as f:
             json.dump(self.meta, f, indent=2)
 
     def describe(self) -> None:
         """Prints selection counts and facility-location coverage by class."""
-        if self.selected_df is None:
+        if self.teaching_set_df is None:
             print("teaching set: empty")
             return
-        df = self.selected_df
+        df = self.teaching_set_df
         n = len(df)
         by_class = df.groupby("class_label")["session_id"].nunique().rename("n_sessions")
         print(f"[teaching set] rows={n}, classes:\n{by_class.to_string()}")
@@ -1477,7 +1513,7 @@ class TeachIterator:
         meta = self._serve_row(row)
         return meta
 
-    # core: build session, plot immediately, and return a small log dict
+    # build session, plot immediately, and return a small log dict
     def _serve_row(self, row: pd.Series) -> dict:
         sid = int(row.get("session_id", row.get("charging_id", -1)))
         # paths
@@ -1494,7 +1530,7 @@ class TeachIterator:
         simp = None
         if self.group in ("A", "B"):
             if piv_path is not None and Path(piv_path).exists():
-                idx, val = _load_knots(piv_path, power_kw=power)
+                idx, val = _load_knots(piv_path, base_series=power)
                 idx, val = _align_knots(idx, val, T)
                 simp = ChargingSessionSimplification(
                     power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
@@ -1508,40 +1544,90 @@ class TeachIterator:
                     power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
                 )
         sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
-        # immediate plot
+        # immediate plot with group-specific SOC rules
         if "label" in row and pd.notna(row["label"]):
             label_str = str(row["label"])
         elif "class_label" in row and pd.notna(row["class_label"]):
             label_str = "normal" if int(row["class_label"]) == 0 else "abnormal"
         else:
             label_str = "unknown"
+
+        # derive file paths
+        sts_full_path = row.get("sts_full_path", None)
+        piv_path = row.get("piv_path", None)
+        raw_power_path = row.get("raw_power_path", None) or str(_derive_raw_power_path(sts_full_path)) if sts_full_path else None
+        raw_soc_path = row.get("raw_soc_path", None) or (str(_derive_raw_soc_path(sts_full_path)) if sts_full_path else None)
+        piv_soc_path = row.get("piv_soc_path", None)
+        sts_soc_path = row.get("sts_soc_path", None)
+
         if self.group == "C":
-            sess_raw = ChargingSession(session_id=sid, power_kw=sess.power_kw)
-            fig, ax = sess_raw.plot(
-                show_soc=False,
-                title=f"Power transfer over time for {label_str} session {sid}",
+            # C: raw power + raw SOC only
+            power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
+            soc_raw = _safe_load(raw_soc_path) if raw_soc_path else _safe_load(_derive_raw_soc_path(sts_full_path))
+            sess_c = ChargingSession(session_id=sid, power_kw=power, soc_pct=np.asarray(soc_raw, dtype=float))
+            fig, ax = sess_c.plot(
+                soc_mode="raw",  # plot raw SOC on right axis
+                title=f"Power transfer over time with raw SOC for {label_str} session {sid}",
                 y_lim=self.y_lim,
             )
         else:
-            subtext = f"k={simp.k_power} segments" if (simp and simp.k_power is not None) else None
+            # A/B: raw+simpl power + simplified SOC only
+            power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
+            idx, val = _load_knots(piv_path, base_series=power)
+            simp = ChargingSessionSimplification(
+                power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
+            )
+            # attach SOC simpl if present, else fallback to raw SOC densification via dense->knots
+            sidx, sval = None, None
+
+            # load a base soc series to derive values from if pivots are indices-only
+            soc_base: np.ndarray | None = None
+            if raw_soc_path is not None:
+                try:
+                    soc_base = np.asarray(_safe_load(raw_soc_path), dtype=float).reshape(-1)
+                except Exception:
+                    soc_base = None
+            if soc_base is None and sts_soc_path is not None:
+                # fallback to dense simplified soc as base
+                try:
+                    soc_base = np.asarray(_safe_load(sts_soc_path), dtype=float).reshape(-1)
+                except Exception:
+                    soc_base = None
+
+            if piv_soc_path is not None:
+                # passes the soc series so 1D index pivots can be mapped to values
+                sidx, sval = _load_knots(piv_soc_path, base_series=soc_base)
+            elif sts_soc_path is not None:
+                # erives pivots and values from dense soc if pivots missing
+                sidx, sval = _dense_to_knots(_safe_load(sts_soc_path))
+
+            if sidx is not None and sval is not None:
+                simp.soc_knot_idx = np.asarray(sidx, dtype=int)
+                simp.soc_knot_val_pct = np.asarray(sval, dtype=float)
+
+
+            sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
+            # subtext = f"example {self._cursor} has k={simp.k_power} segments" if (simp and simp.k_power is not None) else None
             fig, ax = sess.plot(
-                show_soc=False,
-                title=f"Original + simplified power transfer over time for {label_str} session {sid}",
+                soc_mode="simpl",  # plot simplified SOC on right axis
+                title=f"Original + simplified power with RDP-simplified SOC for {label_str} session {sid}",
                 y_lim=self.y_lim,
             )
-            print(subtext)
-
-
+            # if subtext:
+            #     print(subtext)
 
         # metadata for logging
         return {
             "session_id": sid,
             "group": self.group,
             "k": (int(simp.k_power) if simp and simp.k_power is not None else None),
-            "label": label_str,                                # ← never None now
+            "label": label_str,
             "sts_full_path": row.get("sts_full_path", None),
+            "sts_soc_path": sts_soc_path,
             "piv_path": row.get("piv_path", None),
+            "piv_soc_path": piv_soc_path,
             "raw_power_path": str(raw_power_path),
+            "raw_soc_path": raw_soc_path,
         }
 
 
@@ -1649,6 +1735,11 @@ def _derive_raw_power_path(sts_full_path: str | Path) -> Path:
         pass
     return p
 
+def _derive_raw_soc_path(sts_full_path: str | Path) -> Path:
+    """heuristic to derive raw SOC file path from a row, mirroring pool export layout."""
+    p = Path(sts_full_path)
+    return p.parent.parent / "raw_soc" / p.name
+
 
 def _plot_session_overlay(ax, sid: int, row: pd.Series) -> None:
     """Plots raw vs simplified overlays for a session on a given axis."""
@@ -1706,7 +1797,7 @@ def _pick_edge_examples(kept: pd.DataFrame, cls: int, edges: list[int]) -> list[
 def _create_main_table(conn: sqlite3.Connection) -> None:
     """Ensures the `ors_pool` table and indexes exist."""
     conn.execute(
-        """
+    """
     CREATE TABLE IF NOT EXISTS ors_pool (
         session_id INTEGER PRIMARY KEY,
         label_text TEXT,
@@ -1722,7 +1813,11 @@ def _create_main_table(conn: sqlite3.Connection) -> None:
         sts_full_path TEXT,
         piv_path TEXT,
         emb_dim INTEGER,
-        emb BLOB
+        emb BLOB,
+        raw_power_path TEXT,
+        raw_soc_path   TEXT,
+        piv_soc_path   TEXT,
+        sts_soc_path   TEXT
     );
     """
     )
@@ -1736,9 +1831,11 @@ def _upsert_row(conn: sqlite3.Connection, row: dict) -> None:
     conn.execute(
         """
     INSERT INTO ors_pool (session_id, label_text, label_int, k, err, frag, robust_prob, margin, threshold,
-                          model_id, ts_unix, sts_full_path, piv_path, emb_dim, emb)
+                          model_id, ts_unix, sts_full_path, piv_path, emb_dim, emb,
+                          raw_power_path, raw_soc_path, piv_soc_path, sts_soc_path)
     VALUES (:session_id, :label_text, :label_int, :k, :err, :frag, :robust_prob, :margin, :threshold,
-            :model_id, :ts_unix, :sts_full_path, :piv_path, :emb_dim, :emb)
+            :model_id, :ts_unix, :sts_full_path, :piv_path, :emb_dim, :emb,
+            :raw_power_path, :raw_soc_path, :piv_soc_path, :sts_soc_path)
     ON CONFLICT(session_id) DO UPDATE SET
         label_text=excluded.label_text,
         label_int=excluded.label_int,
@@ -1753,10 +1850,15 @@ def _upsert_row(conn: sqlite3.Connection, row: dict) -> None:
         sts_full_path=excluded.sts_full_path,
         piv_path=excluded.piv_path,
         emb_dim=excluded.emb_dim,
-        emb=excluded.emb
+        emb=excluded.emb,
+        raw_power_path=excluded.raw_power_path,
+        raw_soc_path=excluded.raw_soc_path,
+        piv_soc_path=excluded.piv_soc_path,
+        sts_soc_path=excluded.sts_soc_path
     """,
         row,
     )
+
     conn.commit()
 
 
@@ -1866,28 +1968,43 @@ def _load_power(path: str | Path) -> np.ndarray:
     y = np.asarray(y, dtype=float).reshape(-1)
     return y
 
-def _load_knots(path: str | Path, *, power_kw: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Load knots from .npy:
-       - 1D -> indices only; needs power_kw to fetch values
-       - (K,2) or (2,K) -> explicit (idx, val_kw)
+def _load_knots(
+    path: str | Path,
+    base_series: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Loads knots from a .npy file and returns (indices, values).
+    The file may contain:
+      - 1D int array (indices only)
+      - 2D array shaped (K, 2) or (2, K) with [idx, val]
+    If indices only are stored, values are derived by sampling from `base_series`.
+    Args:
+        path: Path to .npy file with knots.
+        base_series: Optional dense series to derive values from
+    Raises: ValueError if indices-only are loaded and no base series is available.
+    Returns:
+        idx: 1D int array of pivot indices.
+        vals: 1D float array of pivot values aligned with idx.
     """
     a = _safe_load(path)
+    a = np.asarray(a)
     if a.ndim == 1:
-        idx = np.asarray(a, dtype=int)
-        if power_kw is None:
-            raise ValueError("1D pivots require power_kw to derive knot values.")
-        vals = np.asarray(power_kw, dtype=float)[idx]
+        idx = a.astype(int).reshape(-1)
+        if base_series is None:
+            # keep helpful error for old call sites
+            raise ValueError("1D pivots require a base series to derive knot values.")
+        vals = np.asarray(base_series, dtype=float)[idx]
         return idx, vals
     if a.ndim == 2:
         if a.shape[1] == 2:
-            idx = a[:, 0].astype(int)
-            vals = a[:, 1].astype(float)
+            idx = a[:, 0].astype(int).reshape(-1)
+            vals = a[:, 1].astype(float).reshape(-1)
             return idx, vals
         if a.shape[0] == 2:
-            idx = a[0].astype(int)
-            vals = a[1].astype(float)
+            idx = a[0, :].astype(int).reshape(-1)
+            vals = a[1, :].astype(float).reshape(-1)
             return idx, vals
-    raise ValueError(f"unexpected pivots array shape {a.shape} at {path}")
+    raise ValueError(f"unexpected knots array shape {a.shape} in {path}")
+
 
 def _dense_to_knots(y: np.ndarray, tol: float = 1e-8) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruct knots from a dense piecewise-linear series (best-effort).

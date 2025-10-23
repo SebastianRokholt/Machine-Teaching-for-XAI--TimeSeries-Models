@@ -1,13 +1,65 @@
 # src/mt4xai/plot.py
 from __future__ import annotations
+from matplotlib.figure import Figure
+from matplotlib.pylab import Axes
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 from .data import SessionPredsBundle, reconstruct_abs_from_bundle
 
-def plot_full_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
+
+# TODO: Improve visualization
+def plot_raw_session(
+    power_kw: np.ndarray,
+    *,
+    soc: np.ndarray | None = None,
+    soc_mode: Literal["none", "raw", "simpl"] = "none",
+    title: str | None = None,
+    y_lim: tuple[float, float] | None = None,
+    ) -> tuple[Figure, Axes]:
+    """Plots raw power (left hand axis, kw) and optionally SOC (right hand axis, %).
+
+    Args:
+        power_kw: Dense power in kW, shape (T,).
+        soc: Optional SOC series in percent, shape (T,).
+        soc_mode: "none", "raw", or "simpl".
+        title: Optional figure title.
+        y_lim: Optional power y-limits (min, max).
+
+    Returns:
+        Matplotlib figure and left axis.
+    """
+    y = np.asarray(power_kw, dtype=float).reshape(-1)
+    x = np.arange(y.size)
+
+    fig = plt.figure(figsize=(10, 4))
+    ax = plt.gca()
+    ax.plot(x, y, linewidth=1.2, label="power (raw)")
+    if y_lim is not None:
+        ax.set_ylim(*y_lim)
+    ax.set_xlabel("time (arbitrary units)")
+    ax.set_ylabel("power (kW)")
+    if title:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    lines = ax.get_lines()
+    if soc_mode != "none" and soc is not None:
+        ax2 = ax.twinx()
+        ax2.set_ylim(0.0, 100.0)
+        ax2.set_ylabel("state of charge (%)")
+        soc_color = "#0b3d91"  # dark blue
+        ax2.plot(x, np.clip(soc, 0.0, 100.0), linewidth=1.2, label=f"soc ({soc_mode})", color=soc_color)
+        lines = lines + ax2.get_lines()
+
+    labels = [ln.get_label() for ln in lines]
+    ax.legend(lines, labels, loc="best", fontsize=9)
+    return fig, ax
+
+
+def plot_raw_pred_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
                       idx_power_inp: int, idx_soc_inp: int,
                       target: str = "power",
                       title_suffix: str = "",
@@ -104,7 +156,66 @@ def plot_full_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
     plt.show()
 
 
-def plot_session_with_simplification(
+# TODO: Improve visualization
+def plot_raw_simpl_session(
+    power_kw: np.ndarray,
+    idx: np.ndarray,
+    val_kw: np.ndarray,
+    *,
+    soc: np.ndarray | None = None,
+    soc_mode: Literal["none", "raw", "simpl"] = "none",
+    title: str | None = None,
+    y_lim: tuple[float, float] | None = None,
+) -> tuple[Figure, Axes]:
+    """Plots raw and simplified power. Optionally overlays SOC on right-hand axis.
+
+    Args:
+        power_kw: Dense power in kW, shape (T,).
+        idx: Knot indices for simplified power, shape (K,).
+        val_kw: Knot values in kW, shape (K,).
+        soc: Optional SOC series in percent, shape (T,).
+        soc_mode: "none", "raw", or "simpl".
+        title: Optional figure title.
+        y_lim: Optional power y-limits (min, max).
+
+    Returns:
+        Matplotlib figure and left axis.
+    """
+    y = np.asarray(power_kw, dtype=float).reshape(-1)
+    T = y.size
+    xs = np.arange(T)
+    idx = np.asarray(idx, dtype=int).reshape(-1)
+    val = np.asarray(val_kw, dtype=float).reshape(-1)
+
+    y_hat = np.interp(xs, idx.astype(float), val)
+
+    fig = plt.figure(figsize=(10, 4))
+    ax = plt.gca()
+    ax.plot(xs, y, linewidth=1.0, alpha=0.85, label="power (raw)")
+    ax.plot(xs, y_hat, linewidth=1.8, label="power (simplified)")
+    if y_lim is not None:
+        ax.set_ylim(*y_lim)
+    ax.set_xlabel("time (arbitrary units)")
+    ax.set_ylabel("power (kW)")
+    if title:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    lines = ax.get_lines()
+    if soc_mode != "none" and soc is not None:
+        ax2 = ax.twinx()
+        ax2.set_ylim(0.0, 100.0)
+        ax2.set_ylabel("state of charge (%)")
+        soc_color = "#0b3d91"
+        ax2.plot(xs, np.clip(soc, 0.0, 100.0), linewidth=1.2, label=f"soc ({soc_mode})", color=soc_color)
+        lines = lines + ax2.get_lines()
+
+    labels = [ln.get_label() for ln in lines]
+    ax.legend(lines, labels, loc="best", fontsize=9)
+    return fig, ax
+
+
+def plot_raw_pred_simp_session(
     bundle: SessionPredsBundle, power_scaler, soc_scaler, idx_power_inp: int, idx_soc_inp: int,
     simpl_power_unscaled: np.ndarray, *, session_id: int | None = None, k: int | None = None,
     threshold: float | None = None, simp_error: float | None = None, orig_error: float | None = None,
@@ -175,62 +286,4 @@ def plot_session_with_simplification(
     fig.subplots_adjust(bottom=0.18)
     fig.text(0.01, 0.02, fig_desc, fontsize=9, ha="left")
 
-    return fig, ax
-
-
-def plot_raw_power(*, t: np.ndarray, power_kw: np.ndarray, title: str | None = None,
-                       y_lim: tuple[float, float] | None = None, show_soc: bool = False,
-                       soc_pct: np.ndarray | None = None):
-    t = np.asarray(t, dtype=float)
-    power_kw = np.asarray(power_kw, dtype=float)
-
-    sns.set_theme(style="whitegrid")
-    sns.set_palette("deep")
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    # raw power: dotted black
-    sns.lineplot(x=t, y=power_kw, ax=ax, color="black", linestyle=":", linewidth=2.6, label="raw power")
-
-    # optional SOC overlay (kept off in teaching by default)
-    if show_soc and soc_pct is not None:
-        sns.lineplot(x=t, y=np.asarray(soc_pct, dtype=float), ax=ax, linewidth=2.0, label="soc (%)")
-
-    ax.set_xlabel("minutes elapsed")
-    ax.set_ylabel("kW")
-    if y_lim is not None:
-        ax.set_ylim(*y_lim)
-    if title:
-        ax.set_title(title)
-    ax.legend(loc="best")
-    fig.tight_layout()
-    return fig, ax
-
-
-def plot_raw_and_simpl(*, t: np.ndarray, power_kw: np.ndarray, simp_power_kw: np.ndarray,
-                           title: str | None = None, y_lim: tuple[float, float] | None = None,
-                           show_soc: bool = False, soc_pct: np.ndarray | None = None):
-    t = np.asarray(t, dtype=float)
-    power_kw = np.asarray(power_kw, dtype=float)
-    simp_power_kw = np.asarray(simp_power_kw, dtype=float)
-
-    sns.set_theme(style="whitegrid")
-    sns.set_palette("deep")
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    # raw power: dotted black
-    sns.lineplot(x=t, y=power_kw, ax=ax, color="black", linestyle=":", linewidth=2.6, label="raw power")
-    # simplification: red solid
-    sns.lineplot(x=t, y=simp_power_kw, ax=ax, color="tab:red", linewidth=2.6, label="simplified")
-
-    if show_soc and soc_pct is not None:
-        sns.lineplot(x=t, y=np.asarray(soc_pct, dtype=float), ax=ax, linewidth=2.0, label="soc (%)")
-
-    ax.set_xlabel("minutes elapsed")
-    ax.set_ylabel("kW")
-    if y_lim is not None:
-        ax.set_ylim(*y_lim)
-    if title:
-        ax.set_title(title)
-    ax.legend(loc="best")
-    fig.tight_layout()
     return fig, ax

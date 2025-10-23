@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import torch
 from rdp import rdp
+
+from mt4xai.data import SessionPredsBundle
 from .plot import reconstruct_abs_from_bundle
 from .inference import inverse_targets_np, predict_residuals, reconstruct_abs_from_residuals_batch
 
@@ -50,6 +52,12 @@ class ORSParams:
     max_k: int = 100
     t_min_eval: int = 1
     model_id: Optional[str] = None
+    # SOC with RDP specific params
+    soc_stage1_mode: str | None = "rdp"
+    soc_rdp_epsilon: float | None = 0.75
+    soc_rdp_candidates: int = 5       # parsed, not used by fixed epsilon path yet
+    soc_rdp_eps_min: float = 1.0e-6   # parsed, future-proof
+    soc_rdp_eps_max: float = 100.0
 
 
 @dataclass
@@ -508,7 +516,7 @@ def _session_id(bundle) -> Optional[int]:
 
 # ----------------------------------------- main driver ------------------------------------------------ #
 
-def ors(bundle,
+def ors(bundle: SessionPredsBundle,
         model: torch.nn.Module,
         params: ORSParams,
         *,
@@ -544,12 +552,33 @@ def ors(bundle,
       power_weight, decay_lambda, threshold: macro-RMSE configuration.
 
     Returns:
-      dict with keys {obj,k,piv,sts,frag,err,label} on success; None if no valid candidate.
+      dict with keys {obj,k,piv,sts,frag,err,label} on success; None if no valid candidate. 
+      Additionally includes piv_soc and sts_soc when params.soc_stage1_mode == "rdp" and SOC is present.
     """
     T = bundle.length
     y = np.asarray(bundle.true_power_unscaled, dtype=float)
     y_min, y_max = float(np.min(y)), float(np.max(y))
     sid = _session_id(bundle)
+    
+    # attach SOC simplification if configured, doesn't impact power simplification
+    def _with_soc(result: Dict | None) -> Dict | None:
+        if result is None:
+            return None
+        try:
+            if getattr(params, "soc_stage1_mode", None) == "rdp":
+                y_soc = np.asarray(bundle.true_soc_unscaled, dtype=float).reshape(-1)
+                if y_soc.size != T:
+                    raise ValueError("power and SOC must have equal length for teaching overlays")
+                piv_soc, sts_soc = _ors_soc_rdp_select(y_soc, params)
+                if piv_soc is not None and sts_soc is not None:
+                    result["piv_soc"] = piv_soc
+                    result["sts_soc"] = sts_soc
+        except Exception as e:
+            # non-fatal: keep power result intact
+            # reason: soc overlays are auxiliary for teaching; never block power
+            pass
+        return result
+
 
     # ---- Stage-1 candidates (initial) ----
     cands = ors_candidates(y, params)
@@ -559,7 +588,7 @@ def ors(bundle,
               f"rdp_stage1_candidates={params.rdp_stage1_candidates}). Returning k=1 fallback.")
         piv = np.array([0, T - 1], dtype=int)
         sts = interpolate_from_pivots(T, piv, y[piv])
-        return dict(obj=0.0, k=1, piv=piv, sts=sts, frag=0.0, err=0.0, label="normal")
+        return _with_soc(dict(obj=0.0, k=1, piv=piv, sts=sts, frag=0.0, err=0.0, label="normal"))
 
     # base label on original series
     base_lbl, base_err, Y_abs_true = base_label_from_bundle(
@@ -628,7 +657,7 @@ def ors(bundle,
     # ----- evaluate initial candidates -----
     best = evaluate_candidates(cands, params)
     if best is not None:
-        return best
+        return _with_soc(best)
 
     # ----- Fallback #1: log + rerun with dp_q*2 (if DP) and beta*4 -----
     k_min, k_max = _k_span(cands)
@@ -646,7 +675,7 @@ def ors(bundle,
     else:
         best = evaluate_candidates(cands1, p_fb1)
         if best is not None:
-            return best
+            return _with_soc(best)
 
     # ----- Fallback #2: switch to RDP with large stage1_candidates -----
     k_min1, k_max1 = _k_span(cands1 or [])
@@ -664,11 +693,58 @@ def ors(bundle,
 
     best = evaluate_candidates(cands2, p_fb2)
     if best is not None:
-        return best
+        return _with_soc(best)
 
     k_min2, k_max2 = _k_span(cands2)
     print(f"[ORS][warn] sid={sid} fallbacks exhausted (rdp k_span={k_min2}..{k_max2}); skipping session.")
     return None
+
+
+def _ors_soc_rdp_select(y_soc: np.ndarray, params: ORSParams) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """Selects an SOC simplification using ORS stage-1 with RDP candidates.
+
+    This uses the same candidate generator `ors_candidates` with `stage1_mode="rdp"`,
+    and selects the best candidate by the stage-1 cost_es returned for RDP, which is
+    l2 + beta*k. Robustness and label constraints are intentionally not applied for
+    SOC, since classification depends on power, not SOC.
+
+    Args:
+        y_soc: Dense SOC series in percent, shape (T,).
+        params: ORS parameters; only beta, min_k, max_k and rdp-related knobs matter.
+
+    Returns:
+        (piv, sts) where `piv` are pivot indices (int32) and `sts` is the dense
+        piecewise-linear reconstruction (float64). Returns (None, None) if no
+        candidate can be produced.
+    """
+    y_soc = np.asarray(y_soc, dtype=float).reshape(-1)
+    T = y_soc.size
+    if T < 2:
+        return None, None
+
+    # force stage-1 RDP for SOC, preserve k-range and beta
+    p_soc = replace(params, stage1_mode="rdp")
+    cands = ors_candidates(y_soc, p_soc)
+    if not cands:
+        return None, None
+
+    best_cost = float("inf")
+    best_piv = None
+    for cost_es, piv in cands:
+        k = int(len(piv) - 1)
+        if k < int(p_soc.min_k) or k > int(p_soc.max_k):
+            continue
+        if float(cost_es) < best_cost:
+            best_cost = float(cost_es)
+            best_piv = piv
+
+    if best_piv is None:
+        return None, None
+
+    piv = np.asarray(best_piv, dtype=int).reshape(-1)
+    xs = np.arange(T, dtype=float)
+    sts = np.interp(xs, piv.astype(float), y_soc[piv])
+    return piv.astype(np.int32), sts
 
 
 # ----------------------------------------- diagnostics ------------------------------------------------ #

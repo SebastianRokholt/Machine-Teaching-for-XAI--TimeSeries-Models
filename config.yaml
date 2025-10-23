@@ -19,7 +19,7 @@ paths:
   figures: "Figures"
   logs: "Logs"
 
-modelling:
+inference:
   horizon: 5
   # final model hyperparams derived from model tuning
   final_model_name: "final_model.pth"
@@ -27,7 +27,7 @@ modelling:
   # num_layers: 
   # dropout: 
   power_weight: 0.6522982410461 
-  decay_lambda: 0.4
+  horizon_decay_lambda: 0.4
 
 anomaly_detection:
   # values derived from anomaly detection exploration in notebook 4
@@ -38,10 +38,22 @@ anomaly_detection:
 
 ors:
   # values derived from ORS exploration in notebook 5
-  # alpha: 
-  # beta:
-  # gamma: 
-  # epsilon: 
+  # power_stage1_mode: "dp_prefix"
+  # power_dp_alpha: 
+  # power_dp_q:
+  # power_beta:
+  # power_gamma: 
+  # power_epsilon_value: 
+  # power_R: 2000
+  # power_min_k: 1
+  # power_max_k: 12
+  soc_stage1_mode: "rdp"  # None disables SOC channel entirely for inference, simplifications, plotting, teaching
+  soc_rdp_epsilon: 0.75  # for RDP simplifications
+  soc_rdp_candidates: 5
+  soc_rdp_eps_min: 1.0e-6
+  soc_rdp_eps_max: 100.0 
+  stage2_err_metric: "l2"
+  epsilon_mode: "fraction"
 
 teaching:
   teaching_pool_dir: "../Data/teaching_pool"
