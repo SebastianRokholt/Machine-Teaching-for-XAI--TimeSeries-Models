@@ -78,15 +78,21 @@ class ChargingSessionSimplification:
     k_soc: Optional[int] = None
     kind: Literal["ors", "rdp"] = "ors"
 
-    def densify_power(self, T: int) -> Optional[np.ndarray]:
-        """Returns dense power simplification (kW) or None if absent."""
-        if self.power_knot_idx is None or self.power_knot_val_kw is None:
-            return None
-        xi = np.asarray(self.power_knot_idx, dtype=int)
-        yi = np.asarray(self.power_knot_val_kw, dtype=float)
-        xi = np.clip(xi, 0, max(T - 1, 0))
-        x = np.arange(T, dtype=float)
-        return np.interp(x, xi.astype(float), yi)
+    def densify_power(self, T: int, *, anchor_endpoints: Literal["both","last"]="both",
+                        t_min_eval: int = 1) -> Optional[np.ndarray]:
+            from mt4xai.ors import interpolate_from_pivots  # lazy import to avoid circularity
+            """Return dense power simplification (kW), respecting endpoint policy and t_min_eval.
+            
+            Uses ORS' interpolate_from_pivots so that when anchor_endpoints="last" and the first
+            true knot is at t ≥ t_min_eval, the first segment is extended linearly back to t=0.
+            """
+            if self.power_knot_idx is None or self.power_knot_val_kw is None:
+                return None
+            return interpolate_from_pivots(
+                T, np.asarray(self.power_knot_idx, dtype=int),
+                np.asarray(self.power_knot_val_kw, dtype=float),
+                t_min_eval=t_min_eval, anchor_endpoints=anchor_endpoints
+            )
 
     def densify_soc(self, T: int) -> Optional[np.ndarray]:
         """Returns dense SoC simplification (%) or None if absent."""
@@ -196,11 +202,14 @@ class ChargingSession:
         if device is not None: t = t.to(device)
         return t
     
+
     def plot(
         self, *, 
         soc_mode: Literal["none", "raw", "simpl"] = "none", 
         title: str | None = None, 
-        y_lim: tuple[float, float] | None = None
+        y_lim: tuple[float, float] | None = None, 
+        anchor_endpoints: Literal["both","last"]="both", 
+        t_min_eval: int=1,
         ) -> tuple[Figure, Axes]:
         """Plots session with optional SOC overlay on a right 0–100% axis.
         Args:
@@ -231,11 +240,21 @@ class ChargingSession:
             soc_mode = "none"
 
         if self.simplification is None or getattr(self.simplification, "power_knot_idx", None) is None:
-            return plot_raw_session(power_kw=power, soc=soc, soc_mode=soc_mode, title=title, y_lim=y_lim)
+            return plot_raw_session(power_kw=power, soc=soc, soc_mode=soc_mode, title=title, power_y_lim=y_lim)
         else:
             idx = np.asarray(self.simplification.power_knot_idx, dtype=int)
             val = np.asarray(self.simplification.power_knot_val_kw, dtype=float)
-            return plot_raw_simpl_session(power_kw=power, idx=idx, val_kw=val, soc=soc, soc_mode=soc_mode, title=title, y_lim=y_lim)
+            return plot_raw_simpl_session(
+                power_raw=power,
+                simp_idx=idx,
+                simp_kw=val,
+                soc=soc,
+                soc_mode=soc_mode,
+                title=title,
+                power_y_lim=y_lim,
+                anchor_endpoints=anchor_endpoints,
+                t_min_eval=t_min_eval,
+            )
         
     def validate(self, *, check_knots: bool = True) -> None:
         """Validate internal consistency (length alignment, optional knots checks).

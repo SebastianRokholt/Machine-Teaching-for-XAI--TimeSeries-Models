@@ -32,10 +32,14 @@ from functools import lru_cache
 import ipywidgets as widgets
 from ipywidgets import Layout, HBox
 from IPython.display import display, clear_output
+
+# Modules from the project's MT4XAI package
+%load_ext autoreload
+%autoreload 2
 from mt4xai.data import split_data, apply_scalers, build_loader, fit_scalers_on_train, fetch_session_preds_bundle
 from mt4xai.model import load_lstm_model
 from mt4xai.ors import ORSParams, ors, base_label_from_bundle
-from mt4xai.plot import plot_session_with_simplification
+from mt4xai.plot import plot_raw_pred_simp_session
 from mt4xai.inference import compute_session_MRMSE, classify_by_threshold, percentile_threshold
 
 RANDOM_SEED = 42
@@ -152,11 +156,11 @@ MRC_THRESHOLD = 8.5962
 
 # common ORS settings
 common_params = dict(
-    alpha=0.001, beta=3.0, gamma=0.05,
+    dp_alpha=0.001, beta=3.0, gamma=0.05,
     R=5000, epsilon_mode="fraction", epsilon_value=0.3,
-    q=250, stage1_candidates=30,
-    t_min_eval=1, min_k=1, max_k=15,
-    stage2_err_metric="l2"   # "l2" (paper) or "mrmse"
+    dp_q=250, rdp_stage1_candidates=30,
+    t_min_eval=1, anchor_endpoints="last",
+    min_k=1, max_k=15, stage2_err_metric="l2"   # "l2" (same as ORS paper) or "mrmse"
 )
 
 
@@ -191,7 +195,7 @@ print(f"[DP-prefix]  k={res_fast['k']}, frag={res_fast['frag']:.5f}, obj={res_fa
 
 
 ```python
-# 3) RDP HEURISTIC (very fast)
+# 3) RDP HEURISTIC (very fast but no guaranteed optimum)
 p_rdp = ORSParams(stage1_mode="rdp", **common_params)
 res_rdp = ors(bundle_test, model, p_rdp,
                             power_scaler=power_scaler, soc_scaler=soc_scaler,
@@ -214,7 +218,7 @@ base_lbl, base_err, _ = base_label_from_bundle(bundle_test,
 
 for tag, res in [("DP-vanilla", res_vanilla), ("DP-prefix", res_fast), ("RDP", res_rdp)]:
     print(tag, "-> k:", res["k"], "obj:", f"{res['obj']:.5f}")
-    fig, ax = plot_session_with_simplification(bundle_test, power_scaler, soc_scaler,
+    fig, ax = plot_raw_pred_simp_session(bundle_test, power_scaler, soc_scaler,
         idx_power_inp, idx_soc_inp,
         res['sts'], session_id=bundle_test.session_id,
         k=res['k'], threshold=MRC_THRESHOLD,
@@ -258,7 +262,7 @@ for tag, res in [("DP-vanilla", res_vanilla), ("DP-prefix", res_fast), ("RDP", r
 # ---- 1) macro-rmse baseline (original class) ----
 # uses same decay/threshold logic as in the AD notebook so the "original classification" is consistent
 # set these to match your chosen defaults
-T_MIN_EVAL = 1
+T_MIN_EVAL = 2
 LAMBDA_DECAY = 0.2
 
 # compute validation/test macro-rmse and threshold (e.g., 95th percentile on validation)
@@ -298,10 +302,10 @@ def _ors_cached(sid: int, stage1_mode: str, stage2_err_metric: str,
     # keep key small & hashable; bundle stays in separate cache
     params = ORSParams(
         stage1_mode=stage1_mode, stage2_err_metric=stage2_err_metric,
-        alpha=float(alpha), beta=float(beta), gamma=float(gamma),
+        dp_alpha=float(alpha), beta=float(beta), gamma=float(gamma),
         R=int(R), epsilon_mode=epsilon_mode, epsilon_value=float(epsilon_value),
-        q=int(q), stage1_candidates=int(stage1_candidates),
-        min_k=int(min_k), max_k=int(max_k), t_min_eval=T_MIN_EVAL
+        dp_q=int(q), rdp_stage1_candidates=int(stage1_candidates),
+        min_k=int(min_k), max_k=int(max_k), t_min_eval=T_MIN_EVAL, anchor_endpoints="last",
     )
     b = _bundle_for_sid(int(sid))
     return ors(b, model, params,
@@ -467,15 +471,15 @@ w_sid.observe(_on_sid_typed, names="value")
 def _reset_filters(_btn=None):
     w_class.value = "abnormal"
     w_len.value = (8, 60)
-    w_stage1.value = "rdp"
-    w_alpha.value = 0.0001
+    w_stage1.value = "dp_prefix"
+    w_alpha.value = 0.01
     w_beta.value = 3.0
-    w_gamma.value = 0.01
-    w_eps.value = 0.30
-    w_R.value = 1000
-    w_q.value = 250
+    w_gamma.value = 0.05
+    w_eps.value = 0.2
+    w_R.value = 2000
+    w_q.value = 150
     w_k.value = (1, 15)
-    w_ncand.value = 10
+    w_ncand.value = 30
     w_metric.value = "l2"
     _refresh_sid_list()
 w_reset.on_click(_reset_filters)
@@ -540,14 +544,13 @@ def _on_compute(_btn):
     # draw plot
     with out_plot:
         clear_output(wait=True)
-        fig, ax = plot_session_with_simplification(
+        fig, ax = plot_raw_pred_simp_session(
             b, power_scaler, soc_scaler, idx_power_inp, idx_soc_inp,
             res["sts"], session_id=int(sid),
             k=res["k"], threshold=MRC_THRESHOLD,
             simp_error=res["err"], orig_error=base_err,
             label=res["label"], decay_lambda=LAMBDA_DECAY, t_min_eval=T_MIN_EVAL
         )
-        import matplotlib.pyplot as plt
         plt.show()
         print(f"Simplicity (k): {res['k']} segments")
 
@@ -597,7 +600,7 @@ display(ui)
 
 ```
 
-    9.0986
+    8.9938
 
 
 

@@ -7,7 +7,7 @@
 # ----------------------------------------- imports, config and outputs ----------------------------------------- #
 from __future__ import annotations
 from dataclasses import dataclass, replace
-from typing import Optional, List, Tuple, Dict, Iterable
+from typing import Literal, Optional, List, Tuple, Dict, Iterable
 import heapq
 import numpy as np
 import pandas as pd
@@ -36,7 +36,10 @@ class ORSParams:
       - beta, gamma: weights for k and fragility in the final objective
       - R, epsilon_mode, epsilon_value: robustness sampling configuration
       - seed, min_k, max_k, t_min_eval, model_id: misc. control parameters
+      - ...
+    
     """
+    # TODO: Finish docstring
     stage1_mode: str = "dp_prefix"
     stage2_err_metric: str = "l2"
     dp_q: int = 500
@@ -47,10 +50,11 @@ class ORSParams:
     R: int = 10000
     epsilon_mode: str = "fraction"
     epsilon_value: float = 0.3
-    seed: Optional[int] = 42
+    random_seed: Optional[int] = 42
     min_k: int = 1
     max_k: int = 100
-    t_min_eval: int = 1
+    t_min_eval: int = 0
+    anchor_endpoints: Literal["both", "last"] = "last"
     model_id: Optional[str] = None
     # SOC with RDP specific params
     soc_stage1_mode: str | None = "rdp"
@@ -411,43 +415,160 @@ def stage1_rdp(y: np.ndarray, stage1_candidates: int, beta: float) -> List[Tuple
 
 
 def ors_candidates(y: np.ndarray, params: ORSParams) -> Optional[List[Tuple[float, np.ndarray]]]:
-    """Dispatch Stage-1 candidate generation according to mode."""
+    """Dispatch Stage-1 candidate generation according to mode.
+    
+    The original ORS algorithm anchors the simplification to the first and last data point in the sequence. 
+    However, this is not optimal for our AD use case where model predictions for early t aren't y evaluated. 
+    This implementation optionally enforces an endpoint extrapolation technique for the early window t ∈ [0, t_min_eval). 
+    If the model is evaluated on whole-sequence prediction or ORSParams.anchor_endpoints = "both", candidates are generated
+    according to the ORS paper. If, however, ORSParams.t_min_eval > 0 and ORSParams.anchor_endpoints = "last", only the right 
+    endpoint is anchored. The left tail is extrapolated without a new pivot, i.e. the slope at t_min_eval is maintained towards the left. 
+    """
+    T = int(y.shape[0])
+
+    # optionally slices original series to window where model predictions are evaluated
+    if params.anchor_endpoints == "last" and params.t_min_eval > 0:
+        piv_rel, offset = y[int(params.t_min_eval):], int(params.t_min_eval)
+    else:
+        piv_rel, offset = y, 0
+
+    # stage-1 returns a list of relative pivot arrays (sorted and with slice ends included)
     mode = params.stage1_mode.lower()
     if mode == "dp":
-        return stage1_dp(y, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
+        cand_rel = stage1_dp(piv_rel, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
     elif mode == "dp_prefix":
-        return stage1_dp_prefix(y, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
+        cand_rel = stage1_dp_prefix(piv_rel, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
     elif mode == "rdp":
-        return stage1_rdp(y, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
+        cand_rel = stage1_rdp(piv_rel, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
     else:
-        raise ValueError(f"unknown stage1_mode: {params.stage1_mode}")
+        print(f"[ors] Warning: unknown stage1_mode: {params.stage1_mode}. Reverting to mode 'rdp'")
+        cand_rel = stage1_rdp(piv_rel, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
+    
+    # Shifts the relative pivots back to absolute time and enforce endpoint policy
+    cands_abs = [(float(cost), _postprocess_pivots(piv, T, offset, params.anchor_endpoints))
+                 for (cost, piv) in cand_rel]
+    return cands_abs
 
 
-# ----------------------------------------- stage-2: robustness --------------------------------------- #
+def _postprocess_pivots(piv_rel: np.ndarray, T: int, offset: int, anchor_endpoints: Literal["both","last"]) -> np.ndarray:
+    """Shift relative pivots back to absolute time and enforce endpoint policy."""
+    P = np.asarray(piv_rel, dtype=int).reshape(-1) + int(offset)
+    if anchor_endpoints == "both":
+        P = np.r_[0, P, T - 1]
+    else:  # "last"
+        P = np.r_[P, T - 1]
+    return np.unique(np.clip(P, 0, T - 1))
 
-def interpolate_from_pivots(T: int, pivots: np.ndarray, pv: np.ndarray) -> np.ndarray:
-    """Interpolate a length-T series linearly between pivot values."""
+# ----------------------------------------- ORS stage-2: robustness --------------------------------------- #
+
+def interpolate_from_pivots(
+    T: int, pivots: np.ndarray, values: np.ndarray, t_min_eval,
+    anchor_endpoints: Literal["both", "last"] = "last"
+) -> np.ndarray:
+    """Return a dense length-T series from pivots with optional left extrapolation.
+
+    If anchor_endpoints == "last", the curve linearly extends the first interior segment
+    over [0, t_min_eval) so the value and slope at t_min_eval match, no breakpoint is added.
+    If anchor_endpoints == "both", behaviour matches the legacy 'anchor 0 and T-1'.
+
+    Args:
+        T: Output length.
+        pivots: Knot indices in absolute time (sorted or unsorted), shape (K,).
+        values: Knot values (kW), shape (K,).
+        t_min_eval: First timestep used by the classifier.
+        anchor_endpoints: Whether to anchor both ends or only the last one.
+
+    Returns:
+        Dense piecewise-linear series of shape (T,).
+    """
+    t = np.asarray(pivots, dtype=int).reshape(-1)
+    y = np.asarray(values, dtype=float).reshape(-1)
+    order = np.argsort(t, kind="stable")
+    t, y = t[order], y[order]
+
+    if anchor_endpoints in ("last", "both") and t[-1] != T - 1:
+        t = np.concatenate([t, [T - 1]])
+        y = np.concatenate([y, [y[-1]]])
+
     x = np.arange(T, dtype=float)
-    return np.interp(x, pivots, pv)
 
+    if anchor_endpoints == "both" or t_min_eval <= 0:
+        return np.interp(x, t.astype(float), y.astype(float))
 
-def interpolate_batch_from_pivots(T: int, pivots: np.ndarray, pv_batch: np.ndarray) -> np.ndarray:
-    """Vectorized linear interpolation for a batch of pivot-value sets."""
-    R = pv_batch.shape[0]
-    out = np.empty((R, T), dtype=float)
-    for s in range(len(pivots) - 1):
-        i0, i1 = int(pivots[s]), int(pivots[s + 1])
-        if i1 <= i0:
-            continue
-        span = i1 - i0
-        xs = np.arange(span + 1, dtype=float)
-        y0 = pv_batch[:, [s]]
-        y1 = pv_batch[:, [s + 1]]
-        m = (y1 - y0) / span
-        seg = y0 + m * xs
-        out[:, i0:i1 + 1] = seg
-    out[:, -1] = pv_batch[:, -1]
+    # legacy 'both' is handled above; below is slope-preserving left tail for 'last'
+    out = np.interp(x, t.astype(float), y.astype(float))
+
+    # find the segment that governs t_min_eval to get its slope m
+    j = int(np.searchsorted(t, t_min_eval, side="right"))
+    i0 = max(0, j - 1)
+    i1 = min(j, t.size - 1)
+
+    # ensure two distinct knots to define a slope; fall back to flat if degenerate
+    denom = int(t[i1]) - int(t[i0])
+    if denom == 0:
+        m = 0.0
+        y_eval = float(y[i0])
+    else:
+        m = (float(y[i1]) - float(y[i0])) / float(denom)
+        y_eval = float(y[i0]) + m * float(t_min_eval - int(t[i0]))
+
+    if t_min_eval > 0:
+        left_idx = np.arange(t_min_eval, dtype=float)
+        out[:t_min_eval] = y_eval - m * (t_min_eval - left_idx)
+
     return out
+
+
+def interpolate_batch_from_pivots(
+    T: int, pivots: np.ndarray, value_batch: np.ndarray, t_min_eval,
+    anchor_endpoints: Literal["both", "last"] = "last"
+) -> np.ndarray:
+    """Vectorised interpolation with evaluation-aware left extrapolation."""
+    t = np.asarray(pivots, dtype=int).reshape(-1)
+    V = np.asarray(value_batch, dtype=float)          # shape (R, K)
+    R, K = V.shape
+    order = np.argsort(t, kind="stable")
+    t, V = t[order], V[:, order]
+
+    if anchor_endpoints in ("last", "both") and t[-1] != T - 1:
+        t = np.concatenate([t, [T - 1]])
+        V = np.concatenate([V, V[:, [-1]]], axis=1)
+        K += 1
+
+    x = np.arange(T, dtype=float)
+
+    if anchor_endpoints == "both" or t_min_eval <= 0:
+        # piecewise-linear interpolation per row
+        out = np.empty((R, T), dtype=float)
+        for r in range(R):
+            out[r] = np.interp(x, t.astype(float), V[r].astype(float))
+        return out
+
+    # build interior by segments (faster than per-row np.interp) and then fix left tail
+    out = np.empty((R, T), dtype=float)
+    for s in range(K - 1):
+        a, b = int(t[s]), int(t[s + 1])
+        if b <= a:
+            continue
+        span = b - a
+        m = (V[:, s + 1] - V[:, s]) / float(span)
+        xs = np.arange(span + 1, dtype=float)
+        seg = V[:, [s]] + m[:, None] * xs[None, :]
+        out[:, a:b + 1] = seg
+    out[:, -1] = V[:, -1]
+
+    # slope-preserving left tail for all rows
+    j = int(np.searchsorted(t, t_min_eval, side="right"))
+    i0 = max(0, j - 1)
+    i1 = min(j, K - 1)
+    denom = float(max(1, int(t[i1]) - int(t[i0])))
+    m = (V[:, i1] - V[:, i0]) / denom
+    y_eval = V[:, i0] + m * float(t_min_eval - int(t[i0]))
+    left = np.arange(t_min_eval, dtype=float)
+    out[:, :t_min_eval] = y_eval[:, None] - m[:, None] * (t_min_eval - left)[None, :]
+
+    return out
+
 
 
 def fragility_uniform_band_batched(bundle,
@@ -465,6 +586,7 @@ def fragility_uniform_band_batched(bundle,
                                    power_weight: float,
                                    decay_lambda: float,
                                    t_min_eval: int,
+                                   anchor_endpoints: Literal["both", "last"] = "last",
                                    Y_abs_true: np.ndarray,
                                    threshold: float,
                                    seed: Optional[int]) -> float:
@@ -475,7 +597,8 @@ def fragility_uniform_band_batched(bundle,
     pv = sts_y[pivots].astype(float)                                # (k+1,)
     noise = rng.uniform(-eps, +eps, size=(R, k + 1)).astype(float)  # (R, k+1)
     pv_batch = pv[None, :] + noise                                  # (R, k+1)
-    power_batch = interpolate_batch_from_pivots(T, pivots, pv_batch)  # (R, T)
+    power_batch = interpolate_batch_from_pivots(T, pivots, pv_batch, 
+                                                t_min_eval=t_min_eval, anchor_endpoints=anchor_endpoints)  # (R, T)
 
     errs = macro_rmse_for_power_batch(bundle, model, power_batch,
                                       power_scaler=power_scaler, soc_scaler=soc_scaler,
@@ -587,7 +710,7 @@ def ors(bundle: SessionPredsBundle,
         print(f"[ORS][warn] sid={sid} got cands=None (mode={params.stage1_mode}, dp_q={params.dp_q}, "
               f"rdp_stage1_candidates={params.rdp_stage1_candidates}). Returning k=1 fallback.")
         piv = np.array([0, T - 1], dtype=int)
-        sts = interpolate_from_pivots(T, piv, y[piv])
+        sts = interpolate_from_pivots(T, piv, y[piv], anchor_endpoints=params.anchor_endpoints)
         return _with_soc(dict(obj=0.0, k=1, piv=piv, sts=sts, frag=0.0, err=0.0, label="normal"))
 
     # base label on original series
@@ -614,11 +737,11 @@ def ors(bundle: SessionPredsBundle,
         """Evaluate Stage-1 candidates under constraints; return best dict or None."""
         best: Optional[Dict] = None
         for cost_es, piv in cands_list:
-            k = int(len(piv) - 1)
+            k = int(len(piv) - 1)  # calculate k = number of pivots in pivot set -1
             if k < int(p.min_k) or k > int(p.max_k):
                 continue
 
-            sts = interpolate_from_pivots(T, piv, y[piv])
+            sts = interpolate_from_pivots(T, piv, y[piv], t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints)
             l2_err = float(np.sum((y - sts) ** 2))
 
             lbl_sts, err_sts = classify_macro_rmse_from_power(
@@ -629,20 +752,21 @@ def ors(bundle: SessionPredsBundle,
                 t_min_eval=p.t_min_eval, Y_abs_true=Y_abs_true, threshold=threshold
             )
             if lbl_sts != base_lbl:
-                continue  # KEEP the label-consistency constraint (no relaxation)
+                continue  # keeps the label-consistency constraint
 
             frag = fragility_uniform_band_batched(
                 bundle, model, pivots=piv, sts_y=sts, R=p.R, eps=eps, base_label=base_lbl,
                 power_scaler=power_scaler, soc_scaler=soc_scaler,
                 idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
                 power_weight=power_weight, decay_lambda=decay_lambda,
-                t_min_eval=p.t_min_eval, Y_abs_true=Y_abs_true, threshold=threshold,
-                seed=p.seed
+                t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints, 
+                Y_abs_true=Y_abs_true, threshold=threshold,
+                seed=p.random_seed
             )
 
             # Stage-1 cost_es is:
             #  - DP: dp_alpha*l2 + beta*k
-            #  - RDP: l2 + beta*k (dp_alpha not in its stage-1)
+            #  - RDP: l2 + beta*k 
             # Stage-2 adds gamma*frag
             total = float(cost_es + p.gamma * frag)
 

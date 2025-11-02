@@ -6,56 +6,92 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, List
 from .data import SessionPredsBundle, reconstruct_abs_from_bundle
 
+COLOUR_POWER_RAW  = "#f28e2b" # raw power
+COLOUR_POWER_SIMPL  = "#b22222" # dark red
+COLOUR_SOC = "#0b3d91" # dark blue (for raw and simplified)
 
-# TODO: Improve visualization
+def _axis_label_with_dual_icon(ax: Axes, label: str, *, colours: list[str],
+                                 side: Literal["left", "right"] = "left",
+                                 fontsize: float = 12.0, labelpad: float = 8.0) -> None:
+    """
+    draws multiple coloured '■' squares next to the y-axis label, no mathtext.
+    - keeps the actual ylabel as plain text (so layout/tight_layout work)
+    - places one coloured square per entry in `colors`
+    - colours ticks + matching spine using the first colour
+    """
+    ax.set_ylabel(label, labelpad=labelpad, fontsize=fontsize)
+
+    # manual positioning of squares in axes coordinates after label text
+    x = -0.055 if side == "left" else 1.046
+    y0 = 0.75 if side == "left" else 0.87
+
+    if len(colours) == 1 and side == "left": 
+        ax.text(x+0.006, y0-0.045, "■", transform=ax.transAxes,
+                    ha="center", va="center", color=colours[0], fontsize=fontsize, fontweight="bold",
+                    clip_on=False)
+    else:
+        for i, c in enumerate(colours):
+            ax.text(x, y0 - i * 0.045, "■", transform=ax.transAxes,
+                    ha="center", va="center", color=c, fontsize=fontsize, fontweight="bold",
+                    clip_on=False)
+
+
 def plot_raw_session(
-    power_kw: np.ndarray,
-    *,
-    soc: np.ndarray | None = None,
-    soc_mode: Literal["none", "raw", "simpl"] = "none",
-    title: str | None = None,
-    y_lim: tuple[float, float] | None = None,
-    ) -> tuple[Figure, Axes]:
-    """Plots raw power (left hand axis, kw) and optionally SOC (right hand axis, %).
+    power_kw: np.ndarray, *, soc: np.ndarray | None = None, soc_mode: Literal["none", "raw", "simpl"] = "none",
+    title: str | None = None, power_y_lim: tuple[float, float] = (0, 160), 
+    figsize: Tuple[int, int] = (14, 5)) -> tuple[Figure, Axes]:
+    """Plots raw power (left axis, kW) and optionally SOC (right axis, %) with colour-coded axes.
 
     Args:
         power_kw: Dense power in kW, shape (T,).
         soc: Optional SOC series in percent, shape (T,).
-        soc_mode: "none", "raw", or "simpl".
+        soc_mode: "none", "raw", or "simpl" — label text only.
         title: Optional figure title.
-        y_lim: Optional power y-limits (min, max).
+        y_lim: Optional power y-limits (min, max). If None, uses [0, max + 20].
+        dt_minutes: Minutes per time step; scales x and renames the x-axis to 'Minutes elapsed'.
 
     Returns:
-        Matplotlib figure and left axis.
+        (fig, left_axis).
     """
     y = np.asarray(power_kw, dtype=float).reshape(-1)
-    x = np.arange(y.size)
+    T = y.size
+    x = np.arange(T, dtype=float)
 
-    fig = plt.figure(figsize=(10, 4))
+    fig = plt.figure(figsize=figsize)
     ax = plt.gca()
-    ax.plot(x, y, linewidth=1.2, label="power (raw)")
-    if y_lim is not None:
-        ax.set_ylim(*y_lim)
-    ax.set_xlabel("time (arbitrary units)")
-    ax.set_ylabel("power (kW)")
+
+    # main series: raw power (orange), slightly thicker
+    ax.plot(x, y, linewidth=1.8, color=COLOUR_POWER_RAW, label="Power (kW)")
+
+    # y-limits
+    ax.set_ylim(power_y_lim[0], power_y_lim[1])
+
+    # axes, title, grid
+    ax.set_xlabel("Minutes elapsed", fontdict={"size": 15})
+    _axis_label_with_dual_icon(ax, "Power (kW)", colours=[COLOUR_POWER_RAW], side="left", 
+                               fontsize=15)
     if title:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)
 
+    # optional SOC on right axis (blue)
     lines = ax.get_lines()
     if soc_mode != "none" and soc is not None:
         ax2 = ax.twinx()
         ax2.set_ylim(0.0, 100.0)
-        ax2.set_ylabel("state of charge (%)")
-        soc_color = "#0b3d91"  # dark blue
-        ax2.plot(x, np.clip(soc, 0.0, 100.0), linewidth=1.2, label=f"soc ({soc_mode})", color=soc_color)
+        _axis_label_with_dual_icon(ax2, "Battery charge level (%)", colours=[COLOUR_SOC], 
+                                   side="right", fontsize=15)
+        ax2.plot(x, np.clip(np.asarray(soc, dtype=float), 0.0, 100.0), linewidth=1.6,
+                 color=COLOUR_SOC, label=f"Battery charge level (%)")
         lines = lines + ax2.get_lines()
 
     labels = [ln.get_label() for ln in lines]
-    ax.legend(lines, labels, loc="best", fontsize=9)
+    ax.legend(lines, labels, bbox_to_anchor=(0.18, -0.1),
+          frameon=True, framealpha=0.9, fontsize=10)
+    fig.tight_layout()
     return fig, ax
 
 
@@ -155,63 +191,64 @@ def plot_raw_pred_session(bundle: SessionPredsBundle, power_scaler, soc_scaler,
     fig.tight_layout()
     plt.show()
 
-
-# TODO: Improve visualization
 def plot_raw_simpl_session(
-    power_kw: np.ndarray,
-    idx: np.ndarray,
-    val_kw: np.ndarray,
-    *,
-    soc: np.ndarray | None = None,
-    soc_mode: Literal["none", "raw", "simpl"] = "none",
-    title: str | None = None,
-    y_lim: tuple[float, float] | None = None,
+    power_raw: np.ndarray, simp_idx: np.ndarray, simp_kw: np.ndarray, *,
+    t_min_eval: int, anchor_endpoints: Literal["both", "last"],
+    soc: np.ndarray | None = None, soc_mode: Literal["none", "raw", "simpl"] = "none",
+    title: str | None = None, power_y_lim: tuple[float, float] = (0, 140),
+    figsize: Tuple[int, int] = (14, 5)
 ) -> tuple[Figure, Axes]:
-    """Plots raw and simplified power. Optionally overlays SOC on right-hand axis.
+    """Plots raw and simplified power (left axis) and optionally SOC (right axis) with strong axis-series links.
 
-    Args:
-        power_kw: Dense power in kW, shape (T,).
-        idx: Knot indices for simplified power, shape (K,).
-        val_kw: Knot values in kW, shape (K,).
-        soc: Optional SOC series in percent, shape (T,).
-        soc_mode: "none", "raw", or "simpl".
-        title: Optional figure title.
-        y_lim: Optional power y-limits (min, max).
-
-    Returns:
-        Matplotlib figure and left axis.
+    Colours:
+        - simplified power: dark red
+        - raw power: black
+        - SOC: blue (right axis)
     """
-    y = np.asarray(power_kw, dtype=float).reshape(-1)
-    T = y.size
-    xs = np.arange(T)
-    idx = np.asarray(idx, dtype=int).reshape(-1)
-    val = np.asarray(val_kw, dtype=float).reshape(-1)
+    from mt4xai.ors import interpolate_from_pivots
+    power_raw = np.asarray(power_raw, dtype=float).reshape(-1)
+    T = power_raw.size
+    x = np.arange(T, dtype=float)
 
-    y_hat = np.interp(xs, idx.astype(float), val)
+    simp_idx = np.asarray(simp_idx, dtype=int)
+    simp_kw = np.asarray(simp_kw, dtype=float)
+    power_simp_interp = interpolate_from_pivots(
+        T=T, pivots=simp_idx, values=simp_kw, t_min_eval=t_min_eval, anchor_endpoints=anchor_endpoints
+    )
 
-    fig = plt.figure(figsize=(10, 4))
+    fig = plt.figure(figsize=figsize)
     ax = plt.gca()
-    ax.plot(xs, y, linewidth=1.0, alpha=0.85, label="power (raw)")
-    ax.plot(xs, y_hat, linewidth=1.8, label="power (simplified)")
-    if y_lim is not None:
-        ax.set_ylim(*y_lim)
-    ax.set_xlabel("time (arbitrary units)")
-    ax.set_ylabel("power (kW)")
+
+    # raw  + simplified
+    ax.plot(x, power_raw, linewidth=1.5, alpha=0.8, linestyle="dashed",
+            color=COLOUR_POWER_RAW, label="power (actual)")
+    ax.plot(x, power_simp_interp, linewidth=2.2, color=COLOUR_POWER_SIMPL, alpha=0.9, 
+            label="power (simplified)")
+
+    ax.set_ylim(power_y_lim[0], power_y_lim[1])
+
+    # axes, title, grid
+    ax.set_xlabel("Minutes elapsed", fontdict={"size": 15})
+    _axis_label_with_dual_icon(ax, "Power (kW)", colours=[COLOUR_POWER_RAW, COLOUR_POWER_SIMPL], side="left", fontsize=14)
     if title:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)
 
+    # build legend candidates
     lines = ax.get_lines()
+
+    # optional SOC (right axis)
     if soc_mode != "none" and soc is not None:
         ax2 = ax.twinx()
-        ax2.set_ylim(0.0, 100.0)
-        ax2.set_ylabel("state of charge (%)")
-        soc_color = "#0b3d91"
-        ax2.plot(xs, np.clip(soc, 0.0, 100.0), linewidth=1.2, label=f"soc ({soc_mode})", color=soc_color)
+        ax2.set_ylim(0, 100)
+        _axis_label_with_dual_icon(ax2, "Battery charge level (%)", colours=[COLOUR_SOC], side="right", fontsize=14)
+        ax2.plot(x, np.clip(np.asarray(soc, dtype=float), 0.0, 100.0), linewidth=1.6, alpha=0.8,
+                 color=COLOUR_SOC, label=f"battery charge level")
         lines = lines + ax2.get_lines()
 
     labels = [ln.get_label() for ln in lines]
-    ax.legend(lines, labels, loc="best", fontsize=9)
+    ax.legend(lines, labels, bbox_to_anchor=(0.18, -0.1),
+          frameon=True, framealpha=0.9, fontsize=10)
     return fig, ax
 
 
