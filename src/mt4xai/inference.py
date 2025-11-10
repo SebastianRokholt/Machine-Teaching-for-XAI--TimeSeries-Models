@@ -1,18 +1,26 @@
 # src/mt4xai/inference.py
 from __future__ import annotations  # postpones evaluation of type hints to speed up imports
 import torch
+from torch import nn
+from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
-from typing import Iterable
+from typing import Dict, Iterable, Optional
 from sklearn.preprocessing import MinMaxScaler
-from .data import SessionPredsBundle, reconstruct_abs_from_bundle, make_bundle_from_session_df
+from sklearn.metrics import mean_squared_error
+from .data import SessionPredsBundle, ChargingSessionDataset, reconstruct_abs_from_bundle, make_bundle_from_session_df, session_collate_fn
+from .model import horizon_weights
+
+_RWSE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+_EPS: float = 1e-8
+
 
 @torch.no_grad()
 def predict_residuals(model, X: torch.Tensor, lengths: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
     Runs the sequence model and returns residual predictions with shape (B, T, H, C).
     Forward signature is (x, seq_lengths) -> (preds, out_lengths).
-    We run forward on GPU but ALWAYS return CPU for downstream numpy/scaler ops.
+    We run forward on GPU but always return CPU for downstream numpy/scaler ops.
     """
     model.eval()
     X = X.to(device)
@@ -24,7 +32,63 @@ def predict_residuals(model, X: torch.Tensor, lengths: torch.Tensor, device: tor
         lengths = lengths.to(dtype=torch.long, device="cpu")
 
     P_res, _ = model(X, lengths)
-    return P_res.detach().cpu()  # <-- move to CPU here
+    return P_res.detach().cpu()
+
+
+def evaluate_model(model: nn.Module,
+    dataset: ChargingSessionDataset,
+    batch_size: int,
+    device: torch.device,
+    power_scaler: MinMaxScaler,
+    horizon: int,
+    idx_power: int=2,
+    weight_decay: Optional[np.ndarray]=None,
+ ) -> Dict[str, float | int]:
+    """computes Macro-RMSE (in kW) for a single-target (power) multi-horizon forecaster.
+    
+    it computes a per-session RMSE that aggregates per-horizon MSE with weights w_h, then
+    averages those RMSE values across sessions. predictions are reconstructed to absolute
+    power and inverse-scaled to kW before error computation.
+    returns: {"MacroRMSE": float, "NumSequencesEvaluated": int}
+    """
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=session_collate_fn, shuffle=False)
+    model.eval()
+    h_weights = horizon_weights(H=horizon, alpha=weight_decay, device=torch.device("cpu"), as_vector=True)
+    seq_rmses: list[float] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            _, X_batch, Y_batch, lengths = batch
+            X_batch = X_batch.to(device, non_blocking=True)
+            Y_batch = Y_batch.to(device, non_blocking=True)
+
+            pred_resid, _ = model(X_batch, lengths)                      # (B, T, H, 1)
+            P_abs = reconstruct_abs_from_residuals_batch(pred_resid, X_batch, idx_power)  # (B,T,H,1)
+            Y_abs = Y_batch + X_batch[..., [idx_power]].unsqueeze(2)     # (B, T, H, 1)
+
+            B, _, H, _ = P_abs.shape
+            for i in range(B):
+                L = int(lengths[i].item())
+                if L <= H + 1:
+                    continue
+                s, e = 1, L - H  # valid [t] for multi-horizon comparison
+
+                # inverse-scale to kW
+                pv = P_abs[i, s:e, :, 0].contiguous().view(-1, 1).cpu().numpy()
+                tv = Y_abs[i, s:e, :, 0].contiguous().view(-1, 1).cpu().numpy()
+                p_kw = power_scaler.inverse_transform(pv).reshape(-1, H)
+                t_kw = power_scaler.inverse_transform(tv).reshape(-1, H)
+
+                # per-horizon MSE over valid t, then weighted average across horizons
+                per_h_mse = np.array([
+                    mean_squared_error(t_kw[:, h], p_kw[:, h]) for h in range(H)
+                ], dtype=np.float64)
+                weighted_mse = float(np.dot(h_weights, per_h_mse))
+                seq_rmses.append(np.sqrt(weighted_mse))
+    return {
+        "MacroRMSE": float(np.mean(seq_rmses)) if seq_rmses else float("nan"),
+        "NumSequencesEvaluated": int(len(seq_rmses)),
+    }
 
 
 def reconstruct_abs_from_residuals_batch(X: torch.Tensor,
@@ -65,43 +129,82 @@ def inverse_targets_np(arr_scaled: np.ndarray,
     out[..., 1] = soc_scaler.inverse_transform(out[..., 1].reshape(-1, 1)).reshape(out.shape[:-1])
     return out
 
-def macro_rmse_per_session(P_abs: torch.Tensor,
-                           Y_abs: torch.Tensor,
-                           lengths: torch.Tensor,
-                           power_weight: float = 0.5, 
-                           t_min_eval: int = 0,
-                           w_h: np.ndarray | None = None) -> np.ndarray:
+
+def macro_rmse_per_session(P_abs: torch.Tensor, Y_abs: torch.Tensor, lengths: torch.Tensor,
+                               power_min: torch.Tensor, power_max: torch.Tensor,
+                               horizon_decay: float) -> torch.Tensor:
+    """Computes per-sequence Macro-RMSE (kW) for a single target across horizons.
+
+    It inverse-transforms scaled absolute predictions/targets to kW, computes
+    per-horizon MSE over valid timesteps for each sequence, aggregates with
+    horizon weights w_h ∝ exp(-alpha*(h-1)) (normalised to sum 1), then takes
+    the root per sequence. Returns one RMSE per sequence.
+
+    Args:
+        P_abs: absolute predictions in scaled space, shape (B, T, H, 1).
+        Y_abs: absolute targets in scaled space, shape (B, T, H, 1).
+        lengths: sequence lengths, shape (B,).
+        power_min: scalar tensor with original-space min for power.
+        power_max: scalar tensor with original-space max for power.
+        horizon_decay: horizon-decay parameter (alpha) for the weights.
+
+    Returns:
+        Tensor of shape (B,) with per-sequence Macro-RMSE in kW. Entries are
+        NaN for sequences that are too short (L <= H+1).
     """
-    computes one scalar error per session:
-       sum_h w_h[h] * [ w*rmse_power(h) + (1-w)*rmse_soc(h) ]
-    only timesteps t >= t_min_eval + 1 are included.
-    if w_h is None, uses uniform weights across horizons.
-    """
-    B, T, H, C = P_abs.shape
-    errs = np.zeros(B, dtype=np.float64)
-    if w_h is None:
-        w_h = np.ones(H, dtype=np.float64) / max(1, H)
+    # inverse min–max to kW
+    P_kw = P_abs[..., 0] * (power_max - power_min) + power_min  # (B,T,H)
+    Y_kw = Y_abs[..., 0] * (power_max - power_min) + power_min  # (B,T,H)
 
-    for b in range(B):
-        L = int(lengths[b])
-        vals, hs = [], []
-        for h in range(H):
-            end = L - (h + 1)
-            if end <= t_min_eval:
-                continue
-            diff = (P_abs[b, t_min_eval:end, h, :] - Y_abs[b, t_min_eval:end, h, :]).cpu().numpy()
-            rmse_c = np.sqrt(np.mean(diff**2, axis=0))
-            v = power_weight * rmse_c[0] + (1.0 - power_weight) * rmse_c[1]
-            vals.append(v); hs.append(h)
-        if vals:
-            errs[b] = float(np.sum([w_h[h] * v for v, h in zip(vals, hs)]))
-        else:
-            errs[b] = np.nan
-    return errs
+    B, T, H = P_kw.shape
+    w_h = horizon_weights(H, horizon_decay, P_kw.device).view(H)
+    w_h = w_h / w_h.sum()
+
+    out = torch.full((B,), float("nan"), device=P_kw.device)
+    for i in range(B):
+        L = int(lengths[i].item())
+        if L <= H + 1:
+            continue
+        s, e = 1, L - H
+        e2 = (P_kw[i, s:e, :] - Y_kw[i, s:e, :]).pow(2) # (Tv, H)
+        per_h_mse = e2.mean(dim=0)  # (H,)
+        out[i] = torch.sqrt((w_h * per_h_mse).sum())
+    return out
 
 
-_RWSE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
-_EPS: float = 1e-8
+# def macro_rmse_per_session(P_abs: torch.Tensor,
+#                            Y_abs: torch.Tensor,
+#                            lengths: torch.Tensor,
+#                            power_weight: float = 0.5, 
+#                            t_min_eval: int = 0,
+#                            w_h: np.ndarray | None = None) -> np.ndarray:
+#     """
+#     computes one scalar error per session:
+#        sum_h w_h[h] * [ w*rmse_power(h) + (1-w)*rmse_soc(h) ]
+#     only timesteps t >= t_min_eval + 1 are included.
+#     if w_h is None, uses uniform weights across horizons.
+#     """
+#     B, T, H, C = P_abs.shape
+#     errs = np.zeros(B, dtype=np.float64)
+#     if w_h is None:
+#         w_h = np.ones(H, dtype=np.float64) / max(1, H)
+
+#     for b in range(B):
+#         L = int(lengths[b])
+#         vals, hs = [], []
+#         for h in range(H):
+#             end = L - (h + 1)
+#             if end <= t_min_eval:
+#                 continue
+#             diff = (P_abs[b, t_min_eval:end, h, :] - Y_abs[b, t_min_eval:end, h, :]).cpu().numpy()
+#             rmse_c = np.sqrt(np.mean(diff**2, axis=0))
+#             v = power_weight * rmse_c[0] + (1.0 - power_weight) * rmse_c[1]
+#             vals.append(v); hs.append(h)
+#         if vals:
+#             errs[b] = float(np.sum([w_h[h] * v for v, h in zip(vals, hs)]))
+#         else:
+#             errs[b] = np.nan
+#     return errs
 
 
 def list_unique_session_ids(df_scaled: pd.DataFrame) -> np.ndarray:

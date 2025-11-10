@@ -1,7 +1,5 @@
-# ===========================================================
 # MT4XAI Project Configuration
 # Stores tunable parameters and empirically derived constants
-# ===========================================================
 
 project:
   random_seed: 42
@@ -20,19 +18,17 @@ paths:
   logs: "Logs"
 
 inference:
+  # final model hyperparams below derived from model tuning in notebook 3
   horizon: 5
-  # final model hyperparams derived from model tuning
   final_model_name: "final_model.pth"
   # hidden_dim: 
   # num_layers: 
   # dropout: 
-  power_weight: 0.6522982410461 
+  # values below derived from anomaly detection exploration in notebook 4
   horizon_decay_lambda: 0.4
-
-anomaly_detection:
-  # values derived from anomaly detection exploration in notebook 4
+  power_weight: 0.6522982410461 # deprecated
   t_min_eval: 1  
-  rmse_threshold: 8.5962  
+  ad_rmse_threshold: 8.5962  
   ad_pct_threshold: 0.95  
   metric: "macro_rmse"
 
@@ -57,4 +53,4 @@ ors:
 
 teaching:
   teaching_pool_dir: "../Data/teaching_pool"
-  teaching_set_size: 200  # balanced across two classes
+  teaching_set_size: 60  # balanced across two classes: 10 + 10 for pre/post test, <=40 for teaching session

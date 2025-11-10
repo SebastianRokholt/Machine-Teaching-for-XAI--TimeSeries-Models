@@ -1,14 +1,17 @@
 # src/mt4xai/model.py
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
 from torch.nn.utils import weight_norm
 import torch.nn.functional as F
 
 
-# LSTM
+# --------------------------------- LSTM ----------------------------------- #
+
 class MultiHorizonLSTM(nn.Module):
-    """LSTM multi-horizon residual model"""
+    """LSTM multi-horizon residual model with a linear (fully connected) head for 
+    predicting residuals on variable-length sequences."""
     def __init__(self, input_size: int, hidden_dim: int, horizon: int, num_targets: int,
                  num_layers: int, dropout: float=0.0):
         super().__init__()
@@ -20,13 +23,11 @@ class MultiHorizonLSTM(nn.Module):
         )
         self.linear = nn.Linear(hidden_dim, horizon * num_targets)
 
-    def forward(self, x: torch.Tensor, seq_lengths: torch.Tensor):
+    def forward(self, x: Tensor, seq_lengths: Tensor):
         packed_x = rnn_utils.pack_padded_sequence(x, seq_lengths, batch_first=True, enforce_sorted=False)
         packed_out, _ = self.lstm(packed_x)
         out, out_lengths = rnn_utils.pad_packed_sequence(packed_out, batch_first=True)
         out = self.linear(out).view(out.shape[0], out.shape[1], self.horizon, self.num_targets)
-        # enforce non-negative SOC deltas via softplus
-        out = torch.cat([out[:, :, :, 0:1], F.softplus(out[:, :, :, 1:2])], dim=-1)
         return out, out_lengths
     
 
@@ -47,7 +48,7 @@ def load_lstm_model(path, device="cpu"):
     model = MultiHorizonLSTM(
         input_size=len(checkpoint["input_features"]),
         hidden_dim=int(cfg["hidden_dim"]),
-        horizon=cfg["horizon"],
+        horizon=int(cfg["horizon"]),
         num_targets=len(checkpoint["target_features"]),
         num_layers=cfg["num_layers"],
         dropout=cfg["dropout"]
@@ -58,7 +59,7 @@ def load_lstm_model(path, device="cpu"):
     return model, checkpoint
 
 
-# TCN
+# --------------------------------- TCN ----------------------------------- #
 class MultiHorizonTCN(nn.Module):
     """
     WaveNet-style TCN:
@@ -90,7 +91,7 @@ class MultiHorizonTCN(nn.Module):
         # RF = 1 + (k-1) * sum_{i=0}^{L-1} (growth^i)
         return 1 + (kernel_size - 1) * sum(dilation_growth ** i for i in range(num_layers))
 
-    def forward(self, x: torch.Tensor, seq_lengths: torch.Tensor):
+    def forward(self, x: Tensor, seq_lengths: Tensor):
         # x: (B, T, F) -> (B, C, T)
         B, T, RF = x.shape
         h = self.input_proj(x.transpose(1, 2))
@@ -98,11 +99,8 @@ class MultiHorizonTCN(nn.Module):
         for blk in self.blocks:
             h, s = blk(h)
             skip_sum = s if skip_sum is None else (skip_sum + s)
-
         h = self.post(skip_sum)
         y = self.head(h).transpose(1, 2).view(B, T, self.horizon, self.num_targets)
-        # enforces non-negative SOC deltas with softplus
-        y = torch.cat([y[:, :, :, 0:1], F.softplus(y[:, :, :, 1:2])], dim=-1)
         return y, seq_lengths
 
 
@@ -150,7 +148,36 @@ def build_model_tcn(cfg):
         hidden_dim=int(cfg["hidden_dim"]),
         num_layers=int(cfg["num_layers"]),
         kernel_size=int(cfg["kernel_size"]),
-        horizon=cfg["horizon"],
+        horizon=int(cfg["horizon"]),
         num_targets=len(cfg["target_features"]),
         dropout=float(cfg.get("dropout", 0.0)),
     ).to(cfg["device"])
+
+
+# --------------------------------- COMMON MODELLING UTILITIES ----------------------------------- #
+def horizon_weights(H: int, alpha: float | Tensor, device: torch.device, *,
+                    normalise: bool = True, as_vector: bool = False, eps: float = 1e-12) -> Tensor:
+    """Return exponentially decaying horizon weights w[h] = exp(-alpha*(h-1)).
+
+    The weights emphasise shorter horizons as alpha increases. By default they are
+    normalised to sum to 1 across horizons so that the aggregate loss/metric is
+    scale-stable with respect to alpha.
+
+    Args:
+        H: number of prediction horizons.
+        alpha: exponential decay parameter; larger values increase decay.
+        device: torch device for the returned tensor.
+        normalise: if True, divide by the sum across horizons (default: True).
+        as_vector: if True, return shape (H,); otherwise return (1, 1, H, 1).
+        eps: small constant to avoid division by zero during normalisation.
+
+    Returns:
+        Tensor: horizon weights as (H,) if as_vector is True, else (1, 1, H, 1).
+    """
+    h = torch.arange(1, H + 1, device=device, dtype=torch.float32)
+    if isinstance(alpha, Tensor):
+        alpha = alpha.to(device=device, dtype=torch.float32)
+    w = torch.exp(-alpha * (h - 1))
+    if normalise:
+        w = w / w.sum().clamp_min(eps)
+    return w if as_vector else w.view(1, 1, H, 1)

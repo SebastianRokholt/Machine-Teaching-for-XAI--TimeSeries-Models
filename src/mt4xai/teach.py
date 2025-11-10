@@ -8,7 +8,7 @@ import os
 import copy
 import heapq
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Literal, Sequence, Optional, Tuple
 from matplotlib.figure import Figure
@@ -23,7 +23,7 @@ from IPython.display import display
 # ---- mt4xai project modules ----
 from .ors import ORSParams, ors, build_true_abs_from_series, macro_rmse_from_abs
 from .inference import predict_residuals, inverse_targets_np, reconstruct_abs_from_residuals_batch
-from .data import fetch_session_preds_bundle, ChargingSession, ChargingSessionSimplification
+from .data import fetch_charging_session, ChargingSession, ChargingSessionSimplification
 from .model import load_lstm_model
 
 
@@ -105,7 +105,7 @@ class TeachingPool:
         }
         meta = {
             "model_id": Path(config.model_path).name,
-            "threshold": config.threshold,
+            "threshold": config.ad_threshold,
             "random_seed": config.random_seed,
             "timestamp": int(time.time()),
         }
@@ -163,7 +163,7 @@ class TeachingPool:
             cfg_model = ckpt["config"]
             config.power_weight = float(cfg_model.get("power_weight", config.power_weight))
             config.decay_lambda = float(cfg_model.get("decay_lambda", config.decay_lambda))
-            print(f"[teach] loaded model config: power_weight={config.power_weight}, decay_lambda={config.decay_lambda}")
+            print(f"[teach] loaded model config: \n{config}")
 
         dirs = cls.ensure_dirs(Path(config.output_dir))
         db_path = dirs["root"] / "pool_cache.db"
@@ -189,8 +189,14 @@ class TeachingPool:
                 power_weight=config.power_weight,
                 decay_lambda=config.decay_lambda,
                 t_min_eval=config.ors_params.t_min_eval,
-                threshold=config.threshold,
+                threshold=config.ad_threshold,
             )
+            # quick diagnostic: run inside TeachingPool.build just after compute_base_labels(...) returns
+            q = np.quantile(np.fromiter(err_by_id.values(), dtype=float), [0.5, 0.8, 0.9, 0.95, 0.99])
+            print(f"[sanity] Macro-RMSE quantiles now (pw={config.power_weight}, λ={config.decay_lambda}):",
+                dict(zip(["p50","p80","p90","p95","p99"], q)))
+            print(f"[sanity] threshold used: {config.ad_threshold}")
+
             print(f"[teach] base labels: abnormal={len(abn_ids)}, normal={len(norm_ids)}")
             plan = cls.sample_sessions(abn_ids, norm_ids, random_seed=config.random_seed)
             (dirs["root"] / "sampled_normals.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
@@ -214,7 +220,7 @@ class TeachingPool:
         params.model_id = Path(config.model_path).name
         for n_done, sid in enumerate(to_process, start=1):
             # fetch bundle by session_id
-            b = fetch_session_preds_bundle(
+            b = fetch_charging_session(
                 model,
                 test_loader,
                 batch_index=None,
@@ -226,6 +232,21 @@ class TeachingPool:
                 idx_power_inp=idx_power_inp,
                 idx_soc_inp=idx_soc_inp,
             )
+
+            # enforce length range
+            T_seq = int(getattr(b, "length", None) or getattr(b, "T", None) or len(b.true_power_unscaled))
+            lr = config.length_range
+            if lr is not None:
+                lo_raw, hi_raw = lr
+                lo_ok = True if lo_raw is None else T_seq >= int(lo_raw)
+                hi_ok = True if hi_raw is None else T_seq <= int(hi_raw)
+                if not (lo_ok and hi_ok):
+                    # light logging; avoid spamming every row
+                    if (n_done % 50) == 0:
+                        print(f"[teach] skip sid={sid}: T={T_seq} outside "
+                            f"[{0 if lo_raw is None else int(lo_raw)}, "
+                            f"{'inf' if hi_raw is None else int(hi_raw)}]")
+                    continue
 
             # persist raw power and raw SOC for overlays
             try:
@@ -241,10 +262,6 @@ class TeachingPool:
                 raise RuntimeError(f"[teach] session {sid}: SOC missing or cannot save: {e}") from e
 
             # clamp ORS params to sequence length
-            try:
-                T_seq = int(getattr(b, "T", None) or len(b.true_power_unscaled))
-            except Exception:
-                T_seq = 0
             p_local = cls.prepare_ors_params_for_T(params, T_seq if T_seq > 0 else 2)
 
             # run ORS safely
@@ -259,7 +276,7 @@ class TeachingPool:
                     idx_soc_inp=idx_soc_inp,
                     power_weight=config.power_weight,
                     decay_lambda=config.decay_lambda,
-                    threshold=config.threshold,
+                    threshold=config.ad_threshold,
                 )
             except Exception as e:
                 print(f"[teach][warn] ORS raised for sid={sid}: {type(e).__name__}: {e}")
@@ -275,7 +292,7 @@ class TeachingPool:
                 robust_prob = float(1.0 - float(res["frag"]))
                 lbl_text = str(res["label"])
                 lbl_int = 1 if lbl_text == "abnormal" else 0
-                margin = float(config.threshold - res["err"]) if lbl_int == 0 else float(res["err"] - config.threshold)
+                margin = float(config.ad_threshold - res["err"]) if lbl_int == 0 else float(res["err"] - config.ad_threshold)
             except Exception as e:
                 print(f"[teach][warn] metric cast failure sid={sid}: {e}; skipping.")
                 continue
@@ -326,7 +343,7 @@ class TeachingPool:
                 frag=float(res["frag"]),
                 robust_prob=robust_prob,
                 margin=margin,
-                threshold=float(config.threshold),
+                threshold=float(config.ad_threshold),
                 model_id=p_local.model_id,
                 ts_unix=float(time.time()),
                 raw_power_path=str((dirs["raw_power"] / f"{sid}.npy").as_posix()),
@@ -787,7 +804,7 @@ class TeachingPool:
                 err = macro_rmse_from_abs(P_abs[i, :T], Y_abs_true, power_weight, decay_lambda, t_min_eval)
                 sid = sids[i]
                 if sid is None:
-                    b = fetch_session_preds_bundle(
+                    b = fetch_charging_session(
                         model,
                         test_loader,
                         batch_index=b_idx,
@@ -844,7 +861,7 @@ class TeachingPool:
     @staticmethod
     def prepare_ors_params_for_T(params: ORSParams, T: int) -> ORSParams:
         """Returns ORSParams clamped/adapted to sequence length T (delegates to shared helper)."""
-        return _prepare_ors_params_for_T(params, T)
+        return _validate_ors_params(params, T)
 
     @staticmethod
     def validate_ors_result(res: dict) -> tuple[bool, str | None]:
@@ -874,15 +891,18 @@ class TeachingPoolConfig:
         ors_params: Parameters for robust simplification.
         power_weight: Macro-RMSE weighting for power.
         decay_lambda: Exponential decay factor in Macro-RMSE.
+        length_range: Optional (min_len, max_len) in timesteps. sessions outside are skipped at pool build stage.
+                      Use None for open bounds, e.g. (11, None) enforces a minimum length of 11 with no upper cap.
     """
     model_path: str = "../Models/final/final_model.pth"
     output_dir: str = "../Data/teaching_pool"
-    threshold: float = 8.5962
+    ad_threshold: float = 8.5962
     random_seed: Optional[int] = None
     device: torch.device = torch.device("cuda"),
     export_every: int = 10
     L: int = 128
     P: int = 4
+    length_range: tuple[int | None, int | None] | None = None
     power_weight: Optional[float] = 0.5
     decay_lambda: Optional[float] = 0.2
     ors_params: ORSParams = field(
@@ -939,8 +959,6 @@ class TeachingSet:
         per_class_target: Target count per class if `per_bin_budget` is not provided (used to derive budgets).
         bin_allocation: "even" or "proportional" split of `per_class_target` across a class's k-bins.
         enforce_even_class_dist: If True, caps both classes to the minimum achievable total subject to availability.
-        length_range: Optional (min_len, max_len) to filter raw session length before selection;
-            use None for open bound, e.g. (10, None) keeps length ≥ 10.
         lambda_margin: Weight for the decision-margin linear term.
         lambda_robust: Weight for the robustness-probability linear term.
         normalize_embeddings: If True, L2-normalises embeddings before cosine similarity.
@@ -962,7 +980,6 @@ class TeachingSet:
         - Embeddings are expected in column `emb` as a list/array with `emb_dim`.
         - Class label column is `class_label` (mapped from `label_int` if needed).
         - k-bin label column is `k_bin_label` (or `k_bin`, which is renamed).
-        - Length filtering prefers `raw_power_path` to infer length; falls back to `sts_full_path`.
         - Group semantics:
             A → curriculum in iterator, shows simplification overlays,
             B → random in iterator, shows simplification overlays,
@@ -980,7 +997,6 @@ class TeachingSet:
                  per_class_target: int | None = 100,
                  bin_allocation: str = "even",
                  enforce_even_class_dist: bool = False,
-                 length_range: Optional[tuple] = None,
                  lambda_margin: float = 0.10,
                  lambda_robust: float = 0.05,
                  normalize_embeddings: bool = True,
@@ -1003,7 +1019,6 @@ class TeachingSet:
             min_per_k=min_per_k,
             bin_allocation=bin_allocation,
             enforce_even_class_dist=enforce_even_class_dist,
-            length_range=length_range,
             lambda_margin=lambda_margin,
             lambda_robust=lambda_robust,
             normalize_embeddings=normalize_embeddings,
@@ -1036,7 +1051,6 @@ class TeachingSet:
                   min_per_k: int = 0,
                   bin_allocation: str = "even",
                   enforce_even_class_dist: bool = False,
-                  length_range: Optional[tuple] = None,
                   lambda_margin: float = 0.10,
                   lambda_robust: float = 0.05,
                   normalize_embeddings: bool = True,
@@ -1062,7 +1076,6 @@ class TeachingSet:
             min_per_k: Seeds at least this many selections per distinct k inside each (class, k-bin) (up to budget).
             bin_allocation: "even" or "proportional" when deriving budgets from `per_class_target`.
             enforce_even_class_dist: Caps totals so both classes select the same achievable count.
-            length_range: Optional (min_len, max_len) filter on raw-session length.
             lambda_margin: Weight for decision-margin bonus.
             lambda_robust: Weight for robustness-probability bonus.
             normalize_embeddings: If True, applies L2 normalisation before cosine similarity.
@@ -1102,32 +1115,11 @@ class TeachingSet:
             print(f"[teach][warn] skipping {n_bad} rows with invalid embeddings for selection.")
         df = df[mask_ok].reset_index(drop=True)
 
-        # optional: filter by raw-session length
-        if length_range is not None:
-            lo_raw, hi_raw = length_range
-            if "length" not in df.columns:
-                def _len_from_row(row) -> int | None:
-                    p = row.get("raw_power_path") or row.get("sts_full_path")
-                    if isinstance(p, str) and os.path.exists(p):
-                        try:
-                            return int(np.load(p, mmap_mode="r").shape[0])
-                        except Exception:
-                            return None
-                    return None
-                df["length"] = df.apply(_len_from_row, axis=1)
-            pool_max = int(pd.to_numeric(df["length"], errors="coerce").max())
-            lo = 0 if lo_raw is None else int(lo_raw)
-            hi = pool_max if hi_raw is None else int(hi_raw)
-            before = len(df)
-            df = df[(pd.to_numeric(df["length"], errors="coerce") >= lo) &
-                    (pd.to_numeric(df["length"], errors="coerce") <= hi)].copy()
-            print(f"[teach] length filter [{lo}, {hi}] kept {len(df)} / {before} rows.")
-
         # budgets
         if per_bin_budget is None:
             if per_class_target is None:
                 raise ValueError("either provide per_bin_budget or set per_class_target")
-            per_bin_budget = derive_per_bin_budget(
+            per_bin_budget = self.derive_per_bin_budget(
                 df, per_class_target=per_class_target, bin_allocation=bin_allocation
             )
         per_bin_budget = self.spillover_by_counts(df, per_bin_budget)
@@ -1740,7 +1732,7 @@ class TeachIterator:
             power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
             soc_raw = _safe_load(raw_soc_path) if raw_soc_path else _safe_load(_derive_raw_soc_path(sts_full_path))
             sess_c = ChargingSession(session_id=sid, power_kw=power, soc_pct=np.asarray(soc_raw, dtype=float))
-            fig, _ = sess_c.plot(soc_mode="raw", title=None, y_lim=self.y_lim)
+            fig, _ = sess_c.plot_raw(soc_mode="raw", title=None, y_lim=self.y_lim)
         else:
             # A/B: raw+simpl power + simplified SOC only
             power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
@@ -1778,7 +1770,7 @@ class TeachIterator:
 
             sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
             # subtext = f"example {self._cursor} has k={simp.k_power} segments" if (simp and simp.k_power is not None) else None
-            fig, _ = sess.plot(soc_mode="simpl", title=None, y_lim=self.y_lim, 
+            fig, _ = sess.plot_raw(soc_mode="simpl", title=None, y_lim=self.y_lim, 
                                anchor_endpoints=self.parent.ors_params.anchor_endpoints, 
                                t_min_eval=int(self.parent.ors_params.t_min_eval))
 
@@ -2047,13 +2039,16 @@ def _save_json(obj: dict, path: Path) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
-def _prepare_ors_params_for_T(params: ORSParams, T: int) -> ORSParams:
-    """Clamps ORS hyperparameters to a feasible range for a sequence of length T."""
+def _validate_ors_params(params: ORSParams, T: int) -> ORSParams:
+    """Validates, and if necessary, constrains the ORS parameters 
+    to an appropriate range for a sequence of length T.
+    Enforces the rules: (1) dp_q must be < T, (2) max_k < T, and (3) 1 <= min_k <= max_k
+    """
     p = copy.copy(params)
     T_safe = max(int(T), 2)
-    p.dp_q = int(max(8, min(p.dp_q, T_safe - 1)))         # q must be < T
-    p.max_k = int(max(1, min(p.max_k, T_safe - 1)))       # max_k < T
-    p.min_k = int(max(1, min(p.min_k, p.max_k)))          # 1 <= min_k <= max_k
+    p.dp_q = int(max(8, min(p.dp_q, T_safe - 1)))
+    p.max_k = int(max(1, min(p.max_k, T_safe - 1)))
+    p.min_k = int(max(1, min(p.min_k, p.max_k)))
     return p
 
 
@@ -2091,14 +2086,22 @@ def _bin_midpoint(bin_label: str) -> float:
 
 
 def _export_config(cfg: TeachingPoolConfig, out_dir: Path, n_abn: int, n_norm: int) -> None:
-    """Writes a compact provenance JSON for the pool build."""
+    """Writes a compact JSON for the pool build stage."""
     meta = {
         "model_id": Path(cfg.model_path).name,
-        "threshold": cfg.threshold,
-        "random_seed": cfg.random_seed,
+        "threshold": float(cfg.ad_threshold),
         "abnormal_count": n_abn,
         "normal_count": n_norm,
+        "decay_lambda": float(cfg.decay_lambda),
+        "power_weight": float(cfg.power_weight),
+        "random_seed": int(cfg.random_seed),
+        "device": str(cfg.device),
+        "export_every": int(cfg.export_every),
+        "length_range": (None if cfg.length_range is None
+                        else [int(x) if x is not None else None for x in cfg.length_range]),
+        "ors_params": asdict(cfg.ors_params),
         "timestamp": int(time.time()),
+
     }
     _save_json(meta, out_dir / "config.json")
 

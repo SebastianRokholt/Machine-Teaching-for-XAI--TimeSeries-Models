@@ -1,6 +1,7 @@
 # src/mt4xai/data.py
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, List, Dict, Literal, Sequence, Tuple, Optional
+from typing import Any, Iterable, List, Dict, Literal, Sequence, Tuple, Optional
 import math, random
 from matplotlib.figure import Figure
 from matplotlib.pylab import Axes
@@ -13,6 +14,7 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Sampler
+from mt4xai.plot import plot_session_power_predictions
 
 
 @dataclass(slots=True)
@@ -36,6 +38,7 @@ class ChargingSessionPrediction:
     num_targets: int
     power_pred_kw: Optional[np.ndarray] = None
     soc_pred_pct: Optional[np.ndarray] = None
+    meta: Optional[SessionMeta] = None
 
     def numpy_residuals(self) -> tuple[np.ndarray, np.ndarray]:
         """Returns (Y_resid_scaled, P_resid_scaled) as numpy arrays."""
@@ -124,13 +127,29 @@ class ChargingSession:
     scaler_soc: Optional[sklearn.base.BaseEstimator | MinMaxScaler] = None
     scaler_temp: Optional[sklearn.base.BaseEstimator | MinMaxScaler] = None
     scaler_nominal_power: Optional[sklearn.base.BaseEstimator | MinMaxScaler] = None
-    # feature_order: tuple[Literal["power", "soc", "temp", "nominal_power"]] = ("power", "soc", "temp", "nominal_power")
 
     @property
     def T(self) -> int:
         return int(self.power_kw.size)
+    
+    @property
+    def horizon(self) -> int:
+        """return number of prediction horizons H (None if predictions missing)."""
+        if self.predictions is not None:
+            return int(self.predictions.horizon)
+        return None
 
-    # --- scaled views (computed on demand) ---
+    @property
+    def true_power_unscaled(self) -> np.ndarray:
+        """return the raw power series (kW) as 1d array."""
+        return np.asarray(self.power_kw, dtype=float).reshape(-1)
+
+    @property
+    def true_soc_unscaled(self) -> Optional[np.ndarray]:
+        """return the raw soc series (%) or None."""
+        return None if self.soc_pct is None else np.asarray(self.soc_pct, dtype=float).reshape(-1)
+
+    # scaled views (computed on demand)
     def power_scaled(self) -> np.ndarray:
         if self.scaler_power is None:
             raise ValueError("power scaler is missing")
@@ -157,7 +176,7 @@ class ChargingSession:
             raise ValueError("nominal_power scaler is missing")
         return self.scaler_nominal_power.transform(self.nominal_power_kw.reshape(-1, 1)).reshape(-1)
 
-    # --- feature stacks / tensors ---
+    # feature stacks / tensors
     def features(self, *, scaled: bool=False, 
                  include: Sequence[Literal["power", "soc", "temp", "nominal_power"]] | None = None) -> np.ndarray:
         """Constructs a feature matrix
@@ -202,8 +221,7 @@ class ChargingSession:
         if device is not None: t = t.to(device)
         return t
     
-
-    def plot(
+    def plot_raw(
         self, *, 
         soc_mode: Literal["none", "raw", "simpl"] = "none", 
         title: str | None = None, 
@@ -211,7 +229,7 @@ class ChargingSession:
         anchor_endpoints: Literal["both","last"]="both", 
         t_min_eval: int=1,
         ) -> tuple[Figure, Axes]:
-        """Plots session with optional SOC overlay on a right 0–100% axis.
+        """Plots session with optional SOC overlay on a right 0-100% axis.
         Args:
             soc_mode: Controls SOC visibility. "none" hides SOC, "raw" uses self.soc_pct,
                 "simpl" uses knots from self.simplification to densify SOC.
@@ -256,6 +274,9 @@ class ChargingSession:
                 t_min_eval=t_min_eval,
             )
         
+    def plot_power_predictions(self, **kwargs):
+        return plot_session_power_predictions(self, **kwargs)
+
     def validate(self, *, check_knots: bool = True) -> None:
         """Validate internal consistency (length alignment, optional knots checks).
 
@@ -339,102 +360,227 @@ def get_nth_batch(loader, n: int):
     return next(it)
 
 
-@torch.no_grad()
-def fetch_session_preds_bundle(model: nn.Module, loader,
-                               batch_index: int | None, sample_index: int | None,
-                               device: torch.device,
-                               power_scaler, soc_scaler,
-                               idx_power_inp: int, idx_soc_inp: int,
-                               session_id: int | None = None) -> SessionPredsBundle:
+# @torch.no_grad()
+# def fetch_session_preds_bundle(model: nn.Module, loader,
+#                                batch_index: int | None, sample_index: int | None,
+#                                device: torch.device,
+#                                power_scaler, soc_scaler,
+#                                idx_power_inp: int, idx_soc_inp: int,
+#                                session_id: int | None = None) -> SessionPredsBundle:
+#     """
+#     builds a SessionPredsBundle from a loader by either:
+#       - selecting a specific (batch_index, sample_index), or
+#       - selecting a specific charging session by 'session_id'
+#     the two modes are mutually exclusive.
+
+#     params
+#     - model, loader, device, scalers, idx_power_inp/idx_soc_inp: as before
+#     - batch_index, sample_index: choose a sample by indices
+#     - session_id: choose a sample by charging_id
+
+#     returns
+#     - SessionPredsBundle with CPU tensors for plotting/post-proc
+#     """
+#     use_id = session_id is not None
+#     use_idx = (batch_index is not None) and (sample_index is not None)
+#     if (use_id and use_idx) or (not use_id and not use_idx):
+#         raise ValueError("provide either session_id OR (batch_index, sample_index), not both.")
+
+#     model.eval()
+
+#     if use_id:
+#         sid, Xb, Yb, Ls = get_session_from_loader(loader, session_id=session_id)
+#         # shapes from helper are batched (1, T, F) etc.
+#         X_dev = Xb.to(device, non_blocking=True)
+#         L_cpu = Ls.to(dtype=torch.long, device="cpu")
+#         P_dev, _ = model(X_dev, L_cpu)  # (1, T, H, C)
+
+#         T = int(Ls[0].item())
+#         P_s = P_dev[0, :T].cpu()
+#         Y_s = Yb[0, :T].cpu()
+#         X_s = Xb[0, :T].cpu()
+
+#         power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
+#         soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
+
+#         H, C = P_s.shape[1], P_s.shape[2]
+#         return SessionPredsBundle(
+#             batch_index=0, sample_index=0,
+#             length=T, horizon=H, num_targets=C,
+#             X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
+#             true_power_unscaled=power_true, true_soc_unscaled=soc_true,
+#             session_id=int(sid) if isinstance(sid, (int, np.integer)) else sid
+#         )
+
+#     batch = get_nth_batch(loader, int(batch_index))
+
+#     session_ids = None
+#     if len(batch) == 4:
+#         session_ids, Xb, Yb, Ls = batch
+#     else:
+#         Xb, Yb, Ls = batch
+
+#     if int(sample_index) >= Xb.shape[0]:
+#         raise IndexError(f"sample_index {sample_index} out of range for batch {batch_index} (size={Xb.shape[0]}).")
+
+#     X_dev = Xb.to(device, non_blocking=True)
+#     L_cpu = Ls.to(dtype=torch.long, device="cpu")  # lengths must be CPU int64
+#     P_dev, _ = model(X_dev, L_cpu)
+
+#     T = Ls[int(sample_index)].item()
+#     P_s = P_dev[int(sample_index), :T].cpu()
+#     Y_s = Yb[int(sample_index), :T].cpu()
+#     X_s = Xb[int(sample_index), :T].cpu()
+
+#     power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
+#     soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
+
+#     H, C = P_s.shape[1], P_s.shape[2]
+#     sid = None if session_ids is None else session_ids[int(sample_index)]
+#     return SessionPredsBundle(
+#         batch_index=int(batch_index), sample_index=int(sample_index),
+#         length=T, horizon=H, num_targets=C,
+#         X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
+#         true_power_unscaled=power_true, true_soc_unscaled=soc_true,
+#         session_id=sid
+#     )
+
+
+from dataclasses import dataclass
+from typing import Optional, Any
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import MinMaxScaler
+
+# optional: tiny metadata carrier so titles can show batch/sample indices
+@dataclass(slots=True)
+class SessionMeta:
+    batch_index: Optional[int] = None
+    sample_index: Optional[int] = None
+
+def fetch_charging_session(
+    model,
+    loader: DataLoader,
+    device: torch.device,
+    power_scaler: MinMaxScaler,
+    soc_scaler: Optional[MinMaxScaler],
+    idx_power_inp: int, idx_soc_inp: Optional[int],
+    *, batch_index: Optional[int] = None, sample_index: Optional[int] = None,
+    session_id: Optional[str | int] = None,
+) -> ChargingSession:
+    """Return a ChargingSession with model residual predictions attached.
+
+    runs the model on one selected sample, extracts T valid steps using its length,
+    inverse-transforms base inputs to original units, and attaches predictions as
+    scaled residual tensors on cpu. also stores scalers on the session so plotting
+    functions do not need them as parameters.
+
+    Args:
+        model: ts model with forward(X, lengths) -> (P_resid, aux), where P_resid ∈ (B,T,H,C or 1).
+        loader: dataloader yielding (sid, X, Y_resid, lengths).
+        device: device for the forward pass.
+        power_scaler: fitted scaler for power (for inverse-transform).
+        soc_scaler: optional fitted scaler for soc.
+        idx_power_inp: column index of power in X.
+        idx_soc_inp: optional column index of soc in X.
+        batch_index, sample_index: selector for a particular sample within a batch.
+        session_id: alternative selector; choose the sample whose sid matches this.
+
+    Returns:
+        ChargingSession with fields power_kw, soc_pct (original units), predictions=ChargingSessionPrediction,
+        and scalers set (scaler_power, scaler_soc). A small 'meta' object is attached in predictions
+        for convenience in plot titles (batch_index, sample_index).
     """
-    builds a SessionPredsBundle from a loader by either:
-      - selecting a specific (batch_index, sample_index), or
-      - selecting a specific charging session by 'session_id'
-    the two modes are mutually exclusive.
-
-    params
-    - model, loader, device, scalers, idx_power_inp/idx_soc_inp: as before
-    - batch_index, sample_index: choose a sample by indices
-    - session_id: choose a sample by charging_id
-
-    returns
-    - SessionPredsBundle with CPU tensors for plotting/post-proc
-    """
-    use_id = session_id is not None
-    use_idx = (batch_index is not None) and (sample_index is not None)
-    if (use_id and use_idx) or (not use_id and not use_idx):
-        raise ValueError("provide either session_id OR (batch_index, sample_index), not both.")
-
     model.eval()
 
-    if use_id:
-        sid, Xb, Yb, Ls = get_session_from_loader(loader, session_id=session_id)
-        # shapes from helper are batched (1, T, F) etc.
+    # selector: prefer session_id; else use (batch_index, sample_index)
+    use_id = session_id is not None
+    if not use_id and (batch_index is None or sample_index is None):
+        raise ValueError("provide either session_id or both batch_index and sample_index")
+
+    # iterate batches until we find the requested sample
+    for bi, (sid_b, Xb, Yb, lengths) in enumerate(loader):
+        if use_id:
+            sid_list = [str(s) for s in sid_b]
+            if str(session_id) not in sid_list:
+                continue
+            si = sid_list.index(str(session_id))
+        else:
+            if bi != int(batch_index):
+                continue
+            si = int(sample_index)
+            if si < 0 or si >= Xb.shape[0]:
+                raise IndexError(f"sample_index {si} out of range for batch {bi} (size={Xb.shape[0]}).")
+
+        # lengths must be cpu int64 for pack_padded_sequence
+        lengths_cpu = lengths.to(dtype=torch.long, device="cpu")
+        # forward on device
         X_dev = Xb.to(device, non_blocking=True)
-        L_cpu = Ls.to(dtype=torch.long, device="cpu")
-        P_dev, _ = model(X_dev, L_cpu)  # (1, T, H, C)
+        P_resid_dev, _ = model(X_dev, lengths_cpu)  # (B, T, H, C or 1)
 
-        T = int(Ls[0].item())
-        P_s = P_dev[0, :T].cpu()
-        Y_s = Yb[0, :T].cpu()
-        X_s = Xb[0, :T].cpu()
+        # slice chosen sample to its true length T
+        T = int(lengths_cpu[si].item())
+        X_s = Xb[si, :T].cpu()                 # (T, F)
+        Y_s = Yb[si, :T].cpu()                 # (T, H, C or 1)
+        P_s = P_resid_dev[si, :T].cpu()        # (T, H, C or 1)
 
+        # normalise channel dim to C>=1
+        if P_s.ndim != 3:
+            raise ValueError(f"expected P_resid sample to have shape (T,H,C), got {tuple(P_s.shape)}")
+        T_s, H_s, C_s = int(P_s.shape[0]), int(P_s.shape[1]), int(P_s.shape[2])
+        if C_s < 1:
+            raise ValueError("prediction head must have at least one target channel (C>=1)")
+
+        # inverse-transform base signals to original units
         power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
-        soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
+        soc_true: Optional[np.ndarray] = None
+        if idx_soc_inp is not None and soc_scaler is not None:
+            soc_true = soc_scaler.inverse_transform(X_s[:, [idx_soc_inp]].numpy()).ravel()
 
-        H, C = P_s.shape[1], P_s.shape[2]
-        return SessionPredsBundle(
-            batch_index=0, sample_index=0,
-            length=T, horizon=H, num_targets=C,
-            X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
-            true_power_unscaled=power_true, true_soc_unscaled=soc_true,
-            session_id=int(sid) if isinstance(sid, (int, np.integer)) else sid
+        # robust session_id type
+        sid_val: Any = sid_b[si]
+        try:
+            sid_val = int(sid_val)
+        except Exception:
+            sid_val = str(sid_val)
+
+        # attach predictions and scalers
+        meta = SessionMeta(batch_index=bi if not use_id else None, sample_index=si if not use_id else None)
+        preds = ChargingSessionPrediction(
+            Y_resid_scaled=Y_s, P_resid_scaled=P_s,
+            horizon=H_s, num_targets=C_s, meta=meta
         )
+        sess = ChargingSession(
+            session_id=sid_val,
+            power_kw=power_true,
+            soc_pct=soc_true,
+            predictions=preds,
+            scaler_power=power_scaler,
+            scaler_soc=soc_scaler,
+        )
+        return sess
 
-    batch = get_nth_batch(loader, int(batch_index))
-
-    session_ids = None
-    if len(batch) == 4:
-        session_ids, Xb, Yb, Ls = batch
-    else:
-        Xb, Yb, Ls = batch
-
-    if int(sample_index) >= Xb.shape[0]:
-        raise IndexError(f"sample_index {sample_index} out of range for batch {batch_index} (size={Xb.shape[0]}).")
-
-    X_dev = Xb.to(device, non_blocking=True)
-    L_cpu = Ls.to(dtype=torch.long, device="cpu")  # lengths must be CPU int64
-    P_dev, _ = model(X_dev, L_cpu)
-
-    T = Ls[int(sample_index)].item()
-    P_s = P_dev[int(sample_index), :T].cpu()
-    Y_s = Yb[int(sample_index), :T].cpu()
-    X_s = Xb[int(sample_index), :T].cpu()
-
-    power_true = power_scaler.inverse_transform(X_s[:, [idx_power_inp]].numpy()).ravel()
-    soc_true   = soc_scaler.inverse_transform(  X_s[:, [idx_soc_inp  ]].numpy()).ravel()
-
-    H, C = P_s.shape[1], P_s.shape[2]
-    sid = None if session_ids is None else session_ids[int(sample_index)]
-    return SessionPredsBundle(
-        batch_index=int(batch_index), sample_index=int(sample_index),
-        length=T, horizon=H, num_targets=C,
-        X_sample=X_s, Y_sample=Y_s, P_sample=P_s,
-        true_power_unscaled=power_true, true_soc_unscaled=soc_true,
-        session_id=sid
-    )
+    # if we finish the loop without finding the id
+    if use_id:
+        raise ValueError(f"session_id {session_id!r} not found in the provided loader.")
+    raise ValueError(f"batch_index {batch_index} not found in the provided loader.")
 
 
 
-def reconstruct_abs_from_bundle(bundle: SessionPredsBundle, idx_power_inp: int, idx_soc_inp: int) -> torch.Tensor:
+def reconstruct_abs_from_bundle(bundle: SessionPredsBundle, idx_power_inp: int) -> torch.Tensor:
     """
-    Reconstruct absolute predictions for power and soc in *scaled* space:
-      P_abs[t, h, c] = X[t, c_base] + P_res[t, h, c], aligned at t+h.
-    Returns (T, H, C), CPU torch tensor.
+    Reconstruct absolute predictions for power and soc in scaled space:
+    P_abs[t, h, c] = X[t, c_base] + P_res[t, h, c], aligned at t+h.
+    
+    Args:
+        bundle: SessionPredsBundle with fields X_sample (T, C_in) and P_sample (T, H, C_out).
+        idx_power_inp: Index of 'power' within the input feature vector X_sample.
+    Returns: 
+        CPU torch tensor of absolute predictions in scaled space, shape (T, H, C_out).
     """
-    base = bundle.X_sample[:, [idx_power_inp, idx_soc_inp]].unsqueeze(1)  # (T,1,2)
+    base = bundle.X_sample[:, [idx_power_inp]].unsqueeze(1)  # (T, 1, 1)    return bundle.P_sample + base
     return bundle.P_sample + base
-
 
 def split_data(df: pd.DataFrame, test_size: float=0.2, 
                validation_size: float=0.1, random_seed: int | None=42) -> Tuple[pd.DataFrame]:
@@ -478,6 +624,7 @@ def apply_scalers(df: pd.DataFrame, scalers: Dict[str, MinMaxScaler]) -> pd.Data
         df[c] = s.transform(df[[c]].astype(float).values)
     return df
 
+
 class ChargingSessionDataset(Dataset):
     """
     Yields full sessions as variable-length sequences.
@@ -508,55 +655,126 @@ class ChargingSessionDataset(Dataset):
         sid, x, y, T = self.groups[idx]
         return sid, x, y, T  # keep session_id for post-hoc grouping
 
+@dataclass
 class LengthBucketSampler(Sampler[List[int]]):
-    """
-    Simple length-bucketing sampler for variable-length sessions.
-    """
-    def __init__(self, lengths: List[int], batch_size: int=8, shuffle: bool=True):
-        self.lengths = lengths
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.sorted_indices = np.argsort(lengths).tolist()
-        # cut into batches of similar lengths
-        self.batches = [self.sorted_indices[i:i+batch_size]
-                        for i in range(0, len(self.sorted_indices), batch_size)]
-        if self.shuffle: random.shuffle(self.batches)
+    """Batches indices by similar sequence length.
+    Sorts indices by length, then slices into contiguous batches. Optionally shuffles
+    the list of batches to avoid curriculum effects while keeping within-batch lengths similar.
 
-    def __iter__(self):
-        if self.shuffle: random.shuffle(self.batches)
-        for b in self.batches: yield b
+    Args:
+        dataset: A ChargingSessionDataset from which to retrieve sequence lengths
+        batch_size: Number of items per batch.
+        shuffle: Whether to shuffle the order of batches at iteration time.
 
-    def __len__(self): return math.ceil(len(self.sorted_indices) / self.batch_size)
+    Yields:
+        Lists of dataset indices, one per batch.
+    """
+    dataset: ChargingSessionDataset
+    batch_size: int = 8 
+    shuffle: bool = True
 
-def session_collate_fn(batch):
+    def __post_init__(self):
+        self.sorted_indices = np.argsort(self.lengths).tolist()
+        self.batches = [
+            self.sorted_indices[i:i + self.batch_size]
+            for i in range(0, len(self.sorted_indices), self.batch_size)
+        ]
+        if self.shuffle:
+            random.shuffle(self.batches)
+
+    def __iter__(self) -> Iterable[List[int]]:
+        if self.shuffle:
+            random.shuffle(self.batches)
+        for b in self.batches:
+            yield b
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.sorted_indices) / self.batch_size)
+    
+    @property
+    def lengths(self) -> List[int]:
+        """returns per-item sequence lengths from a ChargingSessionDataset-like object."""
+        # expects dataset.groups: List[Tuple[sid, x, y, T]]
+        return [grp[3] for grp in self.dataset.groups]
+
+
+def session_collate_fn(batch: List[Tuple]) -> Tuple[List[int] | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pads variable-length sessions to (B, T_max, ·) and carries IDs + lengths.
+
+    Accepts either items of the form ``(sid, x, y, L)`` or ``(x, y, L)``.
+    Returns tensors on CPU; the training step can move them to device.
+
+    Args:
+        batch: List of samples; each item is (sid, x, y, L) or (x, y, L).
+
+    Returns:
+        session_ids: List of session IDs (or None if not provided).
+        X: Tensor of shape (B, T_max, F) float32.
+        Y: Tensor of shape (B, T_max, H, C) float32.
+        lengths: Tensor of shape (B,) int64.
     """
-    Pads variable-length sessions to (B, T_max, .). Carries session_ids and lengths.
-    """
-    session_ids, all_x, all_y, lengths = zip(*batch)
+    first = batch[0]
+    if len(first) == 4:
+        session_ids, all_x, all_y, lengths = zip(*batch)
+        session_ids = list(session_ids)
+    else:
+        all_x, all_y, lengths = zip(*batch)
+        session_ids = None
+
     B = len(all_x)
-    T_max = max(lengths)
-    F    = all_x[0].shape[1]
-    H    = all_y[0].shape[1]
-    C    = all_y[0].shape[2]
+    T_max = int(max(lengths))
+    F = int(all_x[0].shape[1])
+    H = int(all_y[0].shape[1])
+    C = int(all_y[0].shape[2])
 
     X = np.zeros((B, T_max, F), dtype=np.float32)
     Y = np.zeros((B, T_max, H, C), dtype=np.float32)
     for i, (x, y, L) in enumerate(zip(all_x, all_y, lengths)):
-        X[i, :L] = x
-        Y[i, :L] = y
+        Li = int(L)
+        X[i, :Li] = x
+        Y[i, :Li] = y
 
-    return (list(session_ids),
-            torch.from_numpy(X),
-            torch.from_numpy(Y),
-            torch.tensor(lengths, dtype=torch.long))
+    return (
+        session_ids,
+        torch.from_numpy(X).float(),
+        torch.from_numpy(Y).float(),
+        torch.tensor(lengths, dtype=torch.long),
+    )
+
 
 def build_loader(df: pd.DataFrame, input_features: List[str], target_features: List[str],
-                 horizon: int, batch_size: int=16, shuffle: bool=False, num_workers: int=0):
+                 horizon: int, batch_size: int = 16, shuffle: bool = False, num_workers: int = 0,
+                 *, sampler: Literal["length", "bucket"] = "length") -> DataLoader:
+    """Builds a DataLoader with length-aware batching for variable-length sessions.
+
+    Args:
+        df: Session-level (long) dataframe with ``charging_id`` and ``minutes_elapsed``.
+        input_features: Columns to use as model inputs (scaled or raw as prepared).
+        target_features: Columns to use as residual targets (typically ['power'] scaled).
+        horizon: Forecast horizon H.
+        batch_size: Items per batch.
+        shuffle: Shuffle batches (not items) to avoid curriculum effects.
+        num_workers: DataLoader workers.
+        sampler: 'length' (recommended) or 'bucket' (legacy alias).
+
+    Returns:
+        A PyTorch DataLoader yielding (session_ids|None, X, Y, lengths).
+    """
     ds = ChargingSessionDataset(df, input_features, target_features, horizon)
     lengths = [T for (_, _, _, T) in ds.groups]
-    sampler = LengthBucketSampler(lengths, batch_size=batch_size, shuffle=shuffle)
-    return DataLoader(ds, batch_sampler=sampler, collate_fn=session_collate_fn,
-                      num_workers=num_workers, pin_memory=True)
+
+    if sampler == "bucket":
+        batch_sampler = BucketBatchSampler(ds, batch_size=batch_size, shuffle=shuffle)
+    else:
+        batch_sampler = LengthBucketSampler(lengths, batch_size=batch_size, shuffle=shuffle)
+
+    return DataLoader(
+        ds,
+        batch_sampler=batch_sampler,
+        collate_fn=session_collate_fn,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
 
 def get_session_from_loader(test_loader: DataLoader, 
