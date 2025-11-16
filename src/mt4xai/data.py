@@ -744,7 +744,7 @@ def session_collate_fn(batch: List[Tuple]) -> Tuple[List[int] | None, torch.Tens
 
 def build_loader(df: pd.DataFrame, input_features: List[str], target_features: List[str],
                  horizon: int, batch_size: int = 16, shuffle: bool = False, num_workers: int = 0,
-                 *, sampler: Literal["length", "bucket"] = "length") -> DataLoader:
+    ) -> DataLoader:
     """Builds a DataLoader with length-aware batching for variable-length sessions.
 
     Args:
@@ -761,12 +761,7 @@ def build_loader(df: pd.DataFrame, input_features: List[str], target_features: L
         A PyTorch DataLoader yielding (session_ids|None, X, Y, lengths).
     """
     ds = ChargingSessionDataset(df, input_features, target_features, horizon)
-    lengths = [T for (_, _, _, T) in ds.groups]
-
-    if sampler == "bucket":
-        batch_sampler = BucketBatchSampler(ds, batch_size=batch_size, shuffle=shuffle)
-    else:
-        batch_sampler = LengthBucketSampler(lengths, batch_size=batch_size, shuffle=shuffle)
+    batch_sampler = LengthBucketSampler(ds, batch_size=batch_size, shuffle=shuffle)
 
     return DataLoader(
         ds,
@@ -775,6 +770,7 @@ def build_loader(df: pd.DataFrame, input_features: List[str], target_features: L
         num_workers=num_workers,
         pin_memory=True,
     )
+
 
 
 def get_session_from_loader(test_loader: DataLoader, 

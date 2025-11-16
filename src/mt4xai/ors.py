@@ -15,7 +15,7 @@ import torch
 from rdp import rdp
 
 from mt4xai.data import SessionPredsBundle
-from .plot import reconstruct_abs_from_bundle
+from .data import reconstruct_abs_from_bundle
 from .inference import inverse_targets_np, predict_residuals, reconstruct_abs_from_residuals_batch
 
 
@@ -647,7 +647,7 @@ def ors(bundle: SessionPredsBundle,
         soc_scaler,
         idx_power_inp: int,
         idx_soc_inp: int,
-        power_weight: float,
+        power_weight: float=1.0,  # set this to x in [0.0, 1.0) if model prediction targets are multivariate, 1.0 if univariate
         decay_lambda: float,
         threshold: float) -> Optional[Dict]:
     """Run ORS end-to-end with fallbacks, keeping the label-consistency constraint.

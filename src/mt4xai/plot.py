@@ -9,15 +9,6 @@ from matplotlib.figure import Figure
 from matplotlib.pylab import Axes
 from sklearn.preprocessing import MinMaxScaler
 from typing import Literal, Optional, Sequence, Tuple, List
-
-from typing import Optional, Tuple
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import seaborn as sns
-from matplotlib.figure import Figure
-from matplotlib.axes import Axes
 from ray.air.result import Result
 
 HORIZON_PREDS_PALETTE = "deep"  # high-contrast separation between horizons
