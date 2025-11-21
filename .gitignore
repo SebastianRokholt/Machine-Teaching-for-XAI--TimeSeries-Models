@@ -11,7 +11,8 @@ __pycache__/
 
 # Data
 Data/map_data_for_plotting/
-Data/teaching_pool/*.json
+Data/teaching_pool/*
+Data/exam_teaching_pool/*
 *.parquet
 *.png
 *.gif
@@ -26,7 +27,7 @@ Data/teaching_pool/*.json
 *.db
 *.db-wal
 *.db-shm
-
+*.csv
 
 # Models
 /Models
