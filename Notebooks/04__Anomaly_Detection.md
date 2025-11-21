@@ -40,7 +40,7 @@ from ipywidgets import Layout
 from IPython.display import display, clear_output
 from functools import lru_cache
 from mt4xai.model import load_lstm_model
-from mt4xai.plot import plot_full_session
+from mt4xai.plot import plot_raw_pred_session
 from mt4xai.data import make_bundle_from_session_df, get_session_from_loader, split_data, \
                         fit_scalers_on_train, apply_scalers, build_loader
 from mt4xai.inference import compute_session_MRMSE, compute_session_RWSE, fit_rwse_robust_scalers, \
@@ -60,7 +60,10 @@ if torch.cuda.is_available():
     print("[env] Device:", torch.cuda.get_device_name(torch.cuda.current_device()))
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+# Jupyter Notebook settings
 %matplotlib inline
+%load_ext autoreload
+%autoreload 2
 ```
 
     [env] CUDA available: True
@@ -74,7 +77,7 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # Loads a trained LSTM model from disk
 model, checkpoint = load_lstm_model(FINAL_MODEL_PATH, device=DEVICE)
 
-input_features  = checkpoint["input_features"]
+input_features = checkpoint["input_features"]
 target_features = checkpoint["target_features"]
 cfg = checkpoint["config"]
 HORIZON = int(cfg["horizon"])
@@ -82,11 +85,11 @@ POWER_WEIGHT = float(cfg.get("power_weight", 0.5))
 
 # Indices of targets within the *input* feature vector (used for reconstruction)
 idx_power_inp = input_features.index("power")
-idx_soc_inp   = input_features.index("soc")
+idx_soc_inp = input_features.index("soc")
 
 ```
 
-    /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/model.py:45: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+    /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/model.py:46: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
       checkpoint = torch.load(path, map_location=device)
 
 
@@ -113,7 +116,7 @@ val_s = apply_scalers(val_df, scalers)
 test_s = apply_scalers(test_df, scalers)
 
 # Builds the DataLoaders to iterate over charging sessions
-val_loader  = build_loader(val_s,  input_features, target_features, HORIZON, batch_size=16, shuffle=False, num_workers=0)
+val_loader = build_loader(val_s,  input_features, target_features, HORIZON, batch_size=16, shuffle=False, num_workers=0)
 test_loader = build_loader(test_s, input_features, target_features, HORIZON, batch_size=16, shuffle=False, num_workers=0)
 ```
 
@@ -164,8 +167,8 @@ print(f"RWSE = {session_rwse:.3f}, RWSE AD threshold = {rwse_thr:.3f} ---> Class
 ```
 
     Anomaly detection on session 5128923:
-    Macro-RMSE = 1.007, Macro-RMSE AD threshold = 10.000 ---> Classification = NORMAL
-    RWSE = 3.068, RWSE AD threshold = 3.000 ---> Classification = ABNORMAL
+    Macro-RMSE = 1.411, Macro-RMSE AD threshold = 10.000 ---> Classification = NORMAL
+    RWSE = 2.838, RWSE AD threshold = 3.000 ---> Classification = NORMAL
 
 
 
@@ -208,8 +211,8 @@ print(f"RWSE = {session_rwse:.3f}, RWSE AD threshold = {rwse_thr:.3f} ---> Class
 ```
 
     Anomaly detection on session 1691162:
-    Macro-RMSE = 1.007, Macro-RMSE AD threshold = 10.000 ---> Classification = NORMAL
-    RWSE = 1.488, RWSE AD threshold = 3.000 ---> Classification = NORMAL
+    Macro-RMSE = 1.411, Macro-RMSE AD threshold = 10.000 ---> Classification = NORMAL
+    RWSE = 0.680, RWSE AD threshold = 3.000 ---> Classification = NORMAL
 
 
 ### 2.2 Anomaly Detection on the Test Set
@@ -337,8 +340,8 @@ print(f"\nClassification counts:\n Macro-RMSE: {mrmse_test_cls_df["label"].value
     normal      11597
     abnormal      586
            RWSE: label
-    normal      11601
-    abnormal      582
+    normal      11542
+    abnormal      641
 
 
 #### 2.2.3 Calculating Anomaly Statistics
@@ -371,24 +374,24 @@ print(f"Max power output: {power_y_lim[1]:.1f} kW")
 
 ```
 
-    Macro_RMSE threshold @ 95.0th pct = 8.5962
-    RWSE threshold @ 95.0th pct = 2.8567
+    Macro_RMSE threshold @ 95.0th pct = 13.3423
+    RWSE threshold @ 95.0th pct = 3.2347
     
     Lowest-RMSE (most normal) sessions:
        charging_id     error  length   label
-    0     10303976  0.107148      10  normal
-    1     11935991  0.112418      10  normal
-    2      7080318  0.128717      12  normal
-    3      1372719  0.138413      24  normal
-    4      1972288  0.145637      12  normal
+    0      7080318  0.078471      12  normal
+    1      4723841  0.096483      10  normal
+    2     10303976  0.102229      10  normal
+    3      1924502  0.104142      10  normal
+    4      7186948  0.107871      10  normal
     
     Highest-RMSE (most abnormal) sessions:
            charging_id      error  length     label
-    12182     11732342  62.623050      15  abnormal
-    12181      1836322  43.689035      15  abnormal
-    12180      5649864  32.418154      45  abnormal
+    12182     11732342  77.800125      15  abnormal
+    12181      1836322  52.863697      15  abnormal
+    12180      5649864  51.723480      45  abnormal
     
-    Error ranges: Macro-RMSE ∈ [0.107, 62.623], ...
+    Error ranges: Macro-RMSE ∈ [0.078, 77.800], ...
     Session length range: [8, 60] time steps
     Max power output: 199.6 kW
 
@@ -495,32 +498,37 @@ By experimenting with these controls, we expect to see that RMSE-based abnormali
 
 
 ```python
-# UI Defaults
-DEFAULT_METRIC = "macro_rmse"  # initial tab
+# ============================================================
+# UI DEFAULTS
+# ============================================================
+
+DEFAULT_METRIC = "macro_rmse"
 DECAY_DEFAULTS = {"macro_rmse": DEFAULT_DECAY_MRMSE, "rwse": DEFAULT_DECAY_RWSE}
 _current_decay = float(DECAY_DEFAULTS[DEFAULT_METRIC])
 
-
-# caches fetched bundles to avoid re-computation
+# Cache bundles (fast lookup)
 @lru_cache(maxsize=2048)
 def _cached_bundle(sid: int):
     return make_bundle_from_session_df(
-        model=model, df_scaled=test_s, sid=int(sid), device=DEVICE,
+        model=model, df_scaled=test_s, sid=sid, device=DEVICE,
         input_features=input_features, target_features=target_features, horizon=HORIZON,
         power_scaler=power_scaler, soc_scaler=soc_scaler,
-        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp)
+        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp
+    )
+
+# ============================================================
+# RANGES AND TABLES
+# ============================================================
 
 def calc_ranges():
-    errs = df_test_errs["error"].to_numpy()
-    errs = errs[np.isfinite(errs)]
+    errs = df_test_errs["error"].dropna().to_numpy()
     if errs.size == 0:
         return 0.0, 1.0, 0, 1, np.array([0.0, 1.0]), 0.5
     all_sorted = np.sort(errs)
     err_min, err_max = float(all_sorted[0]), float(all_sorted[-1])
 
-    lengths = df_test_errs["length"].to_numpy()
-    lengths = lengths[np.isfinite(lengths)]
-    len_min, len_max = int(np.min(lengths)), int(np.max(lengths))
+    lengths = df_test_errs["length"].dropna().to_numpy()
+    len_min, len_max = int(lengths.min()), int(lengths.max())
 
     thr = percentile_threshold(np.sort(df_val_err["error"].dropna().to_numpy()), pct_thr=PCT_THRESHOLD)
     return err_min, err_max, len_min, len_max, all_sorted, thr
@@ -536,79 +544,100 @@ def set_tables(metric_key: str, lam: float):
     df_val_err, df_test_errs, METRIC_LABEL = choose_metric_tables(metric_key, lam)
 
 
-# UI widgets
-w_metric = widgets.ToggleButtons(options=[("Macro-RMSE", "macro_rmse"), ("RWSE", "rwse")], 
-                                 value=DEFAULT_METRIC, description="Metric", layout=Layout(width="100%"))
-w_cls = widgets.ToggleButtons(options=[("Normal", "normal"), ("Abnormal", "abnormal")], 
-                              value="abnormal", description="Classification", layout=Layout(width="100%"))
-w_target = widgets.SelectMultiple(options=["power", "soc"], value=("power", "soc"), description="Plot Target", rows=2)
-w_target.layout = Layout(width="60%")
-w_decay = widgets.SelectionSlider(
-    options=[(f"λ={v:.1f}", v) for v in DECAY_GRID],  # uses the precomputed tables instead of recomputing on change
-    value=min(DECAY_GRID, key=lambda v: abs(v - _current_decay)), description="Horizon weight decay",
-    continuous_update=False, layout=Layout(width="100%"), style={"description_width": "initial"})
-w_idx = widgets.IntSlider(value=0, min=0, max=0, step=1, description="Index",
-                          continuous_update=False, layout=Layout(width="100%"))
-w_reset = widgets.Button(description="Reset filters", icon="refresh", button_style="", layout=Layout(width="100%"))
+# ============================================================
+# UI WIDGETS (POWER-ONLY)
+# ============================================================
 
-# initialize tables/ranges with decay value from slider widget
-df_val_err, df_test_errs, METRIC_LABEL = choose_metric_tables(DEFAULT_METRIC, lam=w_decay.value)
+w_metric = widgets.ToggleButtons(
+    options=[("Macro-RMSE", "macro_rmse"), ("RWSE", "rwse")],
+    value=DEFAULT_METRIC, description="Metric", layout=Layout(width="100%")
+)
+
+w_cls = widgets.ToggleButtons(
+    options=[("Normal", "normal"), ("Abnormal", "abnormal")],
+    value="abnormal", description="Class", layout=Layout(width="100%")
+)
+
+w_decay = widgets.SelectionSlider(
+    options=[(f"λ={v:.1f}", v) for v in DECAY_GRID],
+    value=min(DECAY_GRID, key=lambda v: abs(v - _current_decay)),
+    description="Horizon weight decay", continuous_update=False,
+    layout=Layout(width="100%"), style={"description_width": "initial"}
+)
+
+w_idx = widgets.IntSlider(value=0, min=0, max=0, step=1,
+                          description="Index", continuous_update=False,
+                          layout=Layout(width="100%"))
+
+w_reset = widgets.Button(description="Reset filters", icon="refresh",
+                         layout=Layout(width="100%"))
+
+# Load initial tables
+df_val_err, df_test_errs, METRIC_LABEL = choose_metric_tables(DEFAULT_METRIC, w_decay.value)
 set_tables(DEFAULT_METRIC, w_decay.value)
 m_err_min, m_err_max, min_session_len, max_session_len, _sorted, m_thr = calc_ranges()
 
-# More UI widgets - with dynamic ranges
-w_len = widgets.IntRangeSlider(value=[min_session_len, max_session_len], min=min_session_len, 
-                               max=max_session_len, step=1, description="Length ∈", 
-                               continuous_update=False, layout=Layout(width="100%"))
+# Dynamic range widgets
+w_len = widgets.IntRangeSlider(
+    value=[min_session_len, max_session_len], min=min_session_len, max=max_session_len,
+    step=1, description="Length ∈", continuous_update=False, layout=Layout(width="100%")
+)
+
 w_err = widgets.FloatRangeSlider(
     value=[m_err_min, m_err_max], min=m_err_min, max=m_err_max,
-    step=(m_err_max - m_err_min) / 500.0 if m_err_max > m_err_min else 1e-3,
-    description="Error ∈", readout_format=".2f",
-    continuous_update=False, layout=Layout(width="80%"))
+    step=(m_err_max - m_err_min) / 500 if m_err_max > m_err_min else 1e-3,
+    description="Error ∈", readout_format=".2f", continuous_update=False,
+    layout=Layout(width="80%")
+)
+
 w_thr = widgets.FloatSlider(
     value=m_thr, min=m_err_min, max=m_err_max,
-    step=(m_err_max - m_err_min) / 300.0 if m_err_max > m_err_min else 1e-3,
+    step=(m_err_max - m_err_min) / 300 if m_err_max > m_err_min else 1e-3,
     description="Classification Threshold", readout_format=".3f",
     continuous_update=False, layout=Layout(width="70%"),
-    style={"description_width": "initial"})
-w_thr_pct = widgets.HTML(value=f"<b>{percentile_of_threshold(_sorted, w_thr.value):.1f}th</b> percentile")
+    style={"description_width": "initial"}
+)
+
+w_thr_pct = widgets.HTML(
+    value=f"<b>{percentile_of_threshold(_sorted, w_thr.value):.1f}th</b> percentile"
+)
+
 sid_options = list(map(str, sorted(df_test_errs["charging_id"].unique())))
 w_sid = widgets.Combobox(
     placeholder="Jump to session id…", options=sid_options, value="",
-    description="Session", ensure_option=False, layout=Layout(width="100%"))
+    description="Session", ensure_option=False, layout=Layout(width="100%")
+)
 
-# Creates the context manager for UI (to display it)
 out = widgets.Output()
+
+
+# ============================================================
+# FILTERING + UPDATE FUNCTIONS
+# ============================================================
 
 def retune_ranges():
     global m_err_min, m_err_max, min_session_len, max_session_len, _sorted, m_thr
     m_err_min, m_err_max, min_session_len, max_session_len, _sorted, m_thr = calc_ranges()
-    w_len.min = min_session_len;  w_len.max = max_session_len
-    w_len.value = [min_session_len, max_session_len]
-    w_err.min = m_err_min
-    w_err.max = m_err_max
-    w_err.step = (m_err_max - m_err_min) / 500.0 if m_err_max > m_err_min else 1e-3
+    w_len.min = min_session_len;  w_len.max = max_session_len; w_len.value = [min_session_len, max_session_len]
+    w_err.min = m_err_min; w_err.max = m_err_max
+    w_err.step = (m_err_max - m_err_min) / 500 if m_err_max > m_err_min else 1e-3
     w_err.value = [m_err_min, m_err_max]
-    w_thr.min = m_err_min
-    w_thr.max = m_err_max
-    w_thr.step = (m_err_max - m_err_min) / 300.0 if m_err_max > m_err_min else 1e-3
+    w_thr.min = m_err_min; w_thr.max = m_err_max
+    w_thr.step = (m_err_max - m_err_min) / 300 if m_err_max > m_err_min else 1e-3
     w_thr.value = m_thr
     w_thr_pct.value = f"<b>{percentile_of_threshold(_sorted, w_thr.value):.1f}th</b> percentile"
 
 def filtered_df(cls_label: str, thr: float, len_lo: int, len_hi: int, err_lo: float, err_hi: float):
-    # uses the package classifier to assign the labels. then filters
     df = df_test_errs.dropna(subset=["error"]).copy()
     df = df[(df["length"] >= len_lo) & (df["length"] <= len_hi) &
             (df["error"]  >= err_lo) & (df["error"]  <= err_hi)].copy()
-    df = classify_by_threshold(df, thr)  # adds 'label' column
+    df = classify_by_threshold(df, thr)
     df = df[df["label"] == cls_label]
-    df = df.sort_values("error", ascending=(cls_label == "normal")).reset_index(drop=True)
-    return df
+    return df.sort_values("error", ascending=(cls_label == "normal")).reset_index(drop=True)
 
 def update_index_range(*_):
     df = filtered_df(w_cls.value, w_thr.value, w_len.value[0], w_len.value[1], w_err.value[0], w_err.value[1])
-    n = len(df)
-    w_idx.max = max(0, n - 1)
+    w_idx.max = max(0, len(df) - 1)
     w_thr_pct.value = f"<b>{percentile_of_threshold(_sorted, w_thr.value):.1f}th</b> percentile"
     render_plots()
 
@@ -628,29 +657,54 @@ def reset_filters(_btn=None):
     w_sid.value = ""
 
 def render_plots(*_):
-    df = filtered_df(w_cls.value, w_thr.value, w_len.value[0], w_len.value[1], w_err.value[0], w_err.value[1])
-    n = len(df)
+    df = filtered_df(
+        w_cls.value,
+        w_thr.value,
+        w_len.value[0], w_len.value[1],
+        w_err.value[0], w_err.value[1]
+    )
+
     with out:
         clear_output(wait=True)
-        if n == 0:
+
+        if len(df) == 0:
             print(f"[{METRIC_LABEL}] No sessions match the current filter.")
             return
-        row = df.iloc[min(w_idx.value, n-1)]
-        sid, err, lbl = row["charging_id"], float(row["error"]), row["label"]
-        bundle = _cached_bundle(int(sid))
-        for tgt in list(w_target.value):
-            y_lim = power_y_lim if tgt == "power" else (0.0, 100.0)
-            plot_full_session(
-                bundle, power_scaler, soc_scaler,
-                idx_power_inp, idx_soc_inp,
-                t_min_eval=T_MIN_EVAL, target=tgt,
-                error=err, threshold=w_thr.value, label=lbl,
-                decay_lambda=w_decay.value, figsize=(10, 5), dpi=300, y_lim=y_lim
-            )
-        print(f"[{METRIC_LABEL}] {n} sessions match filters — Index {w_idx.value+1}/{n}")
+
+        row = df.iloc[min(w_idx.value, len(df) - 1)]
+        sid   = int(row["charging_id"])
+        err   = float(row["error"])
+        lbl   = row["label"]
+
+        bundle = _cached_bundle(sid)
+
+        # Call the plotting function exactly as defined in mt4xai.plot
+        plot_raw_pred_session(
+            bundle,
+            power_scaler,
+            soc_scaler,
+            idx_power_inp,
+            idx_soc_inp,
+            t_min_eval=T_MIN_EVAL,
+            figsize=(10, 5),
+            dpi=300
+        )
+
+        # Add title *after* the function draws its figure
+        plt.title(
+            f"Session {sid} — {lbl.upper()} — Error={err:.3f}  "
+            f"(Threshold={w_thr.value:.3f})",
+            fontsize=11
+        )
+
+        print(f"[{METRIC_LABEL}] {len(df)} sessions match filters — "
+              f"Index {w_idx.value+1}/{len(df)}")
 
 
-# UI observers and observer functions (handlers). They listen for user interaction
+# ============================================================
+# OBSERVERS
+# ============================================================
+
 def on_metric_change(change):
     if change["name"] != "value": return
     metric = change["new"]
@@ -662,39 +716,56 @@ def on_metric_change(change):
 
 def on_decay_change(change):
     if change["name"] != "value": return
-    lam = float(change["new"])
-    set_tables(w_metric.value, lam)
+    set_tables(w_metric.value, float(change["new"]))
     retune_ranges()
     reset_filters()
 
 w_metric.observe(on_metric_change, names="value")
 w_decay.observe(on_decay_change,   names="value")
-for w in (w_cls, w_thr, w_len, w_err): w.observe(update_index_range, names="value")  # filters available sessions when filters are applied
-for w in (w_idx, w_target): w.observe(render_plots, names="value") # re-render plots when session index or pred target is changed
-w_sid.observe(jump_to_sid, names="value") # Displays the selected session when user specificies a charging session ID
-w_reset.on_click(reset_filters)  # Resets all applied filters when the user hits the reset button
+
+for w in (w_cls, w_thr, w_len, w_err):
+    w.observe(update_index_range, names="value")
+
+w_idx.observe(render_plots, names="value")
+w_sid.observe(jump_to_sid, names="value")
+w_reset.on_click(reset_filters)
 
 
-# UI layout. 4 columns above the plots
-col1 = widgets.VBox([w_cls, w_target], layout=Layout(width="20%"))
+# ============================================================
+# LAYOUT
+# ============================================================
+
+col1 = widgets.VBox([w_cls], layout=Layout(width="18%"))
 col2 = widgets.VBox([w_idx, w_sid, w_len], layout=Layout(width="25%"))
-col3 = widgets.VBox([w_metric, w_decay, w_err, widgets.HBox([w_thr, w_thr_pct])], layout=Layout(width="40%"))
-col4 = widgets.VBox([w_reset], layout=Layout(width="10%"))
+col3 = widgets.VBox([w_metric, w_decay, w_err, widgets.HBox([w_thr, w_thr_pct])],
+                    layout=Layout(width="42%"))
+col4 = widgets.VBox([w_reset], layout=Layout(width="12%"))
+
 top_row = widgets.HBox([col1, col2, col3, col4],
-                       layout=Layout(width="100%", justify_content="space-between", align_items="flex-start"))
+                       layout=Layout(width="100%", justify_content="space-between"))
+
 ui = widgets.VBox([top_row, out], layout=Layout(width="100%"))
 
+# ============================================================
+# INITIAL RENDER
+# ============================================================
 
-# Initial rendering of the UI and plots
 retune_ranges()
 reset_filters()
 update_index_range()
+
 display(ui)
 
 ```
 
 
-    VBox(children=(HBox(children=(VBox(children=(ToggleButtons(description='Classification', index=1, layout=Layou…
+    VBox(children=(HBox(children=(VBox(children=(ToggleButtons(description='Class', index=1, layout=Layout(width='…
+
+
+
+    
+![png](04__Anomaly_Detection_files/04__Anomaly_Detection_25_1.png)
+    
 
 
 ### 3.3 Analysis and Summary
@@ -736,9 +807,6 @@ label, err = classify_session(
 
 print(f"[Macro-RMSE] session {sid} → error={err:.4f}, threshold={mrmse_thr:.4f}, label={'ABNORMAL' if label else 'NORMAL'}")
 ```
-
-    [Macro-RMSE] session 7753775 → error=12.0099, threshold=8.5962, label=ABNORMAL
-
 
 
 ```python

@@ -63,30 +63,17 @@ This section initializes the computational environment by:
 ```python
 import os
 import sys 
-import glob
-import json
 import random 
 import logging
-import tempfile
 from pathlib import Path
-from collections import OrderedDict
-from typing import List, Callable, Optional
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import seaborn as sns
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
 import ray
 from ray import tune
-from ray.air import session
-from ray.train import Checkpoint
 from ray.air.config import RunConfig, CheckpointConfig
-from ray.tune import ExperimentAnalysis
 from ray.tune.tuner import Tuner, TuneConfig
 from ray.tune.schedulers import HyperBandForBOHB
 from ray.tune.search.bohb import TuneBOHB
@@ -100,13 +87,13 @@ from project_config import load_config
 cfg = load_config()
 
 # Notebook global constants
-RANDOM_SEED = 42
+RANDOM_SEED = cfg.project.random_seed
 TRAIN_LSTM = True
 TRAIN_TCN = True
 RESUME_TRAIN_IF_CKPT = True
 BATCH_SIZE = 256  # default batch size used for test and evaluation
 NUM_WORKERS = 4  # used in data loaders for training, validation and test
-HORIZON = 5  # model predicts for all horizons h in {1, HORIZON}, horizon decay applied when avg for for inference
+HORIZON = 5  # model predicts for all horizons h in {1, HORIZON}
 
 # Global paths
 PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), os.pardir))
@@ -121,7 +108,6 @@ RAY_TUNE_FOLDER_NAME_TCN = "bohb_tcn_tuning_run_4"
 RAY_TUNE_RUN_FOLDER_PATH_LSTM = os.path.join(MODEL_FOLDER_PATH, RAY_TUNE_FOLDER_NAME_LSTM)
 RAY_TUNE_RUN_FOLDER_PATH_TCN = os.path.join(MODEL_FOLDER_PATH, RAY_TUNE_FOLDER_NAME_TCN)
 
-
 # Set random seeds
 torch.manual_seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
@@ -134,7 +120,7 @@ pd.set_option("display.max_columns", None)
 pd.options.display.float_format = "{:.2f}".format
 sns.set_theme(style="whitegrid")
 
-# torch config, ray config and initialisation
+# PyTorch config, Ray config and initialisation
 print("[env] CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("[env] Device:", torch.cuda.get_device_name(torch.cuda.current_device()))
@@ -153,7 +139,7 @@ ray.init(
     include_dashboard=False,
 )
 
-# Package and notebook settings
+# Jupyter Notebook settings
 %load_ext autoreload
 %autoreload 2
 ```
@@ -391,7 +377,7 @@ print(f"Dropped features: {set(all_features) - set(selected_features)}")
 df.head()
 ```
 
-    Dropped features: {'nearest_weather_station', 'timestamp', 'charger_category', 'lat', 'timestamp_d', 'timestamp_H', 'lon', 'energy'}
+    Dropped features: {'lon', 'lat', 'timestamp_d', 'nearest_weather_station', 'timestamp_H', 'charger_category', 'timestamp', 'energy'}
 
 
 
@@ -1600,7 +1586,6 @@ BASE_CFG = {
     "target_features": target_features,
     "horizon": HORIZON,
 }
-
 ```
 
 ### 4.4 Training and Tuning an LSTM Model
@@ -1625,8 +1610,15 @@ hb = HyperBandForBOHB(time_attr="epoch", max_t=200, reduction_factor=3)
 
 train_ref = ray.put(train_dataset)
 val_ref = ray.put(val_dataset)
-trainable = tune.with_parameters(tune_train_lstm, train_dataset_ref=train_ref, val_dataset_ref=val_ref)
-trainable = tune.with_resources(trainable, {"cpu": 10, "gpu": 0.5})  # per trial
+trainable_lstm = tune.with_parameters(
+    tune_train_lstm, 
+    train_dataset_ref=train_ref, 
+    val_dataset_ref=val_ref, 
+    num_workers=NUM_WORKERS, 
+    power_min=POWER_MIN, 
+    power_max=POWER_MAX, 
+    idx_power=IDX_POWER)
+trainable_lstm = tune.with_resources(trainable_lstm, {"cpu": 10, "gpu": 0.5})  # per trial
 
 ckpt_cfg = CheckpointConfig(
     num_to_keep=3,
@@ -1649,7 +1641,7 @@ if TRAIN_LSTM:
         try:
             tuner = Tuner.restore(
                 run_root,
-                trainable=trainable,
+                trainable=trainable_lstm,
                 resume_unfinished=True,
                 resume_errored=True,
                 param_space=BASE_CFG,
@@ -1671,7 +1663,7 @@ if TRAIN_LSTM:
                 verbose=1,
             )
             tuner = Tuner(
-                trainable,
+                trainable_lstm,
                 tune_config=TuneConfig(
                     search_alg=bohb,
                     scheduler=hb,
@@ -1688,7 +1680,7 @@ if TRAIN_LSTM:
             # any other restore failure? also start a fresh run
             print(f"[lstm][warn] restore failed ({type(e).__name__}: {e}). Starting a fresh run.")
             tuner = Tuner(
-                trainable,
+                trainable_lstm,
                 tune_config=TuneConfig(
                     search_alg=bohb,
                     scheduler=hb,
@@ -1707,7 +1699,7 @@ if TRAIN_LSTM:
     else:
         # fresh run
         tuner = Tuner(
-            trainable,
+            trainable_lstm,
             tune_config=TuneConfig(
                 search_alg=bohb,
                 scheduler=hb,
@@ -1734,7 +1726,7 @@ if TRAIN_LSTM:
     model_lstm.load_state_dict(payload["model_state_dict"])
     model_lstm.eval()
     save_final_model_pth(model_lstm, best_lstm_res, out_path=MODEL_PATH_LSTM)
-    print(f"[LSTM] saved clean final model .pth → {MODEL_PATH_LSTM}")
+    print(f"[LSTM] saved clean final model .pth at {MODEL_PATH_LSTM}")
 
 else:
     # restore most recent completed run
@@ -1778,52 +1770,17 @@ else:
       <h3>Tune Status</h3>
       <table>
 <tbody>
-<tr><td>Current time:</td><td>2025-11-10 21:22:17</td></tr>
-<tr><td>Running for: </td><td>00:00:12.45        </td></tr>
-<tr><td>Memory:      </td><td>7.4/13.6 GiB       </td></tr>
+<tr><td>Current time:</td><td>2025-11-13 00:19:51</td></tr>
+<tr><td>Running for: </td><td>01:37:24.68        </td></tr>
+<tr><td>Memory:      </td><td>6.7/13.6 GiB       </td></tr>
 </tbody>
 </table>
     </div>
     <div class="vDivider"></div>
     <div class="systemInfo">
       <h3>System Info</h3>
-      Using HyperBand: num_stopped=0 total_brackets=2<br>Round #0:<br>  Bracket(Max Size (n)=98, Milestone (r)=2, completed=0.0%): {ERROR: 4, PENDING: 1} <br>Logical resource usage: 10.0/24 CPUs, 0.5/1 GPUs (0.0/1.0 accelerator_type:G)
+      Using HyperBand: num_stopped=62 total_brackets=2<br>Round #0:<br>  Bracket(Max Size (n)=2, Milestone (r)=162, completed=100.0%): {TERMINATED: 64} <br>Logical resource usage: 10.0/24 CPUs, 0.5/1 GPUs (0.0/1.0 accelerator_type:G)
     </div>
-    <div class="vDivider"></div>
-<div class="messages">
-  <h3>Messages</h3>
-
-
-  Number of errored trials: 4<br><table>
-<thead>
-<tr><th>Trial name              </th><th style="text-align: right;">  # failures</th><th>error file                                                                                                                                                                                                                                                                              </th></tr>
-</thead>
-<tbody>
-<tr><td>tune_train_lstm_c89eda5d</td><td style="text-align: right;">           1</td><td>/tmp/ray/session_2025-11-10_21-18-24_241871_19797/artifacts/2025-11-10_21-22-05/bohb_lstm_tuning_run_9/driver_artifacts/tune_train_lstm_c89eda5d_1_alpha_h=0.3311,batch_size=96,device=ref_ph_09667283,dropout=0.1803,grad_clip_norm=1.0000,hidden_dim=64,_2025-11-10_21-22-05/error.txt</td></tr>
-<tr><td>tune_train_lstm_38d21f3c</td><td style="text-align: right;">           1</td><td>/tmp/ray/session_2025-11-10_21-18-24_241871_19797/artifacts/2025-11-10_21-22-05/bohb_lstm_tuning_run_9/driver_artifacts/tune_train_lstm_38d21f3c_2_alpha_h=0.3972,batch_size=96,device=ref_ph_09667283,dropout=0.1173,grad_clip_norm=5.0000,hidden_dim=128_2025-11-10_21-22-08/error.txt</td></tr>
-<tr><td>tune_train_lstm_f4f470b7</td><td style="text-align: right;">           1</td><td>/tmp/ray/session_2025-11-10_21-18-24_241871_19797/artifacts/2025-11-10_21-22-05/bohb_lstm_tuning_run_9/driver_artifacts/tune_train_lstm_f4f470b7_3_alpha_h=0.2055,batch_size=96,device=ref_ph_09667283,dropout=0.1818,grad_clip_norm=5.0000,hidden_dim=512_2025-11-10_21-22-11/error.txt</td></tr>
-<tr><td>tune_train_lstm_1f945cfd</td><td style="text-align: right;">           1</td><td>/tmp/ray/session_2025-11-10_21-18-24_241871_19797/artifacts/2025-11-10_21-22-05/bohb_lstm_tuning_run_9/driver_artifacts/tune_train_lstm_1f945cfd_4_alpha_h=0.4434,batch_size=32,device=ref_ph_09667283,dropout=0.2641,grad_clip_norm=5.0000,hidden_dim=192_2025-11-10_21-22-14/error.txt</td></tr>
-</tbody>
-</table>
-</div>
-<style>
-.messages {
-  color: var(--jp-ui-font-color1);
-  display: flex;
-  flex-direction: column;
-  padding-left: 1em;
-  overflow-y: auto;
-}
-.messages h3 {
-  font-weight: bold;
-}
-.vDivider {
-  border-left-width: var(--jp-border-width);
-  border-left-color: var(--jp-border-color0);
-  border-left-style: solid;
-  margin: 0.5em 1em 0.5em 1em;
-}
-</style>
 
   </div>
   <div class="hDivider"></div>
@@ -1831,14 +1788,73 @@ else:
     <h3>Trial Status</h3>
     <table>
 <thead>
-<tr><th>Trial name              </th><th>status  </th><th>loc               </th><th style="text-align: right;">  alpha_h</th><th style="text-align: right;">  batch_size</th><th style="text-align: right;">  dropout</th><th style="text-align: right;">  grad_clip_norm</th><th style="text-align: right;">  hidden_dim</th><th style="text-align: right;">         lr</th><th style="text-align: right;">  num_epochs</th><th style="text-align: right;">  num_layers</th><th style="text-align: right;">  weight_decay</th></tr>
+<tr><th>Trial name              </th><th>status    </th><th>loc               </th><th style="text-align: right;">  alpha_h</th><th style="text-align: right;">  batch_size</th><th style="text-align: right;">   dropout</th><th style="text-align: right;">  grad_clip_norm</th><th style="text-align: right;">  hidden_dim</th><th style="text-align: right;">         lr</th><th style="text-align: right;">  num_epochs</th><th style="text-align: right;">  num_layers</th><th style="text-align: right;">  weight_decay</th><th style="text-align: right;">  iter</th><th style="text-align: right;">  total time (s)</th><th style="text-align: right;">  train_loss</th><th style="text-align: right;">  val_loss</th><th style="text-align: right;">  val_rmse_power</th></tr>
 </thead>
 <tbody>
-<tr><td>tune_train_lstm_1cfec721</td><td>PENDING </td><td>                  </td><td style="text-align: right;"> 0.341343</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.0800343</td><td style="text-align: right;">               0</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.001646   </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   4.45192e-06</td></tr>
-<tr><td>tune_train_lstm_c89eda5d</td><td>ERROR   </td><td>172.31.29.69:22297</td><td style="text-align: right;"> 0.331089</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.180335 </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00219286 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.000977501</td></tr>
-<tr><td>tune_train_lstm_38d21f3c</td><td>ERROR   </td><td>172.31.29.69:22447</td><td style="text-align: right;"> 0.397151</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.117318 </td><td style="text-align: right;">               5</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.0214012  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.00227148 </td></tr>
-<tr><td>tune_train_lstm_f4f470b7</td><td>ERROR   </td><td>172.31.29.69:22598</td><td style="text-align: right;"> 0.205473</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.181788 </td><td style="text-align: right;">               5</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.0178462  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   3.36997e-05</td></tr>
-<tr><td>tune_train_lstm_1f945cfd</td><td>ERROR   </td><td>172.31.29.69:22689</td><td style="text-align: right;"> 0.443431</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.26414  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.000497995</td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   8.64529e-06</td></tr>
+<tr><td>tune_train_lstm_7102e8f0</td><td>TERMINATED</td><td>172.31.29.69:3950 </td><td style="text-align: right;"> 0.331089</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.180335  </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00219286 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.000977501</td><td style="text-align: right;">     2</td><td style="text-align: right;">        10.1464 </td><td style="text-align: right;">    0.611332</td><td style="text-align: right;">  0.569806</td><td style="text-align: right;">         5.03946</td></tr>
+<tr><td>tune_train_lstm_03a68a9e</td><td>TERMINATED</td><td>172.31.29.69:4041 </td><td style="text-align: right;"> 0.397151</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.117318  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.0214012  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.00227148 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        11.357  </td><td style="text-align: right;">    0.990552</td><td style="text-align: right;">  0.913504</td><td style="text-align: right;">         7.45338</td></tr>
+<tr><td>tune_train_lstm_adae3bb5</td><td>TERMINATED</td><td>172.31.29.69:4477 </td><td style="text-align: right;"> 0.205473</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.181788  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.0178462  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   3.36997e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        11.1058 </td><td style="text-align: right;">    1.47625 </td><td style="text-align: right;">  1.52678 </td><td style="text-align: right;">        12.4096 </td></tr>
+<tr><td>tune_train_lstm_65a51fc9</td><td>TERMINATED</td><td>172.31.29.69:22058</td><td style="text-align: right;"> 0.443431</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.26414   </td><td style="text-align: right;">               5</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.000497995</td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   8.64529e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        79.6345 </td><td style="text-align: right;">    0.386252</td><td style="text-align: right;">  0.371437</td><td style="text-align: right;">         3.89876</td></tr>
+<tr><td>tune_train_lstm_aa435faa</td><td>TERMINATED</td><td>172.31.29.69:4987 </td><td style="text-align: right;"> 0.341343</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.0800343 </td><td style="text-align: right;">               0</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.001646   </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   4.45192e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">        10.9619 </td><td style="text-align: right;">    0.564989</td><td style="text-align: right;">  0.550956</td><td style="text-align: right;">         4.91964</td></tr>
+<tr><td>tune_train_lstm_e63f9f80</td><td>TERMINATED</td><td>172.31.29.69:5298 </td><td style="text-align: right;"> 0.379233</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.0340421 </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00392381 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.00179191 </td><td style="text-align: right;">     2</td><td style="text-align: right;">         9.09738</td><td style="text-align: right;">    0.561096</td><td style="text-align: right;">  0.517972</td><td style="text-align: right;">         4.72657</td></tr>
+<tr><td>tune_train_lstm_8745d40f</td><td>TERMINATED</td><td>172.31.29.69:5533 </td><td style="text-align: right;"> 0.529047</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.148168  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.0264937  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.000325127</td><td style="text-align: right;">     2</td><td style="text-align: right;">         8.12008</td><td style="text-align: right;">    0.593073</td><td style="text-align: right;">  0.552703</td><td style="text-align: right;">         4.95474</td></tr>
+<tr><td>tune_train_lstm_b1eb8be6</td><td>TERMINATED</td><td>172.31.29.69:22149</td><td style="text-align: right;"> 0.529161</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.289086  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.000469326</td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000277091</td><td style="text-align: right;">     6</td><td style="text-align: right;">        72.005  </td><td style="text-align: right;">    0.41333 </td><td style="text-align: right;">  0.403128</td><td style="text-align: right;">         4.05609</td></tr>
+<tr><td>tune_train_lstm_03c93d06</td><td>TERMINATED</td><td>172.31.29.69:6060 </td><td style="text-align: right;"> 0.503475</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.00828503</td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.000358749</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.000846869</td><td style="text-align: right;">     2</td><td style="text-align: right;">        25.9844 </td><td style="text-align: right;">    0.506587</td><td style="text-align: right;">  0.504171</td><td style="text-align: right;">         4.65794</td></tr>
+<tr><td>tune_train_lstm_b12efce2</td><td>TERMINATED</td><td>172.31.29.69:6391 </td><td style="text-align: right;"> 0.246461</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.0553001 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.00567104 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   2.61714e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">        13.6587 </td><td style="text-align: right;">    0.622252</td><td style="text-align: right;">  0.609818</td><td style="text-align: right;">         5.30391</td></tr>
+<tr><td>tune_train_lstm_7d92b739</td><td>TERMINATED</td><td>172.31.29.69:6642 </td><td style="text-align: right;"> 0.542829</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0144177 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         384</td><td style="text-align: right;">0.0162749  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.00187753 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        20.8238 </td><td style="text-align: right;">    0.524606</td><td style="text-align: right;">  0.512351</td><td style="text-align: right;">         4.6674 </td></tr>
+<tr><td>tune_train_lstm_73c98c8c</td><td>TERMINATED</td><td>172.31.29.69:6917 </td><td style="text-align: right;"> 0.224276</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.00698158</td><td style="text-align: right;">               0</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.000679204</td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000231155</td><td style="text-align: right;">     2</td><td style="text-align: right;">        20.987  </td><td style="text-align: right;">    0.630179</td><td style="text-align: right;">  0.612081</td><td style="text-align: right;">         5.24347</td></tr>
+<tr><td>tune_train_lstm_1e46a91f</td><td>TERMINATED</td><td>172.31.29.69:7229 </td><td style="text-align: right;"> 0.373796</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.28704   </td><td style="text-align: right;">               0</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.000505883</td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.0023341  </td><td style="text-align: right;">     2</td><td style="text-align: right;">        25.2836 </td><td style="text-align: right;">    0.556664</td><td style="text-align: right;">  0.517327</td><td style="text-align: right;">         4.76262</td></tr>
+<tr><td>tune_train_lstm_b5856c14</td><td>TERMINATED</td><td>172.31.29.69:559  </td><td style="text-align: right;"> 0.349132</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.111193  </td><td style="text-align: right;">               1</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.00137286 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.000233376</td><td style="text-align: right;">    18</td><td style="text-align: right;">       281.703  </td><td style="text-align: right;">    0.295101</td><td style="text-align: right;">  0.307306</td><td style="text-align: right;">         3.46474</td></tr>
+<tr><td>tune_train_lstm_61d00e4a</td><td>TERMINATED</td><td>172.31.29.69:7807 </td><td style="text-align: right;"> 0.38493 </td><td style="text-align: right;">          96</td><td style="text-align: right;">0.275735  </td><td style="text-align: right;">               0</td><td style="text-align: right;">         384</td><td style="text-align: right;">0.0203063  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   2.23901e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        15.8174 </td><td style="text-align: right;">    1.68865 </td><td style="text-align: right;">  2.08374 </td><td style="text-align: right;">        12.946  </td></tr>
+<tr><td>tune_train_lstm_b027c3ee</td><td>TERMINATED</td><td>172.31.29.69:8092 </td><td style="text-align: right;"> 0.358634</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.28216   </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00170059 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   1.11568e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">        19.3469 </td><td style="text-align: right;">    0.559079</td><td style="text-align: right;">  0.536742</td><td style="text-align: right;">         4.80188</td></tr>
+<tr><td>tune_train_lstm_4e8d7d88</td><td>TERMINATED</td><td>172.31.29.69:22803</td><td style="text-align: right;"> 0.519608</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.286215  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00329191 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.000629851</td><td style="text-align: right;">     6</td><td style="text-align: right;">        62.7452 </td><td style="text-align: right;">    0.387055</td><td style="text-align: right;">  0.399893</td><td style="text-align: right;">         3.98873</td></tr>
+<tr><td>tune_train_lstm_34d66f7f</td><td>TERMINATED</td><td>172.31.29.69:7392 </td><td style="text-align: right;"> 0.422826</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.258709  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.00554527 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.00109675 </td><td style="text-align: right;">    54</td><td style="text-align: right;">       956.158  </td><td style="text-align: right;">    0.220576</td><td style="text-align: right;">  0.25192 </td><td style="text-align: right;">         3.01619</td></tr>
+<tr><td>tune_train_lstm_6c869795</td><td>TERMINATED</td><td>172.31.29.69:23620</td><td style="text-align: right;"> 0.487627</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0386245 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         384</td><td style="text-align: right;">0.000442747</td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   1.34138e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        88.0056 </td><td style="text-align: right;">    0.380873</td><td style="text-align: right;">  0.387827</td><td style="text-align: right;">         3.98453</td></tr>
+<tr><td>tune_train_lstm_06824e8a</td><td>TERMINATED</td><td>172.31.29.69:24062</td><td style="text-align: right;"> 0.38624 </td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0966237 </td><td style="text-align: right;">               5</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00447511 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.00269298 </td><td style="text-align: right;">     6</td><td style="text-align: right;">        85.1602 </td><td style="text-align: right;">    0.346802</td><td style="text-align: right;">  0.34676 </td><td style="text-align: right;">         3.73779</td></tr>
+<tr><td>tune_train_lstm_4d4c7ad8</td><td>TERMINATED</td><td>172.31.29.69:9347 </td><td style="text-align: right;"> 0.286085</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.00547274</td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0216707  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000363095</td><td style="text-align: right;">     2</td><td style="text-align: right;">         9.14901</td><td style="text-align: right;">    0.609211</td><td style="text-align: right;">  0.616838</td><td style="text-align: right;">         5.4882 </td></tr>
+<tr><td>tune_train_lstm_81ab5ebc</td><td>TERMINATED</td><td>172.31.29.69:9785 </td><td style="text-align: right;"> 0.430332</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0707102 </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.000353784</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.00123132 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        28.1801 </td><td style="text-align: right;">    0.572811</td><td style="text-align: right;">  0.539232</td><td style="text-align: right;">         4.8404 </td></tr>
+<tr><td>tune_train_lstm_05cdb66b</td><td>TERMINATED</td><td>172.31.29.69:1641 </td><td style="text-align: right;"> 0.352932</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.10828   </td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00490334 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.000851773</td><td style="text-align: right;">    18</td><td style="text-align: right;">       285.468  </td><td style="text-align: right;">    0.303942</td><td style="text-align: right;">  0.309185</td><td style="text-align: right;">         3.43557</td></tr>
+<tr><td>tune_train_lstm_1aa61b4b</td><td>TERMINATED</td><td>172.31.29.69:12109</td><td style="text-align: right;"> 0.518759</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.00275754</td><td style="text-align: right;">               5</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.000501552</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.10784e-06</td><td style="text-align: right;">   162</td><td style="text-align: right;">      2509.09   </td><td style="text-align: right;">    0.182767</td><td style="text-align: right;">  0.237634</td><td style="text-align: right;">         2.87889</td></tr>
+<tr><td>tune_train_lstm_c0e49171</td><td>TERMINATED</td><td>172.31.29.69:3248 </td><td style="text-align: right;"> 0.535686</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.250214  </td><td style="text-align: right;">               5</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00272109 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000702979</td><td style="text-align: right;">    18</td><td style="text-align: right;">       215.47   </td><td style="text-align: right;">    0.301044</td><td style="text-align: right;">  0.320676</td><td style="text-align: right;">         3.59694</td></tr>
+<tr><td>tune_train_lstm_9e2feb0b</td><td>TERMINATED</td><td>172.31.29.69:25403</td><td style="text-align: right;"> 0.539286</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.13332   </td><td style="text-align: right;">               0</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.000794546</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.14523e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        80.9872 </td><td style="text-align: right;">    0.37578 </td><td style="text-align: right;">  0.359586</td><td style="text-align: right;">         3.82286</td></tr>
+<tr><td>tune_train_lstm_afc2b740</td><td>TERMINATED</td><td>172.31.29.69:25655</td><td style="text-align: right;"> 0.337785</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.182482  </td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.00121033 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.000146049</td><td style="text-align: right;">     6</td><td style="text-align: right;">        80.4439 </td><td style="text-align: right;">    0.365959</td><td style="text-align: right;">  0.360137</td><td style="text-align: right;">         3.81688</td></tr>
+<tr><td>tune_train_lstm_bbc15c7c</td><td>TERMINATED</td><td>172.31.29.69:4048 </td><td style="text-align: right;"> 0.376448</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0733273 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.00129906 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.00235672 </td><td style="text-align: right;">    18</td><td style="text-align: right;">       317.952  </td><td style="text-align: right;">    0.282191</td><td style="text-align: right;">  0.298975</td><td style="text-align: right;">         3.41062</td></tr>
+<tr><td>tune_train_lstm_5473fa52</td><td>TERMINATED</td><td>172.31.29.69:26318</td><td style="text-align: right;"> 0.377136</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0967062 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.00931259 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   3.062e-06  </td><td style="text-align: right;">     6</td><td style="text-align: right;">        51.4666 </td><td style="text-align: right;">    0.371635</td><td style="text-align: right;">  0.371689</td><td style="text-align: right;">         3.88283</td></tr>
+<tr><td>tune_train_lstm_3c0d101a</td><td>TERMINATED</td><td>172.31.29.69:26693</td><td style="text-align: right;"> 0.435292</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.122647  </td><td style="text-align: right;">               1</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.00982819 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   3.60819e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        42.4734 </td><td style="text-align: right;">    0.386341</td><td style="text-align: right;">  0.360917</td><td style="text-align: right;">         3.85497</td></tr>
+<tr><td>tune_train_lstm_4e1831a9</td><td>TERMINATED</td><td>172.31.29.69:27025</td><td style="text-align: right;"> 0.485101</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.18723   </td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.00540179 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.2131e-05 </td><td style="text-align: right;">     6</td><td style="text-align: right;">        84.0688 </td><td style="text-align: right;">    0.332105</td><td style="text-align: right;">  0.355275</td><td style="text-align: right;">         3.857  </td></tr>
+<tr><td>tune_train_lstm_63270b5f</td><td>TERMINATED</td><td>172.31.29.69:12630</td><td style="text-align: right;"> 0.348805</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.247513  </td><td style="text-align: right;">               5</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00285615 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.000219803</td><td style="text-align: right;">     2</td><td style="text-align: right;">        20.7696 </td><td style="text-align: right;">    0.549537</td><td style="text-align: right;">  0.532717</td><td style="text-align: right;">         4.77602</td></tr>
+<tr><td>tune_train_lstm_c3198343</td><td>TERMINATED</td><td>172.31.29.69:27270</td><td style="text-align: right;"> 0.442594</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.197316  </td><td style="text-align: right;">               0</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.0100698  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.000982846</td><td style="text-align: right;">     6</td><td style="text-align: right;">        62.7884 </td><td style="text-align: right;">    0.419972</td><td style="text-align: right;">  0.451925</td><td style="text-align: right;">         4.28107</td></tr>
+<tr><td>tune_train_lstm_a048583e</td><td>TERMINATED</td><td>172.31.29.69:4369 </td><td style="text-align: right;"> 0.493789</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.227441  </td><td style="text-align: right;">               0</td><td style="text-align: right;">         192</td><td style="text-align: right;">0.000932895</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   5.05941e-05</td><td style="text-align: right;">    18</td><td style="text-align: right;">       313.034  </td><td style="text-align: right;">    0.27996 </td><td style="text-align: right;">  0.287834</td><td style="text-align: right;">         3.36902</td></tr>
+<tr><td>tune_train_lstm_0d0935e0</td><td>TERMINATED</td><td>172.31.29.69:27922</td><td style="text-align: right;"> 0.466861</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0687754 </td><td style="text-align: right;">               5</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.000854719</td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.00174216 </td><td style="text-align: right;">     6</td><td style="text-align: right;">        76.706  </td><td style="text-align: right;">    0.361139</td><td style="text-align: right;">  0.356383</td><td style="text-align: right;">         3.76263</td></tr>
+<tr><td>tune_train_lstm_aa5e1349</td><td>TERMINATED</td><td>172.31.29.69:13778</td><td style="text-align: right;"> 0.253389</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0339714 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         384</td><td style="text-align: right;">0.0121012  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.00156163 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        27.9531 </td><td style="text-align: right;">    0.8976  </td><td style="text-align: right;">  0.953723</td><td style="text-align: right;">         7.27413</td></tr>
+<tr><td>tune_train_lstm_838d07a6</td><td>TERMINATED</td><td>172.31.29.69:28353</td><td style="text-align: right;"> 0.343166</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.292823  </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0054403  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.0013018  </td><td style="text-align: right;">     6</td><td style="text-align: right;">        90.7446 </td><td style="text-align: right;">    0.403268</td><td style="text-align: right;">  0.376654</td><td style="text-align: right;">         3.99192</td></tr>
+<tr><td>tune_train_lstm_42564177</td><td>TERMINATED</td><td>172.31.29.69:14361</td><td style="text-align: right;"> 0.479949</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0664917 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.0102314  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.00172734 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        20.1869 </td><td style="text-align: right;">    0.518898</td><td style="text-align: right;">  0.543623</td><td style="text-align: right;">         4.81353</td></tr>
+<tr><td>tune_train_lstm_95c8bdd0</td><td>TERMINATED</td><td>172.31.29.69:12201</td><td style="text-align: right;"> 0.479843</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0321616 </td><td style="text-align: right;">               0</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00208565 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.00246027 </td><td style="text-align: right;">   162</td><td style="text-align: right;">      2177.67   </td><td style="text-align: right;">    0.208534</td><td style="text-align: right;">  0.243467</td><td style="text-align: right;">         2.93628</td></tr>
+<tr><td>tune_train_lstm_c5986d86</td><td>TERMINATED</td><td>172.31.29.69:10065</td><td style="text-align: right;"> 0.413966</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0762756 </td><td style="text-align: right;">               5</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.000546781</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   5.61732e-05</td><td style="text-align: right;">    54</td><td style="text-align: right;">       895.31   </td><td style="text-align: right;">    0.222007</td><td style="text-align: right;">  0.25536 </td><td style="text-align: right;">         3.05777</td></tr>
+<tr><td>tune_train_lstm_cc83b75b</td><td>TERMINATED</td><td>172.31.29.69:15249</td><td style="text-align: right;"> 0.402171</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.154552  </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0119312  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   6.65838e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        10.3161 </td><td style="text-align: right;">    0.544115</td><td style="text-align: right;">  0.509512</td><td style="text-align: right;">         4.67994</td></tr>
+<tr><td>tune_train_lstm_a88f95e6</td><td>TERMINATED</td><td>172.31.29.69:15538</td><td style="text-align: right;"> 0.441769</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.198901  </td><td style="text-align: right;">               0</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.00873329 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   4.4699e-06 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        20.054  </td><td style="text-align: right;">    0.504103</td><td style="text-align: right;">  0.501358</td><td style="text-align: right;">         4.67422</td></tr>
+<tr><td>tune_train_lstm_af8797de</td><td>TERMINATED</td><td>172.31.29.69:15628</td><td style="text-align: right;"> 0.38788 </td><td style="text-align: right;">          32</td><td style="text-align: right;">0.155805  </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00120794 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   1.43219e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        22.8132 </td><td style="text-align: right;">    0.533562</td><td style="text-align: right;">  0.50517 </td><td style="text-align: right;">         4.62427</td></tr>
+<tr><td>tune_train_lstm_e8e80fd4</td><td>TERMINATED</td><td>172.31.29.69:29269</td><td style="text-align: right;"> 0.38201 </td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0463214 </td><td style="text-align: right;">               5</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00187991 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.00178347 </td><td style="text-align: right;">     6</td><td style="text-align: right;">        95.4918 </td><td style="text-align: right;">    0.352037</td><td style="text-align: right;">  0.343631</td><td style="text-align: right;">         3.7712 </td></tr>
+<tr><td>tune_train_lstm_42dd86a1</td><td>TERMINATED</td><td>172.31.29.69:29743</td><td style="text-align: right;"> 0.413693</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.22863   </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00367986 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.00107841 </td><td style="text-align: right;">     6</td><td style="text-align: right;">        84.3745 </td><td style="text-align: right;">    0.36652 </td><td style="text-align: right;">  0.355504</td><td style="text-align: right;">         3.81976</td></tr>
+<tr><td>tune_train_lstm_928a18cd</td><td>TERMINATED</td><td>172.31.29.69:16678</td><td style="text-align: right;"> 0.263675</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0468458 </td><td style="text-align: right;">               5</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.00606197 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   2.58866e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        19.4786 </td><td style="text-align: right;">    0.566372</td><td style="text-align: right;">  0.491507</td><td style="text-align: right;">         4.6156 </td></tr>
+<tr><td>tune_train_lstm_09cd55b5</td><td>TERMINATED</td><td>172.31.29.69:29835</td><td style="text-align: right;"> 0.485305</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.132633  </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00111198 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.000908695</td><td style="text-align: right;">     6</td><td style="text-align: right;">        85.2849 </td><td style="text-align: right;">    0.372919</td><td style="text-align: right;">  0.354012</td><td style="text-align: right;">         3.77751</td></tr>
+<tr><td>tune_train_lstm_827bb438</td><td>TERMINATED</td><td>172.31.29.69:30421</td><td style="text-align: right;"> 0.496845</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.247532  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.0108802  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   7.64413e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        61.0811 </td><td style="text-align: right;">    0.400182</td><td style="text-align: right;">  0.385843</td><td style="text-align: right;">         3.93141</td></tr>
+<tr><td>tune_train_lstm_117f82f9</td><td>TERMINATED</td><td>172.31.29.69:6201 </td><td style="text-align: right;"> 0.444701</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0406144 </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00137043 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.00215795 </td><td style="text-align: right;">    18</td><td style="text-align: right;">       385.333  </td><td style="text-align: right;">    0.294478</td><td style="text-align: right;">  0.303298</td><td style="text-align: right;">         3.4072 </td></tr>
+<tr><td>tune_train_lstm_b0499d23</td><td>TERMINATED</td><td>172.31.29.69:17778</td><td style="text-align: right;"> 0.544541</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0201526 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.00641497 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   1.94044e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">        15.3439 </td><td style="text-align: right;">    0.540609</td><td style="text-align: right;">  0.753184</td><td style="text-align: right;">         6.24865</td></tr>
+<tr><td>tune_train_lstm_61380576</td><td>TERMINATED</td><td>172.31.29.69:31048</td><td style="text-align: right;"> 0.467373</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.101897  </td><td style="text-align: right;">               5</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00120471 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000278907</td><td style="text-align: right;">     6</td><td style="text-align: right;">        69.5712 </td><td style="text-align: right;">    0.398713</td><td style="text-align: right;">  0.391249</td><td style="text-align: right;">         4.00785</td></tr>
+<tr><td>tune_train_lstm_1d0b7f30</td><td>TERMINATED</td><td>172.31.29.69:31307</td><td style="text-align: right;"> 0.503138</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.264164  </td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00048594 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   3.70364e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        74.7908 </td><td style="text-align: right;">    0.402097</td><td style="text-align: right;">  0.385908</td><td style="text-align: right;">         3.97403</td></tr>
+<tr><td>tune_train_lstm_77084bcb</td><td>TERMINATED</td><td>172.31.29.69:31688</td><td style="text-align: right;"> 0.53104 </td><td style="text-align: right;">          32</td><td style="text-align: right;">0.22283   </td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00215463 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000307345</td><td style="text-align: right;">     6</td><td style="text-align: right;">        68.7743 </td><td style="text-align: right;">    0.347394</td><td style="text-align: right;">  0.345554</td><td style="text-align: right;">         3.74714</td></tr>
+<tr><td>tune_train_lstm_97b73335</td><td>TERMINATED</td><td>172.31.29.69:18763</td><td style="text-align: right;"> 0.481391</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.116021  </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00101338 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   6.8255e-05 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        19.3231 </td><td style="text-align: right;">    0.550283</td><td style="text-align: right;">  0.52276 </td><td style="text-align: right;">         4.7375 </td></tr>
+<tr><td>tune_train_lstm_1393dcef</td><td>TERMINATED</td><td>172.31.29.69:19237</td><td style="text-align: right;"> 0.324485</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.0809734 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00151426 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   0.000260342</td><td style="text-align: right;">     2</td><td style="text-align: right;">         9.73131</td><td style="text-align: right;">    0.58635 </td><td style="text-align: right;">  0.537364</td><td style="text-align: right;">         4.81806</td></tr>
+<tr><td>tune_train_lstm_e4d18c69</td><td>TERMINATED</td><td>172.31.29.69:19327</td><td style="text-align: right;"> 0.443841</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.0487451 </td><td style="text-align: right;">               3</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.000515221</td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   1.08729e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        21.4696 </td><td style="text-align: right;">    0.558789</td><td style="text-align: right;">  0.548636</td><td style="text-align: right;">         4.95483</td></tr>
+<tr><td>tune_train_lstm_5c1feb95</td><td>TERMINATED</td><td>172.31.29.69:31981</td><td style="text-align: right;"> 0.52106 </td><td style="text-align: right;">          64</td><td style="text-align: right;">0.197635  </td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.0026518  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           2</td><td style="text-align: right;">   0.000864173</td><td style="text-align: right;">     6</td><td style="text-align: right;">        37.4869 </td><td style="text-align: right;">    0.372817</td><td style="text-align: right;">  0.37261 </td><td style="text-align: right;">         3.92667</td></tr>
+<tr><td>tune_train_lstm_2a74b6c4</td><td>TERMINATED</td><td>172.31.29.69:20053</td><td style="text-align: right;"> 0.280503</td><td style="text-align: right;">          96</td><td style="text-align: right;">0.16152   </td><td style="text-align: right;">               5</td><td style="text-align: right;">         128</td><td style="text-align: right;">0.00342764 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           1</td><td style="text-align: right;">   0.000104559</td><td style="text-align: right;">     2</td><td style="text-align: right;">         9.19172</td><td style="text-align: right;">    0.597577</td><td style="text-align: right;">  0.582156</td><td style="text-align: right;">         5.03395</td></tr>
+<tr><td>tune_train_lstm_f73571f6</td><td>TERMINATED</td><td>172.31.29.69:20144</td><td style="text-align: right;"> 0.382882</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.0831797 </td><td style="text-align: right;">               5</td><td style="text-align: right;">         384</td><td style="text-align: right;">0.0276555  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.00018151 </td><td style="text-align: right;">     2</td><td style="text-align: right;">        18.2214 </td><td style="text-align: right;">    2.10313 </td><td style="text-align: right;">  1.43233 </td><td style="text-align: right;">         9.89226</td></tr>
+<tr><td>tune_train_lstm_e7b7af02</td><td>TERMINATED</td><td>172.31.29.69:32314</td><td style="text-align: right;"> 0.329734</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.191723  </td><td style="text-align: right;">               0</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.00938984 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   0.00133581 </td><td style="text-align: right;">     6</td><td style="text-align: right;">        83.5737 </td><td style="text-align: right;">    0.381911</td><td style="text-align: right;">  0.354989</td><td style="text-align: right;">         3.80073</td></tr>
+<tr><td>tune_train_lstm_c7127580</td><td>TERMINATED</td><td>172.31.29.69:32561</td><td style="text-align: right;"> 0.460725</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.217863  </td><td style="text-align: right;">               1</td><td style="text-align: right;">         256</td><td style="text-align: right;">0.00812939 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   1.22377e-05</td><td style="text-align: right;">    18</td><td style="text-align: right;">       252.71   </td><td style="text-align: right;">    0.297912</td><td style="text-align: right;">  0.290699</td><td style="text-align: right;">         3.33239</td></tr>
+<tr><td>tune_train_lstm_4afb9bca</td><td>TERMINATED</td><td>172.31.29.69:21162</td><td style="text-align: right;"> 0.27717 </td><td style="text-align: right;">          96</td><td style="text-align: right;">0.179182  </td><td style="text-align: right;">               0</td><td style="text-align: right;">         512</td><td style="text-align: right;">0.0184912  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.000994769</td><td style="text-align: right;">     2</td><td style="text-align: right;">        22.4196 </td><td style="text-align: right;">    1.40374 </td><td style="text-align: right;">  1.19323 </td><td style="text-align: right;">         8.91229</td></tr>
+<tr><td>tune_train_lstm_20288842</td><td>TERMINATED</td><td>172.31.29.69:21422</td><td style="text-align: right;"> 0.342959</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.255362  </td><td style="text-align: right;">               5</td><td style="text-align: right;">         384</td><td style="text-align: right;">0.0163472  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   0.000141575</td><td style="text-align: right;">     2</td><td style="text-align: right;">        24.1275 </td><td style="text-align: right;">    1.10965 </td><td style="text-align: right;">  1.06697 </td><td style="text-align: right;">         8.37242</td></tr>
+<tr><td>tune_train_lstm_d2cc2ac3</td><td>TERMINATED</td><td>172.31.29.69:21710</td><td style="text-align: right;"> 0.456318</td><td style="text-align: right;">          32</td><td style="text-align: right;">0.255252  </td><td style="text-align: right;">               1</td><td style="text-align: right;">          64</td><td style="text-align: right;">0.000608117</td><td style="text-align: right;">         200</td><td style="text-align: right;">           3</td><td style="text-align: right;">   1.75477e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">        23.4564 </td><td style="text-align: right;">    0.557201</td><td style="text-align: right;">  0.54054 </td><td style="text-align: right;">         4.83196</td></tr>
 </tbody>
 </table>
   </div>
@@ -1876,201 +1892,29 @@ else:
 
 
 
-    2025-11-10 21:22:09,224	ERROR tune_controller.py:1331 -- Trial task failed for trial tune_train_lstm_c89eda5d
-    Traceback (most recent call last):
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/execution/_internal/event_manager.py", line 110, in resolve_future
-        result = ray.get(future)
-                 ^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
-        return fn(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
-        return func(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 2961, in get
-        values, debugger_breakpoint = worker.get_objects(
-                                      ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 1026, in get_objects
-        raise value.as_instanceof_cause()
-    ray.exceptions.RayTaskError(TypeError): [36mray::ImplicitFunc.train()[39m (pid=22297, ip=172.31.29.69, actor_id=62c413e87c6511319566f1cc01000000, repr=tune_train_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/trainable.py", line 331, in train
-        raise skipped from exception_cause(skipped)
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/_internal/util.py", line 107, in run
-        self._ret = self._target(*self._args, **self._kwargs)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 44, in <lambda>
-        training_func=lambda: self._trainable_func(self.config),
-                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 249, in _trainable_func
-        output = fn()
-                 ^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/util.py", line 130, in inner
-        return trainable(config, **fn_kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/train.py", line 207, in tune_train_lstm
-        return tune_train(config, train_dataset_ref, val_dataset_ref, model_builder=build_model_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    TypeError: tune_train() missing 1 required positional argument: 'power_max'
-    2025-11-10 21:22:12,005	ERROR tune_controller.py:1331 -- Trial task failed for trial tune_train_lstm_38d21f3c
-    Traceback (most recent call last):
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/execution/_internal/event_manager.py", line 110, in resolve_future
-        result = ray.get(future)
-                 ^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
-        return fn(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
-        return func(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 2961, in get
-        values, debugger_breakpoint = worker.get_objects(
-                                      ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 1026, in get_objects
-        raise value.as_instanceof_cause()
-    ray.exceptions.RayTaskError(TypeError): [36mray::ImplicitFunc.train()[39m (pid=22447, ip=172.31.29.69, actor_id=cb0ec6de7e2778469047669001000000, repr=tune_train_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/trainable.py", line 331, in train
-        raise skipped from exception_cause(skipped)
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/_internal/util.py", line 107, in run
-        self._ret = self._target(*self._args, **self._kwargs)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 44, in <lambda>
-        training_func=lambda: self._trainable_func(self.config),
-                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 249, in _trainable_func
-        output = fn()
-                 ^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/util.py", line 130, in inner
-        return trainable(config, **fn_kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/train.py", line 207, in tune_train_lstm
-        return tune_train(config, train_dataset_ref, val_dataset_ref, model_builder=build_model_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    TypeError: tune_train() missing 1 required positional argument: 'power_max'
-    2025-11-10 21:22:14,664	ERROR tune_controller.py:1331 -- Trial task failed for trial tune_train_lstm_f4f470b7
-    Traceback (most recent call last):
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/execution/_internal/event_manager.py", line 110, in resolve_future
-        result = ray.get(future)
-                 ^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
-        return fn(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
-        return func(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 2961, in get
-        values, debugger_breakpoint = worker.get_objects(
-                                      ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 1026, in get_objects
-        raise value.as_instanceof_cause()
-    ray.exceptions.RayTaskError(TypeError): [36mray::ImplicitFunc.train()[39m (pid=22598, ip=172.31.29.69, actor_id=85cc89effe50eb6bba8ebb4301000000, repr=tune_train_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/trainable.py", line 331, in train
-        raise skipped from exception_cause(skipped)
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/_internal/util.py", line 107, in run
-        self._ret = self._target(*self._args, **self._kwargs)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 44, in <lambda>
-        training_func=lambda: self._trainable_func(self.config),
-                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 249, in _trainable_func
-        output = fn()
-                 ^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/util.py", line 130, in inner
-        return trainable(config, **fn_kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/train.py", line 207, in tune_train_lstm
-        return tune_train(config, train_dataset_ref, val_dataset_ref, model_builder=build_model_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    TypeError: tune_train() missing 1 required positional argument: 'power_max'
-    2025-11-10 21:22:17,271	ERROR tune_controller.py:1331 -- Trial task failed for trial tune_train_lstm_1f945cfd
-    Traceback (most recent call last):
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/execution/_internal/event_manager.py", line 110, in resolve_future
-        result = ray.get(future)
-                 ^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
-        return fn(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
-        return func(*args, **kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 2961, in get
-        values, debugger_breakpoint = worker.get_objects(
-                                      ^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/_private/worker.py", line 1026, in get_objects
-        raise value.as_instanceof_cause()
-    ray.exceptions.RayTaskError(TypeError): [36mray::ImplicitFunc.train()[39m (pid=22689, ip=172.31.29.69, actor_id=50344c09b02b164f71e4dcbc01000000, repr=tune_train_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/trainable.py", line 331, in train
-        raise skipped from exception_cause(skipped)
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/air/_internal/util.py", line 107, in run
-        self._ret = self._target(*self._args, **self._kwargs)
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 44, in <lambda>
-        training_func=lambda: self._trainable_func(self.config),
-                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/function_trainable.py", line 249, in _trainable_func
-        output = fn()
-                 ^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/trainable/util.py", line 130, in inner
-        return trainable(config, **fn_kwargs)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      File "/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/train.py", line 207, in tune_train_lstm
-        return tune_train(config, train_dataset_ref, val_dataset_ref, model_builder=build_model_lstm)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    TypeError: tune_train() missing 1 required positional argument: 'power_max'
-    2025-11-10 21:22:19,518	ERROR tune.py:1037 -- Trials did not complete: [tune_train_lstm_c89eda5d, tune_train_lstm_38d21f3c, tune_train_lstm_f4f470b7, tune_train_lstm_1f945cfd]
+    /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/statsmodels/nonparametric/kernels.py:62: RuntimeWarning: divide by zero encountered in divide
+      kernel_value = np.ones(Xi.size) * h / (num_levels - 1)
 
 
-
-    ---------------------------------------------------------------------------
-
-    RuntimeError                              Traceback (most recent call last)
-
-    Cell In[14], line 115
-        112 if results_lstm is None:
-        113     raise RuntimeError("No ResultGrid available after run/resume.")
-    --> 115 best_lstm_res = results_lstm.get_best_result(metric="val_metric", mode="min")
-        116 cfg_lstm = dict(best_lstm_res.config)
-        118 ckpt_dir = best_lstm_res.checkpoint.to_directory()
+    [LSTM] saved clean final model .pth at /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Models/LSTM_multihorizon_raytuned_model_9.pth
 
 
-    File /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/ray/tune/result_grid.py:161, in ResultGrid.get_best_result(self, metric, mode, scope, filter_nan_and_inf)
-        150     error_msg = (
-        151         "No best trial found for the given metric: "
-        152         f"{metric or self._experiment_analysis.default_metric}. "
-        153         "This means that no trial has reported this metric"
-        154     )
-        155     error_msg += (
-        156         ", or all values reported for this metric are NaN. To not ignore NaN "
-        157         "values, you can set the `filter_nan_and_inf` arg to False."
-        158         if filter_nan_and_inf
-        159         else "."
-        160     )
-    --> 161     raise RuntimeError(error_msg)
-        163 return self._trial_to_result(best_trial)
-
-
-    RuntimeError: No best trial found for the given metric: val_metric. This means that no trial has reported this metric, or all values reported for this metric are NaN. To not ignore NaN values, you can set the `filter_nan_and_inf` arg to False.
+    /tmp/ipykernel_1683/3848344726.py:127: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+      payload = torch.load(os.path.join(ckpt_dir, "checkpoint.pt"), map_location=DEVICE)
 
 
 
 ```python
 model_lstm = build_model_lstm(cfg_lstm)
 model_lstm.load_state_dict(payload["model_state_dict"])
-# export a clean .pth for downstream notebooks
+
+# exports a clean .pth for downstream tasks
 save_final_model_pth(model_lstm, best_lstm_res, out_path=MODEL_PATH_LSTM)
-print(f"[LSTM] saved clean final model .pth → {MODEL_PATH_LSTM}")
+print(f"[LSTM] saved clean final model .pth at {MODEL_PATH_LSTM}")
 ```
+
+    [LSTM] saved clean final model .pth at /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Models/LSTM_multihorizon_raytuned_model_9.pth
+
 
 ### 4.5 Training and Tuning the TCN Model
 We repeat the same process for the TCN. The search explores convolutional kernel size, dilation depth, and network width, focusing on receptive field properties.
@@ -2079,7 +1923,6 @@ We repeat the same process for the TCN. The search explores convolutional kernel
 ```python
 from mt4xai.model import build_model_tcn
 from mt4xai.train import tune_train_tcn
-
 
 results_tcn = None
 best_tcn_res = None
@@ -2105,9 +1948,16 @@ bohb_tcn = TuneBOHB(space=cs_tcn, metric="val_metric", mode="min")
 hb_tcn = HyperBandForBOHB(time_attr="epoch", max_t=200, reduction_factor=3)
 
 train_ref = ray.put(train_dataset)
-val_ref   = ray.put(val_dataset)
-trainable_tcn = tune.with_parameters(tune_train_tcn, train_dataset_ref=train_ref, val_dataset_ref=val_ref)
-trainable_tcn = tune.with_resources(trainable_tcn, {"cpu": 8, "gpu": 0.5})  # per trial
+val_ref = ray.put(val_dataset)
+trainable_tcn = tune.with_parameters(
+    tune_train_tcn, 
+    train_dataset_ref=train_ref, 
+    val_dataset_ref=val_ref, 
+    num_workers=NUM_WORKERS, 
+    power_min=POWER_MIN, 
+    power_max=POWER_MAX, 
+    idx_power=IDX_POWER)
+trainable_tcn = tune.with_resources(trainable_tcn, {"cpu": 10, "gpu": 0.5})  # per trial
 
 ckpt_cfg_tcn = CheckpointConfig(
     num_to_keep=3,
@@ -2217,7 +2067,7 @@ if TRAIN_TCN:
     model_tcn.load_state_dict(state_dict)
     model_tcn.eval()
     save_final_model_pth(model_tcn, best_tcn_res, out_path=MODEL_PATH_TCN)
-    print(f"[TCN] saved clean final model .pth → {MODEL_PATH_TCN}")
+    print(f"[TCN] saved clean final model .pth at {MODEL_PATH_TCN}")
 
 else:
     # restore most recent completed run
@@ -2258,16 +2108,179 @@ else:
 
 ```
 
+
+<div class="tuneStatus">
+  <div style="display: flex;flex-direction: row">
+    <div style="display: flex;flex-direction: column;">
+      <h3>Tune Status</h3>
+      <table>
+<tbody>
+<tr><td>Current time:</td><td>2025-11-13 03:02:39</td></tr>
+<tr><td>Running for: </td><td>02:42:38.97        </td></tr>
+<tr><td>Memory:      </td><td>7.2/13.6 GiB       </td></tr>
+</tbody>
+</table>
+    </div>
+    <div class="vDivider"></div>
+    <div class="systemInfo">
+      <h3>System Info</h3>
+      Using HyperBand: num_stopped=62 total_brackets=2<br>Round #0:<br>  Bracket(Max Size (n)=2, Milestone (r)=162, completed=100.0%): {TERMINATED: 64} <br>Logical resource usage: 10.0/20 CPUs, 0.5/1 GPUs (0.0/1.0 accelerator_type:G)
+    </div>
+
+  </div>
+  <div class="hDivider"></div>
+  <div class="trialStatus">
+    <h3>Trial Status</h3>
+    <table>
+<thead>
+<tr><th>Trial name             </th><th>status    </th><th>loc               </th><th style="text-align: right;">  alpha_h</th><th style="text-align: right;">  batch_size</th><th style="text-align: right;">  dropout</th><th style="text-align: right;">  grad_clip_norm</th><th style="text-align: right;">  hidden_dim</th><th style="text-align: right;">  kernel_size</th><th style="text-align: right;">         lr</th><th style="text-align: right;">  num_epochs</th><th style="text-align: right;">  num_layers</th><th style="text-align: right;">  weight_decay</th><th style="text-align: right;">  iter</th><th style="text-align: right;">  total time (s)</th><th style="text-align: right;">  train_loss</th><th style="text-align: right;">  val_loss</th><th style="text-align: right;">  val_rmse_power</th></tr>
+</thead>
+<tbody>
+<tr><td>tune_train_tcn_7bd73371</td><td>TERMINATED</td><td>172.31.29.69:10185</td><td style="text-align: right;"> 0.274908</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.226719</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000606672</td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   1.64093e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        159.979 </td><td style="text-align: right;">    0.425374</td><td style="text-align: right;">  0.41681 </td><td style="text-align: right;">         4.30374</td></tr>
+<tr><td>tune_train_tcn_cb54dd27</td><td>TERMINATED</td><td>172.31.29.69:10275</td><td style="text-align: right;"> 0.361679</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.204271</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00065609 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   3.91333e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        124.65  </td><td style="text-align: right;">    0.400788</td><td style="text-align: right;">  0.388606</td><td style="text-align: right;">         4.0426 </td></tr>
+<tr><td>tune_train_tcn_b552a41d</td><td>TERMINATED</td><td>172.31.29.69:20163</td><td style="text-align: right;"> 0.258698</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.196222</td><td style="text-align: right;">               1</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00135986 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   6.18767e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         36.1171</td><td style="text-align: right;">    0.53189 </td><td style="text-align: right;">  0.483703</td><td style="text-align: right;">         4.71656</td></tr>
+<tr><td>tune_train_tcn_8222b286</td><td>TERMINATED</td><td>172.31.29.69:11050</td><td style="text-align: right;"> 0.320883</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.293137</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00155405 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.17061e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        126.382 </td><td style="text-align: right;">    0.413796</td><td style="text-align: right;">  0.394681</td><td style="text-align: right;">         4.1355 </td></tr>
+<tr><td>tune_train_tcn_69bde06b</td><td>TERMINATED</td><td>172.31.29.69:20917</td><td style="text-align: right;"> 0.250783</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.250375</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00120335 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   2.64423e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         20.3896</td><td style="text-align: right;">    0.594471</td><td style="text-align: right;">  0.537119</td><td style="text-align: right;">         4.94728</td></tr>
+<tr><td>tune_train_tcn_acadf3ac</td><td>TERMINATED</td><td>172.31.29.69:21008</td><td style="text-align: right;"> 0.279514</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.216112</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00147401 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   8.85784e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         19.3377</td><td style="text-align: right;">    0.573044</td><td style="text-align: right;">  0.510357</td><td style="text-align: right;">         4.82757</td></tr>
+<tr><td>tune_train_tcn_7f66fbd1</td><td>TERMINATED</td><td>172.31.29.69:21560</td><td style="text-align: right;"> 0.398891</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.272066</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000655417</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   5.84774e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         18.2345</td><td style="text-align: right;">    0.579792</td><td style="text-align: right;">  0.502281</td><td style="text-align: right;">         4.65818</td></tr>
+<tr><td>tune_train_tcn_e06a7d20</td><td>TERMINATED</td><td>172.31.29.69:11445</td><td style="text-align: right;"> 0.314458</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.257952</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00082301 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.44652e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        127.544 </td><td style="text-align: right;">    0.4095  </td><td style="text-align: right;">  0.399392</td><td style="text-align: right;">         4.13381</td></tr>
+<tr><td>tune_train_tcn_0a74d483</td><td>TERMINATED</td><td>172.31.29.69:22186</td><td style="text-align: right;"> 0.205523</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.262717</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00102285 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   1.45126e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         21.2666</td><td style="text-align: right;">    0.60455 </td><td style="text-align: right;">  0.550314</td><td style="text-align: right;">         4.98128</td></tr>
+<tr><td>tune_train_tcn_0385fab1</td><td>TERMINATED</td><td>172.31.29.69:22562</td><td style="text-align: right;"> 0.28847 </td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.25761 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.000963892</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   7.35991e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         32.1717</td><td style="text-align: right;">    0.547243</td><td style="text-align: right;">  0.498497</td><td style="text-align: right;">         4.67541</td></tr>
+<tr><td>tune_train_tcn_9cc779a1</td><td>TERMINATED</td><td>172.31.29.69:11972</td><td style="text-align: right;"> 0.388778</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.244155</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.000778059</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   5.6878e-05 </td><td style="text-align: right;">     6</td><td style="text-align: right;">         76.0944</td><td style="text-align: right;">    0.412524</td><td style="text-align: right;">  0.406726</td><td style="text-align: right;">         4.14252</td></tr>
+<tr><td>tune_train_tcn_f45f80b8</td><td>TERMINATED</td><td>172.31.29.69:12368</td><td style="text-align: right;"> 0.350123</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.258661</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000778424</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.66352e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        127.644 </td><td style="text-align: right;">    0.417283</td><td style="text-align: right;">  0.408866</td><td style="text-align: right;">         4.23612</td></tr>
+<tr><td>tune_train_tcn_e939d971</td><td>TERMINATED</td><td>172.31.29.69:2022 </td><td style="text-align: right;"> 0.39485 </td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.286611</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00185896 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   6.49694e-05</td><td style="text-align: right;">    54</td><td style="text-align: right;">       1211.58  </td><td style="text-align: right;">    0.294345</td><td style="text-align: right;">  0.289959</td><td style="text-align: right;">         3.35694</td></tr>
+<tr><td>tune_train_tcn_457e19a2</td><td>TERMINATED</td><td>172.31.29.69:24020</td><td style="text-align: right;"> 0.211261</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.24688 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00119648 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   8.15293e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         39.2899</td><td style="text-align: right;">    0.557406</td><td style="text-align: right;">  0.534513</td><td style="text-align: right;">         4.92896</td></tr>
+<tr><td>tune_train_tcn_f9c6bc14</td><td>TERMINATED</td><td>172.31.29.69:24324</td><td style="text-align: right;"> 0.27067 </td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.237569</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00088424 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   4.83323e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         19.9953</td><td style="text-align: right;">    0.592872</td><td style="text-align: right;">  0.636941</td><td style="text-align: right;">         5.42352</td></tr>
+<tr><td>tune_train_tcn_d27865e7</td><td>TERMINATED</td><td>172.31.29.69:24737</td><td style="text-align: right;"> 0.211275</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.285991</td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00102835 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   3.23798e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         31.9203</td><td style="text-align: right;">    0.579086</td><td style="text-align: right;">  0.508279</td><td style="text-align: right;">         4.72975</td></tr>
+<tr><td>tune_train_tcn_9e556519</td><td>TERMINATED</td><td>172.31.29.69:25074</td><td style="text-align: right;"> 0.202909</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.243127</td><td style="text-align: right;">               1</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00111675 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   1.07268e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         39.4033</td><td style="text-align: right;">    0.553964</td><td style="text-align: right;">  0.498735</td><td style="text-align: right;">         4.75828</td></tr>
+<tr><td>tune_train_tcn_1f753a53</td><td>TERMINATED</td><td>172.31.29.69:25452</td><td style="text-align: right;"> 0.269017</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.250478</td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00180011 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   2.36772e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         19.7356</td><td style="text-align: right;">    0.564465</td><td style="text-align: right;">  0.52403 </td><td style="text-align: right;">         4.89573</td></tr>
+<tr><td>tune_train_tcn_00391f34</td><td>TERMINATED</td><td>172.31.29.69:13303</td><td style="text-align: right;"> 0.270829</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.22585 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00174025 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.02171e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        127.044 </td><td style="text-align: right;">    0.41809 </td><td style="text-align: right;">  0.423203</td><td style="text-align: right;">         4.31485</td></tr>
+<tr><td>tune_train_tcn_0d05a76a</td><td>TERMINATED</td><td>172.31.29.69:25950</td><td style="text-align: right;"> 0.234675</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.26064 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000659303</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   9.16812e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         21.0454</td><td style="text-align: right;">    0.614931</td><td style="text-align: right;">  0.566074</td><td style="text-align: right;">         5.10928</td></tr>
+<tr><td>tune_train_tcn_211b0458</td><td>TERMINATED</td><td>172.31.29.69:26508</td><td style="text-align: right;"> 0.212675</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.246243</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.0014152  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   1.5018e-05 </td><td style="text-align: right;">     2</td><td style="text-align: right;">         35.9098</td><td style="text-align: right;">    0.552174</td><td style="text-align: right;">  0.479278</td><td style="text-align: right;">         4.63788</td></tr>
+<tr><td>tune_train_tcn_115d515d</td><td>TERMINATED</td><td>172.31.29.69:13706</td><td style="text-align: right;"> 0.32482 </td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.306906</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00133234 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   4.39051e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        125.939 </td><td style="text-align: right;">    0.396912</td><td style="text-align: right;">  0.383012</td><td style="text-align: right;">         4.04813</td></tr>
+<tr><td>tune_train_tcn_e823b416</td><td>TERMINATED</td><td>172.31.29.69:14225</td><td style="text-align: right;"> 0.359459</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.280265</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00182038 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   7.05117e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        142.9   </td><td style="text-align: right;">    0.394882</td><td style="text-align: right;">  0.381183</td><td style="text-align: right;">         4.0243 </td></tr>
+<tr><td>tune_train_tcn_9454a66c</td><td>TERMINATED</td><td>172.31.29.69:27575</td><td style="text-align: right;"> 0.378637</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.313934</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000517214</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.16105e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         31.267 </td><td style="text-align: right;">    0.548458</td><td style="text-align: right;">  0.505924</td><td style="text-align: right;">         4.64019</td></tr>
+<tr><td>tune_train_tcn_09b3ea80</td><td>TERMINATED</td><td>172.31.29.69:26186</td><td style="text-align: right;"> 0.383319</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.3148  </td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00163062 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.74961e-06</td><td style="text-align: right;">    18</td><td style="text-align: right;">        396.688 </td><td style="text-align: right;">    0.33777 </td><td style="text-align: right;">  0.325814</td><td style="text-align: right;">         3.66415</td></tr>
+<tr><td>tune_train_tcn_fabe4781</td><td>TERMINATED</td><td>172.31.29.69:15191</td><td style="text-align: right;"> 0.393421</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.228135</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000560982</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   5.16148e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        138.458 </td><td style="text-align: right;">    0.407203</td><td style="text-align: right;">  0.389286</td><td style="text-align: right;">         4.05748</td></tr>
+<tr><td>tune_train_tcn_ddc04f47</td><td>TERMINATED</td><td>172.31.29.69:28747</td><td style="text-align: right;"> 0.222648</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.265105</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.000935906</td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   3.63908e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         38.6406</td><td style="text-align: right;">    0.528958</td><td style="text-align: right;">  0.497249</td><td style="text-align: right;">         4.7344 </td></tr>
+<tr><td>tune_train_tcn_36e64d40</td><td>TERMINATED</td><td>172.31.29.69:27489</td><td style="text-align: right;"> 0.375746</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.293852</td><td style="text-align: right;">               1</td><td style="text-align: right;">         160</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00144614 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   3.29192e-06</td><td style="text-align: right;">    18</td><td style="text-align: right;">        404.95  </td><td style="text-align: right;">    0.350311</td><td style="text-align: right;">  0.341808</td><td style="text-align: right;">         3.76075</td></tr>
+<tr><td>tune_train_tcn_86f7bfe9</td><td>TERMINATED</td><td>172.31.29.69:16146</td><td style="text-align: right;"> 0.395108</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.189391</td><td style="text-align: right;">               1</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.000871472</td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   1.94088e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">         87.428 </td><td style="text-align: right;">    0.419008</td><td style="text-align: right;">  0.394198</td><td style="text-align: right;">         4.08023</td></tr>
+<tr><td>tune_train_tcn_8ff1c526</td><td>TERMINATED</td><td>172.31.29.69:29600</td><td style="text-align: right;"> 0.331785</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.259722</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.000562926</td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   4.82653e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         37.7669</td><td style="text-align: right;">    0.540446</td><td style="text-align: right;">  0.522035</td><td style="text-align: right;">         4.94804</td></tr>
+<tr><td>tune_train_tcn_241ac3a8</td><td>TERMINATED</td><td>172.31.29.69:30160</td><td style="text-align: right;"> 0.332216</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.185486</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.000635809</td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   1.92372e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         39.5815</td><td style="text-align: right;">    0.542115</td><td style="text-align: right;">  0.519404</td><td style="text-align: right;">         4.853  </td></tr>
+<tr><td>tune_train_tcn_ba21f40f</td><td>TERMINATED</td><td>172.31.29.69:16453</td><td style="text-align: right;"> 0.380157</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.196908</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000576379</td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   8.13692e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        161.056 </td><td style="text-align: right;">    0.416517</td><td style="text-align: right;">  0.415578</td><td style="text-align: right;">         4.24956</td></tr>
+<tr><td>tune_train_tcn_f5e831de</td><td>TERMINATED</td><td>172.31.29.69:30920</td><td style="text-align: right;"> 0.399351</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.311279</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00137623 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   4.53562e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         35.5845</td><td style="text-align: right;">    0.508859</td><td style="text-align: right;">  0.501604</td><td style="text-align: right;">         4.76391</td></tr>
+<tr><td>tune_train_tcn_0b85c6ee</td><td>TERMINATED</td><td>172.31.29.69:16982</td><td style="text-align: right;"> 0.385497</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.219084</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00158239 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   3.45389e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        126.689 </td><td style="text-align: right;">    0.375787</td><td style="text-align: right;">  0.373868</td><td style="text-align: right;">         4.05058</td></tr>
+<tr><td>tune_train_tcn_4afe4be4</td><td>TERMINATED</td><td>172.31.29.69:31668</td><td style="text-align: right;"> 0.32483 </td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.195993</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00103626 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.28338e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         17.5424</td><td style="text-align: right;">    0.55204 </td><td style="text-align: right;">  0.559591</td><td style="text-align: right;">         4.9062 </td></tr>
+<tr><td>tune_train_tcn_34125638</td><td>TERMINATED</td><td>172.31.29.69:17484</td><td style="text-align: right;"> 0.227377</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.297335</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00186427 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   4.92965e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        144.894 </td><td style="text-align: right;">    0.432067</td><td style="text-align: right;">  0.421868</td><td style="text-align: right;">         4.297  </td></tr>
+<tr><td>tune_train_tcn_4238345c</td><td>TERMINATED</td><td>172.31.29.69:4851 </td><td style="text-align: right;"> 0.391162</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.220073</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00056592 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   6.00299e-06</td><td style="text-align: right;">   162</td><td style="text-align: right;">       4933.27  </td><td style="text-align: right;">    0.25781 </td><td style="text-align: right;">  0.262431</td><td style="text-align: right;">         3.12856</td></tr>
+<tr><td>tune_train_tcn_459a70ec</td><td>TERMINATED</td><td>172.31.29.69:307  </td><td style="text-align: right;"> 0.379549</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.206906</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.000528001</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   7.40899e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         31.9862</td><td style="text-align: right;">    0.526362</td><td style="text-align: right;">  0.505429</td><td style="text-align: right;">         4.77438</td></tr>
+<tr><td>tune_train_tcn_4de0a18f</td><td>TERMINATED</td><td>172.31.29.69:662  </td><td style="text-align: right;"> 0.268877</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.291918</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00143204 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   2.18693e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         38.5053</td><td style="text-align: right;">    0.521487</td><td style="text-align: right;">  0.495807</td><td style="text-align: right;">         4.71302</td></tr>
+<tr><td>tune_train_tcn_445ec0c5</td><td>TERMINATED</td><td>172.31.29.69:28974</td><td style="text-align: right;"> 0.388106</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.300876</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00173844 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   6.57841e-05</td><td style="text-align: right;">    18</td><td style="text-align: right;">        406.425 </td><td style="text-align: right;">    0.342496</td><td style="text-align: right;">  0.329441</td><td style="text-align: right;">         3.66528</td></tr>
+<tr><td>tune_train_tcn_16eab31a</td><td>TERMINATED</td><td>172.31.29.69:1416 </td><td style="text-align: right;"> 0.294642</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.24639 </td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.0015241  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   8.39239e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         18.2622</td><td style="text-align: right;">    0.544771</td><td style="text-align: right;">  0.508033</td><td style="text-align: right;">         4.76759</td></tr>
+<tr><td>tune_train_tcn_1c11e536</td><td>TERMINATED</td><td>172.31.29.69:19258</td><td style="text-align: right;"> 0.386518</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.302315</td><td style="text-align: right;">               1</td><td style="text-align: right;">         128</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00196625 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   1.50352e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">         75.3622</td><td style="text-align: right;">    0.432176</td><td style="text-align: right;">  0.413527</td><td style="text-align: right;">         4.23964</td></tr>
+<tr><td>tune_train_tcn_4d1ab968</td><td>TERMINATED</td><td>172.31.29.69:1947 </td><td style="text-align: right;"> 0.395385</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.205309</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00118608 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.44547e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         31.8227</td><td style="text-align: right;">    0.48188 </td><td style="text-align: right;">  0.500629</td><td style="text-align: right;">         4.6972 </td></tr>
+<tr><td>tune_train_tcn_b043a07e</td><td>TERMINATED</td><td>172.31.29.69:4942 </td><td style="text-align: right;"> 0.374653</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.248138</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00163461 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   8.32993e-06</td><td style="text-align: right;">    54</td><td style="text-align: right;">       1405.16  </td><td style="text-align: right;">    0.294566</td><td style="text-align: right;">  0.292981</td><td style="text-align: right;">         3.38067</td></tr>
+<tr><td>tune_train_tcn_f371d9fb</td><td>TERMINATED</td><td>172.31.29.69:20049</td><td style="text-align: right;"> 0.372531</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.286881</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00195349 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   5.81093e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        125.245 </td><td style="text-align: right;">    0.395558</td><td style="text-align: right;">  0.383697</td><td style="text-align: right;">         4.04774</td></tr>
+<tr><td>tune_train_tcn_b41382df</td><td>TERMINATED</td><td>172.31.29.69:30460</td><td style="text-align: right;"> 0.397837</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.212294</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00143046 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   5.25114e-05</td><td style="text-align: right;">    18</td><td style="text-align: right;">        211.215 </td><td style="text-align: right;">    0.335907</td><td style="text-align: right;">  0.339591</td><td style="text-align: right;">         3.71513</td></tr>
+<tr><td>tune_train_tcn_9cba0e7f</td><td>TERMINATED</td><td>172.31.29.69:3594 </td><td style="text-align: right;"> 0.208875</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.232176</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00106257 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   4.72092e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         32.0496</td><td style="text-align: right;">    0.562019</td><td style="text-align: right;">  0.500581</td><td style="text-align: right;">         4.68148</td></tr>
+<tr><td>tune_train_tcn_eab99680</td><td>TERMINATED</td><td>172.31.29.69:3954 </td><td style="text-align: right;"> 0.231721</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.307218</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000512938</td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   2.15157e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         18.7745</td><td style="text-align: right;">    0.643154</td><td style="text-align: right;">  0.591071</td><td style="text-align: right;">         5.16151</td></tr>
+<tr><td>tune_train_tcn_397d7aab</td><td>TERMINATED</td><td>172.31.29.69:20771</td><td style="text-align: right;"> 0.362964</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.249818</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00142478 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   4.31035e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        161.121 </td><td style="text-align: right;">    0.391066</td><td style="text-align: right;">  0.403495</td><td style="text-align: right;">         4.18103</td></tr>
+<tr><td>tune_train_tcn_e458f0fd</td><td>TERMINATED</td><td>172.31.29.69:31111</td><td style="text-align: right;"> 0.375572</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.240132</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00162025 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   2.62904e-06</td><td style="text-align: right;">    18</td><td style="text-align: right;">        519.529 </td><td style="text-align: right;">    0.348377</td><td style="text-align: right;">  0.340882</td><td style="text-align: right;">         3.75196</td></tr>
+<tr><td>tune_train_tcn_309f4ed2</td><td>TERMINATED</td><td>172.31.29.69:5126 </td><td style="text-align: right;"> 0.378875</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.229176</td><td style="text-align: right;">               3</td><td style="text-align: right;">         128</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00157169 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   4.14928e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         38.7169</td><td style="text-align: right;">    0.524094</td><td style="text-align: right;">  0.498495</td><td style="text-align: right;">         4.78125</td></tr>
+<tr><td>tune_train_tcn_38e32b6c</td><td>TERMINATED</td><td>172.31.29.69:21948</td><td style="text-align: right;"> 0.379886</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.280275</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00182463 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   1.38965e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        144.962 </td><td style="text-align: right;">    0.395734</td><td style="text-align: right;">  0.387936</td><td style="text-align: right;">         4.126  </td></tr>
+<tr><td>tune_train_tcn_c1c44748</td><td>TERMINATED</td><td>172.31.29.69:31538</td><td style="text-align: right;"> 0.387722</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.21399 </td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.0019493  </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   2.562e-06  </td><td style="text-align: right;">    18</td><td style="text-align: right;">        526.082 </td><td style="text-align: right;">    0.332512</td><td style="text-align: right;">  0.325008</td><td style="text-align: right;">         3.63311</td></tr>
+<tr><td>tune_train_tcn_ccb3376a</td><td>TERMINATED</td><td>172.31.29.69:5917 </td><td style="text-align: right;"> 0.214939</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.183442</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.001308   </td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   7.71315e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         39.2774</td><td style="text-align: right;">    0.551873</td><td style="text-align: right;">  0.496892</td><td style="text-align: right;">         4.74144</td></tr>
+<tr><td>tune_train_tcn_1259d063</td><td>TERMINATED</td><td>172.31.29.69:6527 </td><td style="text-align: right;"> 0.396796</td><td style="text-align: right;">          64</td><td style="text-align: right;"> 0.258785</td><td style="text-align: right;">               1</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00097471 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   4.48591e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         20.3817</td><td style="text-align: right;">    0.563292</td><td style="text-align: right;">  0.544937</td><td style="text-align: right;">         4.89067</td></tr>
+<tr><td>tune_train_tcn_4ad25caa</td><td>TERMINATED</td><td>172.31.29.69:385  </td><td style="text-align: right;"> 0.375262</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.283791</td><td style="text-align: right;">               1</td><td style="text-align: right;">         160</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00197174 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   2.49933e-06</td><td style="text-align: right;">    18</td><td style="text-align: right;">        457.554 </td><td style="text-align: right;">    0.355547</td><td style="text-align: right;">  0.344453</td><td style="text-align: right;">         3.74896</td></tr>
+<tr><td>tune_train_tcn_d9786fd8</td><td>TERMINATED</td><td>172.31.29.69:23421</td><td style="text-align: right;"> 0.362374</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.314984</td><td style="text-align: right;">               1</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00129555 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   2.75014e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        142.425 </td><td style="text-align: right;">    0.395115</td><td style="text-align: right;">  0.394668</td><td style="text-align: right;">         4.07031</td></tr>
+<tr><td>tune_train_tcn_9e87dc47</td><td>TERMINATED</td><td>172.31.29.69:7513 </td><td style="text-align: right;"> 0.328219</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.315354</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00086894 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   5.2986e-05 </td><td style="text-align: right;">     2</td><td style="text-align: right;">         32.8862</td><td style="text-align: right;">    0.530818</td><td style="text-align: right;">  0.486747</td><td style="text-align: right;">         4.62236</td></tr>
+<tr><td>tune_train_tcn_f039208e</td><td>TERMINATED</td><td>172.31.29.69:7918 </td><td style="text-align: right;"> 0.29292 </td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.289179</td><td style="text-align: right;">               1</td><td style="text-align: right;">         160</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.000812959</td><td style="text-align: right;">         200</td><td style="text-align: right;">           6</td><td style="text-align: right;">   4.39422e-05</td><td style="text-align: right;">     2</td><td style="text-align: right;">         39.3013</td><td style="text-align: right;">    0.558391</td><td style="text-align: right;">  0.526393</td><td style="text-align: right;">         4.80263</td></tr>
+<tr><td>tune_train_tcn_dbafc0c5</td><td>TERMINATED</td><td>172.31.29.69:23884</td><td style="text-align: right;"> 0.324231</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.295168</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00156283 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   7.86085e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        125.978 </td><td style="text-align: right;">    0.397439</td><td style="text-align: right;">  0.382087</td><td style="text-align: right;">         4.04599</td></tr>
+<tr><td>tune_train_tcn_060475b4</td><td>TERMINATED</td><td>172.31.29.69:8624 </td><td style="text-align: right;"> 0.382472</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.261712</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00152099 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.12519e-06</td><td style="text-align: right;">   162</td><td style="text-align: right;">       3704.1   </td><td style="text-align: right;">    0.273939</td><td style="text-align: right;">  0.27444 </td><td style="text-align: right;">         3.22226</td></tr>
+<tr><td>tune_train_tcn_44822b28</td><td>TERMINATED</td><td>172.31.29.69:24806</td><td style="text-align: right;"> 0.365858</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.270078</td><td style="text-align: right;">               3</td><td style="text-align: right;">         160</td><td style="text-align: right;">            5</td><td style="text-align: right;">0.00139801 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.63798e-06</td><td style="text-align: right;">     6</td><td style="text-align: right;">        124.27  </td><td style="text-align: right;">    0.395591</td><td style="text-align: right;">  0.405388</td><td style="text-align: right;">         4.18876</td></tr>
+<tr><td>tune_train_tcn_b7fe6e7f</td><td>TERMINATED</td><td>172.31.29.69:9416 </td><td style="text-align: right;"> 0.35826 </td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.307302</td><td style="text-align: right;">               1</td><td style="text-align: right;">         192</td><td style="text-align: right;">            3</td><td style="text-align: right;">0.00168844 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           4</td><td style="text-align: right;">   1.26697e-06</td><td style="text-align: right;">     2</td><td style="text-align: right;">         32.1298</td><td style="text-align: right;">    0.492075</td><td style="text-align: right;">  0.53974 </td><td style="text-align: right;">         5.10944</td></tr>
+<tr><td>tune_train_tcn_3a9060f5</td><td>TERMINATED</td><td>172.31.29.69:25307</td><td style="text-align: right;"> 0.316221</td><td style="text-align: right;">          32</td><td style="text-align: right;"> 0.281569</td><td style="text-align: right;">               3</td><td style="text-align: right;">         192</td><td style="text-align: right;">            7</td><td style="text-align: right;">0.00153829 </td><td style="text-align: right;">         200</td><td style="text-align: right;">           5</td><td style="text-align: right;">   6.73474e-05</td><td style="text-align: right;">     6</td><td style="text-align: right;">        187.855 </td><td style="text-align: right;">    0.393787</td><td style="text-align: right;">  0.387803</td><td style="text-align: right;">         4.0236 </td></tr>
+</tbody>
+</table>
+  </div>
+</div>
+<style>
+.tuneStatus {
+  color: var(--jp-ui-font-color1);
+}
+.tuneStatus .systemInfo {
+  display: flex;
+  flex-direction: column;
+}
+.tuneStatus td {
+  white-space: nowrap;
+}
+.tuneStatus .trialStatus {
+  display: flex;
+  flex-direction: column;
+}
+.tuneStatus h3 {
+  font-weight: bold;
+}
+.tuneStatus .hDivider {
+  border-bottom-width: var(--jp-border-width);
+  border-bottom-color: var(--jp-border-color0);
+  border-bottom-style: solid;
+}
+.tuneStatus .vDivider {
+  border-left-width: var(--jp-border-width);
+  border-left-color: var(--jp-border-color0);
+  border-left-style: solid;
+  margin: 0.5em 1em 0.5em 1em;
+}
+</style>
+
+
+
+    [TCN] saved clean final model .pth at /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Models/TCN_multihorizon_raytuned_model_4.pth
+
+
+    /tmp/ipykernel_1683/2757692989.py:140: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+      payload = torch.load(os.path.join(ckpt_dir, "checkpoint.pt"), map_location=DEVICE)
+    /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/linux_venv/lib64/python3.12/site-packages/torch/nn/utils/weight_norm.py:143: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+      WeightNorm.apply(module, name, dim)
+
+
 ### 4.6 Plot Training Process from Ray Tune Logs
 We plot per-epoch metrics for the best trials to inspect convergence. Validation curves are computed without dropout and reflect masked, horizon-weighted errors in original units. These plots aim to provide some insight into convergence behaviour and potential under-/overfitting.
 
 
 
 ```python
+from mt4xai.plot import plot_losses_from_result
 # plots the per-epoch metrics from best_result.metrics_dataframe for each model archetype
 if best_lstm_res is not None: plot_losses_from_result(best_lstm_res, title_prefix="LSTM")
 if best_tcn_res  is not None: plot_losses_from_result(best_tcn_res,  title_prefix="TCN")
 ```
+
+
+    
+![png](03__Modelling_files/03__Modelling_35_0.png)
+    
+
+
+
+    
+![png](03__Modelling_files/03__Modelling_35_1.png)
+    
+
+
+
+    
+![png](03__Modelling_files/03__Modelling_35_2.png)
+    
+
+
+
+    
+![png](03__Modelling_files/03__Modelling_35_3.png)
+    
+
 
 The training curves show that both LSTM and TCN models converge steadily, with validation loss consistently below training loss. This happens because the use of dropout and gradient clipping during training injects noise that inflates the training loss, whereas validation is evaluated without these regularisers, leading to lower reported loss. Furthermore, the training loss is computed over longer and more diverse sequences, often including noisy or harder-to-predict segments, while the validation set may contain somewhat shorter or cleaner sequences. The use of the Huber loss also contributes: since it is more robust to outliers, validation loss is less penalised by extreme errors, while the training loss reflects the influence of a larger number of atypical or noisy samples. Across epochs, validation RMSE decreases and stabilises, with SOC predictions achieving the lowest error (≈0.5–0.6%) while power predictions remain more challenging (≈6–6.5 kW RMSE). 
 
@@ -2286,7 +2299,7 @@ The `plot_inputs_to_single_output_grid` was used to debug the models' prediction
 
 ```python
 from mt4xai.plot import plot_inputs_to_single_output_grid
-from mt4xai.data import fetch_charging_session
+from mt4xai.data import LengthBucketSampler, fetch_charging_session, session_collate_fn
 
 # test loader for plotting
 test_sampler = LengthBucketSampler(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -2318,6 +2331,12 @@ plot_inputs_to_single_output_grid(
 );
 ```
 
+
+    
+![png](03__Modelling_files/03__Modelling_39_0.png)
+    
+
+
 #### 5.1.2 Plotting Multi-Horizon Predictions for a Complete Session
 Plots of entire sessions show model predictions across horizons, illustrating temporal coherence of forecasts.
 
@@ -2325,6 +2344,12 @@ Plots of entire sessions show model predictions across horizons, illustrating te
 ```python
 session_lstm.plot_power_predictions();
 ```
+
+
+    
+![png](03__Modelling_files/03__Modelling_41_0.png)
+    
+
 
 
 ```python
@@ -2338,6 +2363,12 @@ session_tcn = fetch_charging_session(
 
 session_tcn.plot_power_predictions();
 ```
+
+
+    
+![png](03__Modelling_files/03__Modelling_42_0.png)
+    
+
 
 #### 5.1.3 Plotting Complete Power Predictions for Multiple Sample Sessions
 Predicted and true power curves are compared across multiple sessions to evaluate generalisation.
@@ -2368,12 +2399,24 @@ if model_lstm is not None:
 ```
 
 
+    
+![png](03__Modelling_files/03__Modelling_44_0.png)
+    
+
+
+
 ```python
 # TCN predictions grid plot across horizons
 if model_tcn is not None:
     sessions_tcn = build_sessions(model_tcn, pairs)
     plot_grid_power_predictions(sessions_tcn, t_min_eval=1, show_points=True, show_soc=True)
 ```
+
+
+    
+![png](03__Modelling_files/03__Modelling_45_0.png)
+    
+
 
 ### 5.2 Model Evaluation and Selection
 We select the final model by evaluating the best LSTM and TCN models with Macro-Averaged Root Mean Squared Error (Macro-RMSE) on the held-out test set, complemented by the qualitative inspection of the multi-horizon prediction plots. For a detailed explanation of Macro-RMSE, see section 4.
@@ -2400,6 +2443,11 @@ if model_tcn is not None:
 best_model_name = "LSTM" if lstm_score <= tcn_score else "TCN"
 print(f"Test Macro-RMSE — LSTM: {lstm_score:.3f} kW | TCN: {tcn_score:.3f} kW. Selected: {best_model_name}")
 ```
+
+    [LSTM] Test Macro-Averaged RMSE: 3.5138 (across 12183 sequences)
+    [TCN]  Test Macro-Averaged RMSE: 3.6100 (across 12183 sequences)
+    Test Macro-RMSE — LSTM: 3.514 kW | TCN: 3.610 kW. Selected: LSTM
+
 
 
 ```python
