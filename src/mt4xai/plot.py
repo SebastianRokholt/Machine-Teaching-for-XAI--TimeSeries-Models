@@ -20,7 +20,7 @@ COLOUR_SOC = "#0b3d91" # dark blue (for raw and simplified)
 
 # ---------------------------------------- CHARGING SESSION PLOTS ---------------------------------------- #
 
-def _axis_label_with_dual_icon(ax: Axes, label: str, *, colours: list[str],
+def _axis_label_icons_raw_simp(ax: Axes, label: str, *, colours: list[str],
                                  side: Literal["left", "right"] = "left",
                                  fontsize: float = 12.0, labelpad: float = 8.0) -> None:
     """
@@ -45,6 +45,36 @@ def _axis_label_with_dual_icon(ax: Axes, label: str, *, colours: list[str],
                     ha="center", va="center", color=c, fontsize=fontsize, fontweight="bold",
                     clip_on=False)
 
+
+def _axis_label_icons_raw_simp_pred(ax: Axes, label: str, *, colours: list[str],
+                                 side: Literal["left", "right"] = "left",
+                                 fontsize: float = 12.0, labelpad: float = 8.0) -> None:
+    """
+    draws multiple coloured '■' squares next to the y-axis label, no mathtext.
+    - keeps the actual ylabel as plain text (so layout/tight_layout work)
+    - places one coloured square per entry in `colors`
+    - colours ticks + matching spine using the first colour
+    """
+    ax.set_ylabel(label, labelpad=labelpad, fontsize=fontsize)
+
+    # manual positioning of squares in axes coordinates after label text
+    x = -0.055 if side == "left" else 1.046
+    y0 = 0.75 if side == "left" else 0.87
+
+    if len(colours) == 1 and side == "left": 
+        ax.text(x+0.006, y0-0.045, "■", transform=ax.transAxes,
+                    ha="center", va="center", color=colours[0], fontsize=fontsize, fontweight="bold",
+                    clip_on=False)
+    else:
+        if side == "left":
+            x_adj = -0.0126
+        else:
+            x_adj = +0.02
+        for i, c in enumerate(colours):
+            ax.text(x+x_adj, y0 - i * 0.045, "■", transform=ax.transAxes,
+                    ha="center", va="center", color=c, fontsize=fontsize, fontweight="bold",
+                    clip_on=False)
+                
 
 def plot_raw_session(
     power_kw: np.ndarray, *, soc: np.ndarray | None = None, soc_mode: Literal["none", "raw", "simpl"] = "none",
@@ -78,7 +108,7 @@ def plot_raw_session(
 
     # axes, title, grid
     ax.set_xlabel("Minutes elapsed", fontdict={"size": 15})
-    _axis_label_with_dual_icon(ax, "Power (kW)", colours=[COLOUR_POWER_RAW], side="left", 
+    _axis_label_icons_raw_simp(ax, "Power (kW)", colours=[COLOUR_POWER_RAW], side="left", 
                                fontsize=15)
     if title:
         ax.set_title(title)
@@ -89,7 +119,7 @@ def plot_raw_session(
     if soc_mode != "none" and soc is not None:
         ax2 = ax.twinx()
         ax2.set_ylim(0.0, 100.0)
-        _axis_label_with_dual_icon(ax2, "Battery charge level (%)", colours=[COLOUR_SOC], 
+        _axis_label_icons_raw_simp(ax2, "Battery charge level (%)", colours=[COLOUR_SOC], 
                                    side="right", fontsize=15)
         ax2.plot(x, np.clip(np.asarray(soc, dtype=float), 0.0, 100.0), linewidth=1.6,
                  color=COLOUR_SOC, label=f"Battery charge level (%)")
@@ -345,7 +375,7 @@ def plot_raw_simpl_session(
 
     # axes, title, grid
     ax.set_xlabel("Minutes elapsed", fontdict={"size": 15})
-    _axis_label_with_dual_icon(ax, "Power (kW)", colours=[COLOUR_POWER_RAW, COLOUR_POWER_SIMPL], side="left", fontsize=14)
+    _axis_label_icons_raw_simp(ax, "Power (kW)", colours=[COLOUR_POWER_RAW, COLOUR_POWER_SIMPL], side="left", fontsize=14)
     if title:
         ax.set_title(title)
     ax.grid(True, alpha=0.3)
@@ -357,7 +387,7 @@ def plot_raw_simpl_session(
     if soc_mode != "none" and soc is not None:
         ax2 = ax.twinx()
         ax2.set_ylim(0, 100)
-        _axis_label_with_dual_icon(ax2, "Battery charge level (%)", colours=[COLOUR_SOC], side="right", fontsize=14)
+        _axis_label_icons_raw_simp(ax2, "Battery charge level (%)", colours=[COLOUR_SOC], side="right", fontsize=14)
         ax2.plot(x, np.clip(np.asarray(soc, dtype=float), 0.0, 100.0), linewidth=1.6, alpha=0.8,
                  color=COLOUR_SOC, label=f"battery charge level")
         lines = lines + ax2.get_lines()
@@ -369,76 +399,186 @@ def plot_raw_simpl_session(
 
 
 def plot_raw_pred_simp_session(
-    bundle: "SessionPredsBundle", power_scaler, soc_scaler, idx_power_inp: int, idx_soc_inp: int,
-    simpl_power_unscaled: np.ndarray, *, session_id: int | None = None, k: int | None = None,
-    threshold: float | None = None, simp_error: float | None = None, orig_error: float | None = None,
-    label: str | None = None, decay_lambda: float | None = None, noise_std_kw: float | None = None,
-    robust_tau: float | None = None, figsize: tuple[float, float] = (12.0, 5.0), dpi: int = 110,
-    t_min_eval: int = 1
-    ) -> tuple[plt.Figure, plt.Axes]:
+    bundle: "SessionPredsBundle",
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    simpl_power_unscaled: np.ndarray,
+    simpl_soc_unscaled: Optional[np.ndarray] = None,
+    session_id: Optional[int | str] = None,
+    k: Optional[int] = None,
+    threshold: Optional[float] = None,
+    simp_error: Optional[float] = None,
+    orig_error: Optional[float] = None,
+    label: Optional[str] = None,
+    decay_lambda: Optional[float] = None,
+    noise_std_kw: Optional[float] = None,
+    robust_tau: Optional[float] = None,
+    figsize: Tuple[int, int] = (12, 4),
+    dpi: int = 110,
+    t_min_eval: int = 1,
+) -> tuple[Figure, Axes]:
     """
-    plots true power, all-horizon predicted power, and an ors-simplified power curve.
-    returns the matplotlib figure and axes so callers can manage rendering.
+    plots true power, multi-horizon power predictions and an ORS simplification,
+    with an optional ORS-RDP SOC simplification on a right-hand axis.
+
+    this function uses `reconstruct_abs_from_bundle` to obtain absolute
+    predictions in kW. soc is only plotted in its simplified form, to avoid
+    clutter and duplicate legend entries.
     """
     from .data import reconstruct_abs_from_bundle  # avoid circular import
+
     T, H = bundle.length, bundle.horizon
     t = np.arange(T)
-    true = np.asarray(bundle.true_power_unscaled, dtype=float)
+    true_power = np.asarray(bundle.true_power_unscaled, dtype=float).reshape(-1)
     sid = int(session_id) if session_id is not None else bundle.session_id
 
-    # create figure/axes explicitly and apply all config to them
+    # reconstruct absolute power predictions
+    P_abs, _ = reconstruct_abs_from_bundle(
+        bundle=bundle,
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+    )
+    if P_abs.ndim == 3:
+        P_pow = P_abs[..., 0]  # [T, H, 1] -> [T, H]
+    else:
+        P_pow = P_abs  # [T, H]
+
+    # figure and left axis (power)
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
 
-    # true power
-    sns.lineplot(x=t, y=true, color="black", linewidth=2.2, label="True power", ax=ax)
+    # true power (kW)
+    sns.lineplot(
+        x=t,
+        y=true_power,
+        color=COLOUR_POWER_WITH_PREDS,
+        linewidth=2.2,
+        label="True power",
+        ax=ax,
+    )
 
-    # multi-horizon predictions (power)
-    palette = sns.color_palette("deep", n_colors=H)
-    P_abs = reconstruct_abs_from_bundle(bundle, idx_power_inp, idx_soc_inp)
+    # multi-horizon predictions
+    palette = sns.color_palette(HORIZON_PREDS_PALETTE, n_colors=H)
     for h0 in range(H):
         i_valid = np.arange(t_min_eval, T - (h0 + 1))
         if i_valid.size == 0:
             continue
         t_pred = i_valid + (h0 + 1)
-        preds = power_scaler.inverse_transform(
-            P_abs[i_valid, h0, 0].numpy().reshape(-1, 1)
-        ).ravel()
+        preds = P_pow[i_valid, h0]
         sns.lineplot(
-            x=t_pred, y=preds, linestyle="--", linewidth=1.6, color=palette[h0],
-            label=f"H={h0+1}", marker="o", markersize=2.5, ax=ax
+            x=t_pred,
+            y=preds,
+            linestyle="--",
+            linewidth=1.6,
+            color=palette[h0],
+            label=f"H={h0+1}",
+            marker="o",
+            markersize=2.5,
+            ax=ax,
         )
 
-    # ors simplification
+    # ors simplification (already in kW)
+    simpl_power_unscaled = np.asarray(simpl_power_unscaled, dtype=float).reshape(-1)
+    if simpl_power_unscaled.size != T:
+        raise ValueError("simpl_power_unscaled must have length equal to session length T.")
     sns.lineplot(
-        x=t, y=simpl_power_unscaled, color="tab:red", linewidth=2.6, label="ORS simplification", ax=ax
+        x=t,
+        y=simpl_power_unscaled,
+        color=COLOUR_POWER_SIMPL,
+        linewidth=2.6,
+        label="ORS simplification (power)",
+        ax=ax,
     )
 
+    # left y-axis (power)
+    ax.set_xlabel("Minutes elapsed")
+    _axis_label_icons_raw_simp_pred(
+        ax,
+        "Power (kW)",
+        colours=[COLOUR_POWER_WITH_PREDS, COLOUR_POWER_SIMPL],
+        side="left",
+        fontsize=12,
+    )
+
+    # optional SOC ORS-RDP overlay on right axis
+    ax2: Optional[Axes] = None
+    if simpl_soc_unscaled is not None:
+        ax2 = ax.twinx()
+        ax2.set_ylim(0.0, 100.0)
+        _axis_label_icons_raw_simp_pred(
+            ax2,
+            "Battery charge level (%)",
+            colours=[COLOUR_SOC],
+            side="right",
+            fontsize=12,
+        )
+
+        simpl_soc_unscaled = np.asarray(simpl_soc_unscaled, dtype=float).reshape(-1)
+        if simpl_soc_unscaled.size != T:
+            raise ValueError("simpl_soc_unscaled must have length equal to session length T.")
+
+        ax2.plot(
+            t,
+            np.clip(simpl_soc_unscaled, 0.0, 100.0),
+            linewidth=1.8,
+            color=COLOUR_SOC,
+            label="SOC (ORS-RDP)",
+        )
+
     # title
-    ttl = f"ORS Simplification of Charging Session {sid}. Classification = {label}, k = {k}"
+    ttl = f"ORS simplification of charging session {sid}"
+    if label is not None:
+        ttl += f" — classification: {label}"
+    if k is not None:
+        ttl += f" (k={k})"
     ax.set_title(ttl)
 
-    # caption string
+    # caption (kept short so layout is stable)
     cap_parts: list[str] = []
-    if label is not None:        cap_parts.append(f"Classification: {label}")
-    if simp_error is not None:   cap_parts.append(f"prediction error on simplification = {simp_error:.3f}")
-    if orig_error is not None:   cap_parts.append(f"prediction error on original = {orig_error:.3f}")
-    if threshold is not None:    cap_parts.append(f"classification threshold = {threshold}")
-    if k is not None:            cap_parts.append(f"k = {k}")
-    if decay_lambda is not None: cap_parts.append(f"λ = {decay_lambda}")
-    if noise_std_kw is not None: cap_parts.append(f"noise_std_kw = {noise_std_kw}")
-    if robust_tau is not None:   cap_parts.append(f"robust_tau = {robust_tau}")
-    fig_desc = ", ".join(cap_parts)
+    if orig_error is not None:
+        cap_parts.append(f"orig macro-RMSE={orig_error:.3f}")
+    if simp_error is not None:
+        cap_parts.append(f"simpl macro-RMSE={simp_error:.3f}")
+    if threshold is not None:
+        cap_parts.append(f"threshold={float(threshold):.3f}")
+    if decay_lambda is not None:
+        cap_parts.append(f"λ={float(decay_lambda):.3f}")
+    if noise_std_kw is not None:
+        cap_parts.append(f"noise σ={float(noise_std_kw):.3f} kW")
+    if robust_tau is not None:
+        cap_parts.append(f"robust τ={float(robust_tau):.3f}")
+    if cap_parts:
+        ax.text(
+            0.01,
+            -0.16,
+            " | ".join(cap_parts),
+            transform=ax.transAxes,
+            fontsize=9,
+            va="top",
+        )
 
-    # axes formatting
-    ax.set_xlabel("Time index")
-    ax.set_ylabel("Power (kW)")
-    ax.grid(True)
-    ax.legend()
+    # collect all lines (including SOC on ax2)
+    lines = list(ax.get_lines())
+    labels = [ln.get_label() for ln in lines]
 
-    # layout and caption placement belong to the figure object
-    fig.tight_layout()
-    fig.subplots_adjust(bottom=0.18)
-    fig.text(0.01, 0.02, fig_desc, fontsize=9, ha="left")
+    if ax2 is not None:
+        ax2_lines = list(ax2.get_lines())
+        ax2_labels = [ln.get_label() for ln in ax2_lines]
+        lines.extend(ax2_lines)
+        labels.extend(ax2_labels)
+
+    # place legend outside the plot area
+    fig.legend(
+        lines,
+        labels,
+        loc="upper right",
+        bbox_to_anchor=(1.07, 0.94),   # near top-right corner outside of the the axes
+        frameon=True,
+        framealpha=0.95,
+        fontsize=9,
+    )
+
+    # make room on the right so legend never squashes the plot
+    fig.subplots_adjust(right=0.80)
 
     return fig, ax
 

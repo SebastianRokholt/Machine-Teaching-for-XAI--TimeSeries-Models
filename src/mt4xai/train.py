@@ -1,19 +1,12 @@
 # src/mt4xai/train.py
 import os
-import sys 
 import glob
 import json
-import random 
-import logging
 import tempfile
 from pathlib import Path
 from collections import OrderedDict
-from typing import List, Callable, Optional
-import numpy as np
+from typing import Callable, Optional
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,20 +17,13 @@ from ray import ObjectRef
 from ray import tune
 from ray.air import session
 from ray.train import Checkpoint
-from ray.air.config import RunConfig, CheckpointConfig
 from ray.tune import ExperimentAnalysis
-from ray.tune.tuner import Tuner, TuneConfig
-from ray.tune.schedulers import HyperBandForBOHB
-from ray.tune.search.bohb import TuneBOHB
-import ConfigSpace as CS
-import ConfigSpace.hyperparameters as CSH
-from sklearn.preprocessing import MinMaxScaler
-
+# custom imports
 from .data import LengthBucketSampler, session_collate_fn
 from .model import build_model_lstm, build_model_tcn, horizon_weights
 from .inference import macro_rmse_per_session
 
-# ----------------------------------------------------- MODEL TRAINING -------------------------------------------- #
+# -------------------------- MODEL TRAINING & TUNING (HYPERPARAMETER SEARCH) ---------------------- #
 def tune_train(
     config,
     num_workers: int, 
@@ -212,9 +198,6 @@ def tune_train_tcn(config, train_dataset_ref=None, val_dataset_ref=None, *,
                    num_workers: int, power_min: float, power_max: float, idx_power: int = 2):
     return tune_train(config, num_workers, power_min, power_max, idx_power,
                       train_dataset_ref, val_dataset_ref, model_builder=build_model_tcn)
-
-
-# ----------------------------------------------------- MODEL TUNING -------------------------------------------- #
 
 
 

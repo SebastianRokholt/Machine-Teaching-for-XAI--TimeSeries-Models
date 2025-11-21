@@ -24,43 +24,61 @@ We tune the ORS terms/parameters on the validation set, then apply ORS to a test
 
 ```python
 import os
-import torch
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+import sys
+from pathlib import Path
 from functools import lru_cache
 import ipywidgets as widgets
 from ipywidgets import Layout, HBox
 from IPython.display import display, clear_output
+import torch
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
 # Modules from the project's MT4XAI package
 %load_ext autoreload
 %autoreload 2
-from mt4xai.data import split_data, apply_scalers, build_loader, fit_scalers_on_train, fetch_session_preds_bundle
+from mt4xai.data import split_data, apply_scalers, build_loader, fit_scalers_on_train
 from mt4xai.model import load_lstm_model
 from mt4xai.ors import ORSParams, ors, base_label_from_bundle
 from mt4xai.plot import plot_raw_pred_simp_session
-from mt4xai.inference import compute_session_MRMSE, classify_by_threshold, percentile_threshold
+from mt4xai.inference import compute_session_MRMSE, classify_by_threshold, percentile_threshold, make_bundle_from_session_df
 
-RANDOM_SEED = 42
-
+# project config
 PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), os.pardir))
-CLEANED_DATA_PATH = os.path.join(PROJECT_ROOT, "Data", "etron55-charging-sessions.parquet")
+sys.path.append(str(Path.cwd().parent))  # Adds additional scripts (e.g. project_config.py) in parent dir to path
+from project_config import load_config
+cfg = load_config()
 
+# AD / inference / macro-rmse config
+RANDOM_SEED = int(cfg.project.random_seed) # e.g. 42
+AD_THRESHOLD = float(cfg.inference.ad_rmse_threshold)  # e.g. 13.3423, 
+AD_PCT_THRESHOLD = float(cfg.inference.ad_pct_threshold)  # e.g "95" for the 95th percentile value. AD_THRESHOLD is used unless we recompute from AD_PCT_THRESHOLD
+LAMBDA_DECAY = float(cfg.inference.horizon_decay_lambda)  # e.g. 0.4
+CLEANED_DATA_PATH = os.path.join(PROJECT_ROOT, "Data", "etron55-charging-sessions.parquet")
 FINAL_MODEL_FOLDER_PATH = os.path.join(PROJECT_ROOT, "Models/final")
 FINAL_MODEL_PATH = os.path.join(FINAL_MODEL_FOLDER_PATH, "final_model.pth")
 
-
+# PyTorch settings
 print("[env] CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("[env] Device:", torch.cuda.get_device_name(torch.cuda.current_device()))
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  # uses Cuda GPU if available
 
+# Jupyter Notebook settings
 %matplotlib inline
+%load_ext autoreload
+%autoreload 2
 ```
 
+    The autoreload extension is already loaded. To reload it, use:
+      %reload_ext autoreload
+    CONFIG FILE LOADED: 
+    {'project': {'random_seed': 42, 'root_dir': None}, 'paths': {'dataset': 'Data/etron55-charging-sessions.parquet', 'teaching_pool': 'Data/teaching_pool', 'models': 'Models', 'final_model': 'Models/final/final_model.pth', 'figures': 'Figures', 'logs': 'Logs'}, 'inference': {'horizon': 5, 'final_model_name': 'final_model.pth', 'hidden_dim': 256, 'num_layers': 4, 'dropout': 0.0027575414563, 'alpha_h': 0.5187590357622, 'batch_size': 32, 'grad_clip_norm': 5.0, 'lr': 0.000501551534, 'weight_decay': 1.1078448e-06, 'horizon_decay_lambda': 0.4, 't_min_eval': 1, 'ad_rmse_threshold': 13.3423, 'ad_pct_threshold': 95, 'metric': 'macro_rmse'}, 'ors': {'soc_stage1_mode': 'rdp', 'soc_rdp_epsilon': 0.75, 'soc_rdp_candidates': 5, 'soc_rdp_eps_min': 1e-06, 'soc_rdp_eps_max': 100.0, 'stage2_err_metric': 'l2', 'epsilon_mode': 'fraction'}, 'teaching': {'teaching_pool_dir': '../Data/teaching_pool', 'teaching_set_size': 60}}
     [env] CUDA available: True
     [env] Device: NVIDIA GeForce RTX 4070 Laptop GPU
+    The autoreload extension is already loaded. To reload it, use:
+      %reload_ext autoreload
 
 
 ### 1.2 Load the Forecasting Model
@@ -74,15 +92,24 @@ input_features  = checkpoint["input_features"]
 target_features = checkpoint["target_features"]
 cfg = checkpoint["config"]
 HORIZON = int(cfg["horizon"])
-POWER_WEIGHT = float(cfg.get("power_weight", 0.5))
 
 # Indices of targets within the *input* feature vector (used for reconstruction)
 idx_power_inp = input_features.index("power")
-idx_soc_inp   = input_features.index("soc")
+idx_soc_inp = input_features.index("soc")
+
+print(model)
+print(cfg)
 ```
 
-    /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/model.py:45: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+    /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/src/mt4xai/model.py:46: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
       checkpoint = torch.load(path, map_location=device)
+
+
+    MultiHorizonLSTM(
+      (lstm): LSTM(12, 256, num_layers=4, batch_first=True, dropout=0.0027575414563)
+      (linear): Linear(in_features=256, out_features=5, bias=True)
+    )
+    {'device': device(type='cuda', index=0), 'input_features': ['temp', 'nominal_power', 'power', 'soc', 'progress', 'rel_power', 'd_power', 'd_soc', 'd_power_ema3', 'd_soc_ema3', 'in_taper', 'dist_to_taper'], 'target_features': ['power'], 'horizon': 5, 'alpha_h': 0.5187590357622, 'batch_size': np.int64(32), 'dropout': 0.0027575414563, 'grad_clip_norm': np.float64(5.0), 'hidden_dim': np.int64(256), 'lr': 0.000501551534, 'num_epochs': 200, 'num_layers': np.int64(4), 'weight_decay': 1.1078448e-06}
 
 
 ### 1.3 Data Preparation
@@ -128,19 +155,170 @@ SESSION_ID = 5649864  # abnormal
 # SESSION_ID = 4468530  # abnormal
 # SESSION_ID = 7554450
 # SESSION_ID = 8203265
-bundle_test = fetch_session_preds_bundle(model, test_loader, device=DEVICE, power_scaler=power_scaler, soc_scaler=soc_scaler,
-                                        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                                        batch_index=None, sample_index=None, session_id=SESSION_ID)
 
-# TEST_BATCH_IDX, TEST_SAMPLE_IDX = 300, 5   # abnormal session with large jump in the beginning
-# TEST_BATCH_IDX, TEST_SAMPLE_IDX = 300, 5   # increase batch index for longer sessions
+display(test_s.head())
+# build a SessionPredsBundle directly from the scaled test dataframe
+bundle_test = make_bundle_from_session_df(
+    model=model,
+    df_scaled=test_s,
+    sid=int(SESSION_ID),
+    device=DEVICE,
+    input_features=input_features,
+    target_features=target_features,
+    horizon=HORIZON,
+    power_scaler=power_scaler,
+    soc_scaler=soc_scaler,
+    idx_power_inp=idx_power_inp,
+    idx_soc_inp=idx_soc_inp, 
+)
 
-# bundle_test = fetch_session_preds_bundle(model, test_loader, TEST_BATCH_IDX, TEST_SAMPLE_IDX, DEVICE,
-#                                  power_scaler, soc_scaler, idx_power_inp, idx_soc_inp)
 T = bundle_test.length
 print(f"[info] test bundle -> T={T}, H={bundle_test.horizon}, session_id={bundle_test.session_id}")
-
 ```
+
+
+<div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type {
+        vertical-align: middle;
+    }
+
+    .dataframe tbody tr th {
+        vertical-align: top;
+    }
+
+    .dataframe thead th {
+        text-align: right;
+    }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>charging_id</th>
+      <th>minutes_elapsed</th>
+      <th>progress</th>
+      <th>power</th>
+      <th>rel_power</th>
+      <th>d_power</th>
+      <th>d_power_ema3</th>
+      <th>soc</th>
+      <th>d_soc</th>
+      <th>d_soc_ema3</th>
+      <th>nominal_power</th>
+      <th>charger_cat_low</th>
+      <th>charger_cat_mid</th>
+      <th>charger_cat_high</th>
+      <th>temp</th>
+      <th>in_taper</th>
+      <th>dist_to_taper</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>17906</td>
+      <td>0</td>
+      <td>0.000000</td>
+      <td>0.322828</td>
+      <td>0.480278</td>
+      <td>0.482091</td>
+      <td>0.482774</td>
+      <td>0.131313</td>
+      <td>0.1</td>
+      <td>0.034492</td>
+      <td>0.222222</td>
+      <td>0.0</td>
+      <td>1.0</td>
+      <td>0.0</td>
+      <td>0.596774</td>
+      <td>0.0</td>
+      <td>0.0</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>17906</td>
+      <td>1</td>
+      <td>0.169294</td>
+      <td>0.331977</td>
+      <td>0.493889</td>
+      <td>0.489997</td>
+      <td>0.490670</td>
+      <td>0.151515</td>
+      <td>0.3</td>
+      <td>0.195404</td>
+      <td>0.222222</td>
+      <td>0.0</td>
+      <td>1.0</td>
+      <td>0.0</td>
+      <td>0.596774</td>
+      <td>0.0</td>
+      <td>0.0</td>
+    </tr>
+    <tr>
+      <th>2</th>
+      <td>17906</td>
+      <td>2</td>
+      <td>0.268324</td>
+      <td>0.336607</td>
+      <td>0.500778</td>
+      <td>0.486092</td>
+      <td>0.490718</td>
+      <td>0.171717</td>
+      <td>0.3</td>
+      <td>0.275859</td>
+      <td>0.222222</td>
+      <td>0.0</td>
+      <td>1.0</td>
+      <td>0.0</td>
+      <td>0.596774</td>
+      <td>0.0</td>
+      <td>0.0</td>
+    </tr>
+    <tr>
+      <th>3</th>
+      <td>17906</td>
+      <td>3</td>
+      <td>0.338588</td>
+      <td>0.335972</td>
+      <td>0.499833</td>
+      <td>0.481542</td>
+      <td>0.486198</td>
+      <td>0.191919</td>
+      <td>0.3</td>
+      <td>0.316087</td>
+      <td>0.222222</td>
+      <td>0.0</td>
+      <td>1.0</td>
+      <td>0.0</td>
+      <td>0.596774</td>
+      <td>0.0</td>
+      <td>0.0</td>
+    </tr>
+    <tr>
+      <th>4</th>
+      <td>17906</td>
+      <td>4</td>
+      <td>0.393088</td>
+      <td>0.336532</td>
+      <td>0.500667</td>
+      <td>0.482575</td>
+      <td>0.484970</td>
+      <td>0.212121</td>
+      <td>0.3</td>
+      <td>0.336201</td>
+      <td>0.222222</td>
+      <td>0.0</td>
+      <td>1.0</td>
+      <td>0.0</td>
+      <td>0.596774</td>
+      <td>0.0</td>
+      <td>0.0</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
 
     [info] test bundle -> T=45, H=5, session_id=5649864
 
@@ -150,85 +328,113 @@ Runs slowly, but works better - tends to find solutions with fewer k
 
 
 ```python
-# macro-rmse params
-LAMBDA_DECAY = 0.2
-MRC_THRESHOLD = 8.5962
+T_MIN_EVAL = 1  # which time step to start evaluating predictions at
 
 # common ORS settings
 common_params = dict(
     dp_alpha=0.001, beta=3.0, gamma=0.05,
     R=5000, epsilon_mode="fraction", epsilon_value=0.3,
     dp_q=250, rdp_stage1_candidates=30,
-    t_min_eval=1, anchor_endpoints="last",
+    t_min_eval=T_MIN_EVAL, anchor_endpoints="last",
     min_k=1, max_k=15, stage2_err_metric="l2"   # "l2" (same as ORS paper) or "mrmse"
 )
 
-
 # 1) VANILLA DP (paper-faithful)
 p_vanilla = ORSParams(stage1_mode="dp", **common_params)
-res_vanilla = ors(bundle_test, model, p_vanilla,
-                                power_scaler=power_scaler, soc_scaler=soc_scaler,
-                                idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                                power_weight=POWER_WEIGHT, decay_lambda=LAMBDA_DECAY,
-                                threshold=MRC_THRESHOLD)
-print(f"[DP-vanilla] k={res_vanilla['k']}, frag={res_vanilla['frag']:.5f}, obj={res_vanilla['obj']:.5f}")
+res_vanilla = ors(
+    bundle_test,
+    model,
+    p_vanilla,
+    power_scaler=power_scaler,
+    idx_power_inp=idx_power_inp,
+    decay_lambda=LAMBDA_DECAY,
+    threshold=AD_THRESHOLD,
+)
 
+if res_vanilla is None:
+    print("[DP-vanilla] no label-preserving simplification found for this session with current params.")
+else:
+    print(f"[DP-vanilla] k={res_vanilla['k']}, frag={res_vanilla['frag']:.5f}, obj={res_vanilla['obj']:.5f}")
 ```
 
-    [DP-vanilla] k=12, frag=0.00000, obj=38.51190
+    [DP-vanilla] k=12, frag=0.00000, obj=38.50278
 
 
 
 ```python
 # 2) DP + PREFIX SUMS (slightly faster)
 p_fast = ORSParams(stage1_mode="dp_prefix", **common_params)
-res_fast = ors(bundle_test, model, p_fast,
-                             power_scaler=power_scaler, soc_scaler=soc_scaler,
-                             idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                             power_weight=POWER_WEIGHT, decay_lambda=LAMBDA_DECAY,
-                             threshold=MRC_THRESHOLD)
-print(f"[DP-prefix]  k={res_fast['k']}, frag={res_fast['frag']:.5f}, obj={res_fast['obj']:.5f}")
+res_fast = ors(
+    bundle_test,
+    model,
+    p_fast,
+    power_scaler=power_scaler,
+    idx_power_inp=idx_power_inp,
+    decay_lambda=LAMBDA_DECAY,
+    threshold=AD_THRESHOLD,
+)
+if res_fast is None:
+    print("[DP-prefix] no label-preserving simplification found for this session with current params.")
+else:
+    print(f"[DP-prefix] k={res_fast['k']}, frag={res_fast['frag']:.5f}, obj={res_fast['obj']:.5f}")
 ```
 
-    [DP-prefix]  k=12, frag=0.00000, obj=38.51190
+    [DP-prefix] k=12, frag=0.00000, obj=38.50278
 
 
 
 ```python
 # 3) RDP HEURISTIC (very fast but no guaranteed optimum)
-p_rdp = ORSParams(stage1_mode="rdp", **common_params)
-res_rdp = ors(bundle_test, model, p_rdp,
-                            power_scaler=power_scaler, soc_scaler=soc_scaler,
-                            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                            power_weight=POWER_WEIGHT, decay_lambda=LAMBDA_DECAY,
-                            threshold=MRC_THRESHOLD)
-print(f"[RDP]        k={res_rdp['k']}, frag={res_rdp['frag']:.5f}, obj={res_rdp['obj']:.5f}")
+p_rdp = ORSParams(stage1_mode="rdp", soc_stage1_mode="rdp", **common_params)
+res_rdp = ors(
+    bundle_test,
+    model,
+    p_rdp,
+    power_scaler=power_scaler,
+    idx_power_inp=idx_power_inp,
+    decay_lambda=LAMBDA_DECAY,
+    threshold=AD_THRESHOLD,
+)
+if res_rdp is None:
+    print("[RDP] no label-preserving simplification found for this session with current params.")
+else:
+    print(f"[RDP] k={res_rdp['k']}, frag={res_rdp['frag']:.5f}, obj={res_rdp['obj']:.5f}")
 ```
 
-    [RDP]        k=15, frag=0.00000, obj=48.77515
+    [RDP] k=13, frag=0.00000, obj=3009.48386
 
 
 
 ```python
-base_lbl, base_err, _ = base_label_from_bundle(bundle_test,
-    power_scaler=power_scaler, soc_scaler=soc_scaler,
-    idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-    power_weight=POWER_WEIGHT, decay_lambda=LAMBDA_DECAY,
-    t_min_eval=p_vanilla.t_min_eval, threshold=MRC_THRESHOLD)
+base_lbl, base_err, _ = base_label_from_bundle(
+    bundle_test,
+    power_scaler=power_scaler,
+    idx_power_inp=idx_power_inp, 
+    decay_lambda=LAMBDA_DECAY,
+    t_min_eval=T_MIN_EVAL, 
+    threshold=AD_THRESHOLD)
 
 for tag, res in [("DP-vanilla", res_vanilla), ("DP-prefix", res_fast), ("RDP", res_rdp)]:
     print(tag, "-> k:", res["k"], "obj:", f"{res['obj']:.5f}")
-    fig, ax = plot_raw_pred_simp_session(bundle_test, power_scaler, soc_scaler,
-        idx_power_inp, idx_soc_inp,
-        res['sts'], session_id=bundle_test.session_id,
-        k=res['k'], threshold=MRC_THRESHOLD,
-        simp_error=res['err'], orig_error=base_err, label=res['label'],
-        decay_lambda=LAMBDA_DECAY, t_min_eval=p_vanilla.t_min_eval)
+    fig, ax = plot_raw_pred_simp_session(
+        bundle_test, 
+        power_scaler,
+        idx_power_inp,
+        res['sts'], 
+        session_id=bundle_test.session_id,
+        k=res['k'], 
+        threshold=AD_THRESHOLD,
+        simp_error=res['err'], 
+        orig_error=base_err, 
+        label=res['label'],
+        decay_lambda=LAMBDA_DECAY, 
+        t_min_eval=T_MIN_EVAL
+    )
     plt.show()
 
 ```
 
-    DP-vanilla -> k: 12 obj: 38.51190
+    DP-vanilla -> k: 12 obj: 38.50278
 
 
 
@@ -237,7 +443,7 @@ for tag, res in [("DP-vanilla", res_vanilla), ("DP-prefix", res_fast), ("RDP", r
     
 
 
-    DP-prefix -> k: 12 obj: 38.51190
+    DP-prefix -> k: 12 obj: 38.50278
 
 
 
@@ -246,7 +452,7 @@ for tag, res in [("DP-vanilla", res_vanilla), ("DP-prefix", res_fast), ("RDP", r
     
 
 
-    RDP -> k: 15 obj: 48.77515
+    RDP -> k: 13 obj: 3009.48386
 
 
 
@@ -259,60 +465,100 @@ for tag, res in [("DP-vanilla", res_vanilla), ("DP-prefix", res_fast), ("RDP", r
 
 
 ```python
-# ---- 1) macro-rmse baseline (original class) ----
+# ---- macro-rmse baseline (original class) ----
 # uses same decay/threshold logic as in the AD notebook so the "original classification" is consistent
 # set these to match your chosen defaults
+from mt4xai.data import SessionPredsBundle
 T_MIN_EVAL = 2
 LAMBDA_DECAY = 0.2
 
-# compute validation/test macro-rmse and threshold (e.g., 95th percentile on validation)
 _df_val_m = compute_session_MRMSE(
-    model, val_loader, DEVICE, power_scaler, soc_scaler, POWER_WEIGHT,
-    idx_power_inp, idx_soc_inp, T_MIN_EVAL, horizon_weights_decay=LAMBDA_DECAY
+    model=model,
+    loader=val_loader,
+    device=DEVICE,
+    power_scaler=power_scaler,
+    idx_power_inp=idx_power_inp,
+    t_min_eval=T_MIN_EVAL,
+    horizon_weights_decay=LAMBDA_DECAY,
 )
-_df_test_m = compute_session_MRMSE(
-    model, test_loader, DEVICE, power_scaler, soc_scaler, POWER_WEIGHT,
-    idx_power_inp, idx_soc_inp, T_MIN_EVAL, horizon_weights_decay=LAMBDA_DECAY
-)
-MRC_THRESHOLD = percentile_threshold(np.sort(_df_val_m["error"].to_numpy()), pct_thr=95.0)
-print(MRC_THRESHOLD)
 
-_cls_test = classify_by_threshold(_df_test_m, threshold=MRC_THRESHOLD)  # adds 'label' column
-# convenience maps
+_df_test_m = compute_session_MRMSE(
+    model=model,
+    loader=test_loader,
+    device=DEVICE,
+    power_scaler=power_scaler,
+    idx_power_inp=idx_power_inp,
+    t_min_eval=T_MIN_EVAL,
+    horizon_weights_decay=LAMBDA_DECAY,
+)
+
+
+ad_threshold = percentile_threshold(np.sort(_df_val_m["error"].to_numpy()), pct_thr=AD_PCT_THRESHOLD)
+
+_cls_test = classify_by_threshold(_df_test_m, threshold=ad_threshold)
 _sid2len = dict(zip(_df_test_m["charging_id"].astype(int), _df_test_m["length"].astype(int)))
 _sid2err = dict(zip(_df_test_m["charging_id"].astype(int), _df_test_m["error"].astype(float)))
 
-# ---- 2) lightweight caches ----
-
+# ---- lightweight caches ----
 @lru_cache(maxsize=2048)
-def _bundle_for_sid(sid: int):
-    # cached bundle with stored preds; plotting + macro-rmse reuse this
-    return fetch_session_preds_bundle(
-        model, test_loader, device=DEVICE,
-        power_scaler=power_scaler, soc_scaler=soc_scaler,
-        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-        batch_index=None, sample_index=None, session_id=int(sid)
+def _bundle_for_sid(sid: int) -> SessionPredsBundle:
+    """return a cached SessionPredsBundle for a given charging session id."""
+    return make_bundle_from_session_df(
+        model=model,
+        df_scaled=test_s,
+        sid=int(sid),
+        device=DEVICE,
+        input_features=input_features,
+        target_features=target_features,
+        horizon=HORIZON,
+        power_scaler=power_scaler,
+        soc_scaler=soc_scaler,
+        idx_power_inp=idx_power_inp,
+        idx_soc_inp=idx_soc_inp,
     )
 
 @lru_cache(maxsize=1024)
-def _ors_cached(sid: int, stage1_mode: str, stage2_err_metric: str,
-                alpha: float, beta: float, gamma: float,
-                R: int, epsilon_value: float, q: int, stage1_candidates: int,
-                min_k: int, max_k: int, epsilon_mode: str = "fraction") -> dict:
-    # keep key small & hashable; bundle stays in separate cache
+def _ors_cached(
+    sid: int,
+    stage1_mode: str,
+    stage2_err_metric: str,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    R: int,
+    epsilon_value: float,
+    q: int,
+    stage1_candidates: int,
+    min_k: int,
+    max_k: int,
+    epsilon_mode: str = "fraction",
+) -> dict:
     params = ORSParams(
-        stage1_mode=stage1_mode, stage2_err_metric=stage2_err_metric,
-        dp_alpha=float(alpha), beta=float(beta), gamma=float(gamma),
-        R=int(R), epsilon_mode=epsilon_mode, epsilon_value=float(epsilon_value),
-        dp_q=int(q), rdp_stage1_candidates=int(stage1_candidates),
-        min_k=int(min_k), max_k=int(max_k), t_min_eval=T_MIN_EVAL, anchor_endpoints="last",
+        stage1_mode=stage1_mode,
+        stage2_err_metric=stage2_err_metric,
+        dp_alpha=float(alpha),
+        beta=float(beta),
+        gamma=float(gamma),
+        R=int(R),
+        epsilon_mode=epsilon_mode,
+        epsilon_value=float(epsilon_value),
+        dp_q=int(q),
+        rdp_stage1_candidates=int(stage1_candidates),
+        min_k=int(min_k),
+        max_k=int(max_k),
+        t_min_eval=T_MIN_EVAL,
+        anchor_endpoints="last",
     )
     b = _bundle_for_sid(int(sid))
-    return ors(b, model, params,
-               power_scaler=power_scaler, soc_scaler=soc_scaler,
-               idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-               power_weight=POWER_WEIGHT, decay_lambda=LAMBDA_DECAY,
-               threshold=MRC_THRESHOLD)
+    return ors(
+        b,
+        model,
+        params,
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+        decay_lambda=LAMBDA_DECAY,
+        threshold=ad_threshold,
+    )
 
 
 # --- layout + widgets for the ORS explorer ---
@@ -321,7 +567,7 @@ _FIG_W_IN = 12.0
 _FIG_DPI  = 110
 _CONTAINER_W = f"{int(_FIG_W_IN * _FIG_DPI)}px"
 
-# 1) widgets (updated ranges/steps)
+# widgets (updated ranges/steps)
 # top-left: classification
 w_class = widgets.ToggleButtons(
     options=[("Normal", "normal"), ("Abnormal", "abnormal")],
@@ -400,7 +646,7 @@ w_ncand = widgets.IntSlider(min=10, max=500, step=10, value=10, description="n_c
 box_status = widgets.HTML("")
 out_plot = widgets.Output()
 
-# 2) helper wiring (re-use your existing functions; only diffs are where we update sid_info)
+# helper wiring (re-use your existing functions; only diffs are where we update sid_info)
 
 def _filter_sids(orig_label: str, Lmin: int, Lmax: int) -> list[int]:
     df = _cls_test[_cls_test["label"] == orig_label].copy()
@@ -472,22 +718,22 @@ def _reset_filters(_btn=None):
     w_class.value = "abnormal"
     w_len.value = (8, 60)
     w_stage1.value = "dp_prefix"
-    w_alpha.value = 0.01
-    w_beta.value = 3.0
+    w_alpha.value = 0.0075
+    w_beta.value = 4.0
     w_gamma.value = 0.05
     w_eps.value = 0.2
-    w_R.value = 2000
+    w_R.value = 1000
     w_q.value = 150
     w_k.value = (1, 15)
     w_ncand.value = 30
-    w_metric.value = "l2"
+    w_metric.value = "rmse"
     _refresh_sid_list()
 w_reset.on_click(_reset_filters)
 
 # call once to populate
 _refresh_sid_list()
 
-# 3) compute callback (unchanged except layout refs)
+# computes callback (unchanged except layout refs)
 def _on_compute(_btn):
     sid = _sid_from_controls()
     out_plot.clear_output()
@@ -535,21 +781,30 @@ def _on_compute(_btn):
     # base label/error for title/caption
     b = _bundle_for_sid(int(sid))
     base_lbl, base_err, _ = base_label_from_bundle(
-        b, power_scaler=power_scaler, soc_scaler=soc_scaler,
-        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-        power_weight=POWER_WEIGHT, decay_lambda=LAMBDA_DECAY,
-        t_min_eval=T_MIN_EVAL, threshold=MRC_THRESHOLD
+        b, power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp, 
+        decay_lambda=LAMBDA_DECAY,
+        t_min_eval=T_MIN_EVAL, 
+        threshold=ad_threshold
     )
 
     # draw plot
     with out_plot:
         clear_output(wait=True)
         fig, ax = plot_raw_pred_simp_session(
-            b, power_scaler, soc_scaler, idx_power_inp, idx_soc_inp,
-            res["sts"], session_id=int(sid),
-            k=res["k"], threshold=MRC_THRESHOLD,
-            simp_error=res["err"], orig_error=base_err,
-            label=res["label"], decay_lambda=LAMBDA_DECAY, t_min_eval=T_MIN_EVAL
+            b,
+            power_scaler,
+            idx_power_inp,
+            simpl_power_unscaled=res["sts"],
+            simpl_soc_unscaled=res.get("sts_soc"),
+            session_id=int(sid),
+            k=res["k"],
+            threshold=ad_threshold,
+            simp_error=res["err"],
+            orig_error=base_err,
+            label=res["label"],
+            decay_lambda=LAMBDA_DECAY,
+            t_min_eval=T_MIN_EVAL,
         )
         plt.show()
         print(f"Simplicity (k): {res['k']} segments")
@@ -565,17 +820,17 @@ w_compute.on_click(_on_compute)
 _sp1 = widgets.Label(value="")
 _sp2 = widgets.Label(value="")
 
-# 4) grid layout (4x4) + full-width status & plot
+# grid layout (4x4) + full-width status & plot
 grid = widgets.GridBox(
     children=[
         # row1
-        w_class,        w_index,   w_alpha,  w_eps,
+        w_class, w_index, w_alpha, w_eps,
         # row2
-        w_stage1,       w_sid_box, w_beta,   w_ncand,
+        w_stage1,w_sid_box, w_beta, w_ncand,
         # row3
-        w_metric,       w_len,     w_gamma,  w_q,
+        w_metric, w_len, w_gamma, w_q,
         # row4
-        _sp1,      _sp2,   w_k,      w_R,
+        _sp1, _sp2, w_k, w_R,
     ],
     layout=Layout(
         width=_CONTAINER_W,
@@ -597,11 +852,7 @@ ui = widgets.VBox(
 )
 
 display(ui)
-
 ```
-
-    8.9938
-
 
 
     VBox(children=(GridBox(children=(ToggleButtons(description='Classification', index=1, options=(('Normal', 'nor…

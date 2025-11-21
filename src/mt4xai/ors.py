@@ -11,12 +11,12 @@ from typing import Literal, Optional, List, Tuple, Dict, Iterable
 import heapq
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
 import torch
 from rdp import rdp
 
-from mt4xai.data import SessionPredsBundle
-from .data import reconstruct_abs_from_bundle
-from .inference import inverse_targets_np, predict_residuals, reconstruct_abs_from_residuals_batch
+from .data import reconstruct_abs_from_bundle, SessionPredsBundle
+from .inference import predict_residuals
 
 
 
@@ -77,118 +77,230 @@ class ORSOutcome:
     objective: float
 
 
-# ----------------------------------------- macro-rmse classifier -------------------------------------- #
+# ----------------------------------------- macro-rmse / predictions -------------------------------------- #
+# TODO: Move these to inference.py 
 
-def build_true_abs_from_series(power_true: np.ndarray, soc_true: np.ndarray, H: int) -> np.ndarray:
-    """Build absolute targets Y_abs[t,h,c] aligned with horizon h in original units."""
+def build_true_abs_from_series(power_true: np.ndarray, H: int) -> np.ndarray:
+    """build absolute targets Y_abs[t, h] aligned with horizon h in original units.
+
+    for each horizon h (1-based), Y_abs[t, h-1] corresponds to the true power
+    at time t + h. entries beyond the available range are left at zero and
+    do not contribute to macro-RMSE once t_min_eval is applied.
+
+    args:
+        power_true: [T] array of true power values in kW.
+        H: prediction horizon (number of steps ahead).
+
+    returns:
+        Y_abs: [T, H] array of absolute targets.
+    """
     T = power_true.size
-    Y = np.zeros((T, H, 2), dtype=float)
+    Y = np.zeros((T, H), dtype=float)
     for h0 in range(H):
         h1 = h0 + 1
         end = T - h1
         if end <= 0:
             break
-        Y[:end, h0, 0] = power_true[h1:h1+end]
-        Y[:end, h0, 1] = soc_true[h1:h1+end]
+        Y[:end, h0] = power_true[h1 : h1 + end]
     return Y
 
 
-def macro_rmse_from_abs(P_abs: np.ndarray, Y_abs: np.ndarray, power_weight: float,
-                        decay_lambda: float, t_min_eval: int) -> float:
-    """Compute macro-RMSE across horizons with exponential decay, in original units."""
-    T, H, _ = P_abs.shape
+def macro_rmse_from_abs(
+    P_abs: np.ndarray,
+    Y_abs: np.ndarray,
+    decay_lambda: float,
+    t_min_eval: int,
+) -> float:
+    """computes macro-RMSE across horizons with exponential decay, in original units.
+
+    supports both single-channel and multi-channel targets:
+
+      - if P_abs has shape [T, H], it is treated as a single channel.
+      - if P_abs has shape [T, H, C], errors are aggregated over channels.
+
+    args:
+        P_abs: absolute predictions [T, H] or [T, H, C].
+        Y_abs: absolute targets with the same shape.
+        decay_lambda: non-negative decay parameter λ for horizon weights.
+        t_min_eval: minimum time index (inclusive) from which errors contribute.
+
+    returns:
+        scalar macro-RMSE value aggregated over horizons.
+    """
+    if P_abs.ndim == 2:
+        P = P_abs[..., np.newaxis]
+        Y = Y_abs[..., np.newaxis]
+    elif P_abs.ndim == 3:
+        P, Y = P_abs, Y_abs
+    else:
+        raise ValueError(
+            f"P_abs and Y_abs must have shape (T, H) or (T, H, C), got {P_abs.shape}"
+        )
+
+    T, H, _ = P.shape
+
+    # horizon weights w_h ∝ exp(-λ h)
     w_h = np.exp(-float(decay_lambda) * np.arange(H, dtype=float))
     w_h = w_h / np.sum(w_h)
-    vals: List[float] = []
+
+    vals: list[float] = []
     for h in range(H):
         end = T - (h + 1)
         if end <= t_min_eval:
             continue
-        diff = P_abs[t_min_eval:end, h, :] - Y_abs[t_min_eval:end, h, :]
-        rmse_c = np.sqrt(np.mean(diff**2, axis=0))
-        vals.append(power_weight * rmse_c[0] + (1.0 - power_weight) * rmse_c[1])
+
+        diff = P[t_min_eval:end, h, :] - Y[t_min_eval:end, h, :]
+        rmse_h = float(np.sqrt(np.mean(diff**2)))
+        vals.append(rmse_h)
+
     if not vals:
         return 0.0
-    return float(np.sum(np.asarray(vals) * w_h[:len(vals)]))
+
+    vals_arr = np.asarray(vals, dtype=float)
+    return float(np.sum(vals_arr * w_h[: len(vals_arr)]))
 
 
 @torch.inference_mode()
-def macro_rmse_for_power_batch(bundle,
-                               model: torch.nn.Module,
-                               power_batch_kw: np.ndarray,
-                               *,
-                               power_scaler,
-                               soc_scaler,
-                               idx_power_inp: int,
-                               idx_soc_inp: int,
-                               power_weight: float,
-                               decay_lambda: float,
-                               t_min_eval: int,
-                               Y_abs_true: np.ndarray) -> np.ndarray:
-    """Run a batched forward pass for perturbed power series and return macro-RMSE per perturbation."""
+def macro_rmse_for_power_batch(
+    bundle: SessionPredsBundle,
+    model: torch.nn.Module,
+    power_batch_kw: np.ndarray,
+    *,
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    decay_lambda: float,
+    t_min_eval: int,
+    Y_abs_true: np.ndarray,
+) -> np.ndarray:
+    """run a batched forward pass for perturbed power series and return macro-RMSE per perturbation.
+
+    args:
+        bundle: reference SessionPredsBundle (provides X_sample, length, horizon).
+        model: trained residual forecaster.
+        power_batch_kw: [R, T] batch of perturbed absolute power curves in kW.
+        power_scaler: scaler for power (for inverse transform).
+        idx_power_inp: index of power feature in X_sample.
+        decay_lambda: macro-RMSE horizon decay parameter.
+        t_min_eval: minimum time index from which errors contribute.
+        Y_abs_true: [T, H] absolute target path built from the *original* power series.
+
+    returns:
+        errs: [R] macro-RMSE values for each perturbed curve.
+    """
     T = bundle.length
-    R = power_batch_kw.shape[0]
-    X_base = bundle.X_sample.clone()                              # (T, F) scaled
+    R, T_in = power_batch_kw.shape
+    if T_in != T:
+        raise ValueError(f"power_batch_kw has T={T_in}, expected {T}")
+
+    # build scaled input batch with perturbed power
+    X_base = bundle.X_sample.clone()  # [T, F] scaled
     p_scaled = power_scaler.transform(power_batch_kw.reshape(-1, 1)).reshape(R, T)
-    Xs = X_base.unsqueeze(0).repeat(R, 1, 1).contiguous()         # (R, T, F)
+    Xs = X_base.unsqueeze(0).repeat(R, 1, 1).contiguous()  # [R, T, F]
     Xs[:, :, idx_power_inp] = torch.from_numpy(p_scaled.astype(np.float32)).to(Xs)
 
-    lengths = torch.tensor([T] * R, dtype=torch.long)
+    lengths = torch.full((R,), T, dtype=torch.long)
     device = next(model.parameters()).device
-    P_res = predict_residuals(model, Xs.to(device), lengths, device=device)                     # (R, T, H, C)
-    P_abs_scaled = reconstruct_abs_from_residuals_batch(Xs, P_res, idx_power_inp, idx_soc_inp)  # (R,T,H,2)
-    P_abs = inverse_targets_np(P_abs_scaled.cpu().numpy(), power_scaler, soc_scaler)            # (R, T, H, 2)
+    P_res = predict_residuals(model, Xs.to(device), lengths, device=device)  # [R, T, H, 1]
+
+    # reconstructs the absolute kW predictions
+    # we reuse the bundle logic but now in batched form
+    P_abs = []
+    for r in range(R):
+        b_tmp = SessionPredsBundle(
+            X_sample=Xs[r].detach().cpu(),
+            P_sample=P_res[r].detach().cpu(),
+            Y_sample=bundle.Y_sample, # targets do not depend on perturbation
+            length=bundle.length,
+            horizon=bundle.horizon,
+            session_id=bundle.session_id,
+            true_power_unscaled=bundle.true_power_unscaled,
+            true_soc_unscaled=bundle.true_soc_unscaled,
+            batch_index=bundle.batch_index,
+            sample_index=bundle.sample_index,
+            num_targets=bundle.num_targets,
+        )
+        P_r, _ = reconstruct_abs_from_bundle(
+            bundle=b_tmp,
+            power_scaler=power_scaler,
+            idx_power_inp=idx_power_inp,
+        )
+        # P_r is [T, H] or [T, H, C], so take power channel if needed
+        P_abs.append(P_r[..., 0] if P_r.ndim == 3 else P_r)
+
+    P_abs_arr = np.stack(P_abs, axis=0)  # [R, T, H]
 
     errs = np.zeros(R, dtype=float)
     for r in range(R):
-        errs[r] = macro_rmse_from_abs(P_abs[r], Y_abs_true, power_weight, decay_lambda, t_min_eval)
+        errs[r] = macro_rmse_from_abs(
+            P_abs_arr[r], Y_abs_true, decay_lambda=decay_lambda, t_min_eval=t_min_eval
+        )
     return errs
 
 
-def classify_macro_rmse_from_power(bundle,
-                                   model: torch.nn.Module,
-                                   power_kw: np.ndarray,
-                                   *,
-                                   power_scaler,
-                                   soc_scaler,
-                                   idx_power_inp: int,
-                                   idx_soc_inp: int,
-                                   power_weight: float,
-                                   decay_lambda: float,
-                                   t_min_eval: int,
-                                   Y_abs_true: np.ndarray,
-                                   threshold: float) -> Tuple[int, float]:
-    """Classify a power curve by macro-RMSE threshold; return (label_int, err)."""
-    errs = macro_rmse_for_power_batch(bundle, model, power_kw[None, :],
-                                      power_scaler=power_scaler, soc_scaler=soc_scaler,
-                                      idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                                      power_weight=power_weight, decay_lambda=decay_lambda,
-                                      t_min_eval=t_min_eval, Y_abs_true=Y_abs_true)
+def classify_macro_rmse_from_power(
+    bundle: SessionPredsBundle,
+    model: torch.nn.Module,
+    power_kw: np.ndarray,
+    *,
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    decay_lambda: float,
+    t_min_eval: int,
+    Y_abs_true: np.ndarray,
+    threshold: float,
+) -> Tuple[int, float]:
+    """classify a power curve by macro-RMSE threshold; return (label_int, err).
+    label_int is 1 for "abnormal" and 0 for "normal".
+    """
+    errs = macro_rmse_for_power_batch(
+        bundle,
+        model,
+        power_kw[None, :],
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+        decay_lambda=decay_lambda,
+        t_min_eval=t_min_eval,
+        Y_abs_true=Y_abs_true,
+    )
     err = float(errs[0])
     return (1 if err > float(threshold) else 0), err
 
 
-def base_label_from_bundle(bundle,
-                           *,
-                           power_scaler,
-                           soc_scaler,
-                           idx_power_inp: int,
-                           idx_soc_inp: int,
-                           power_weight: float,
-                           decay_lambda: float,
-                           t_min_eval: int,
-                           threshold: float) -> Tuple[int, float, np.ndarray]:
-    """Obtain base label+error of the unmodified session using stored predictions."""
-    power_true = np.asarray(bundle.true_power_unscaled, dtype=float)
-    soc_true = np.asarray(bundle.true_soc_unscaled, dtype=float)
-    Y_abs_true = build_true_abs_from_series(power_true, soc_true, bundle.horizon)
+def base_label_from_bundle(
+    bundle: SessionPredsBundle,
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    decay_lambda: float,
+    t_min_eval: int,
+    threshold: float,
+) -> tuple[str, float, np.ndarray]:
+    """computes baseline macro-RMSE and label for an unperturbed session bundle.
 
-    P_abs_scaled = reconstruct_abs_from_bundle(bundle, idx_power_inp, idx_soc_inp).numpy()
-    P_abs = inverse_targets_np(P_abs_scaled, power_scaler, soc_scaler)
+    it reconstructs absolute predictions and targets from the residual forecasts,
+    computes macro-RMSE with exponential horizon decay, then classifies the session
+    as normal or abnormal by comparing the error to a fixed threshold.
 
-    err = macro_rmse_from_abs(P_abs, Y_abs_true, power_weight, decay_lambda, t_min_eval)
-    lbl = 1 if err > float(threshold) else 0
-    return lbl, err, Y_abs_true
+    returns:
+        label: "normal" or "abnormal" based on the threshold.
+        err: macro-RMSE for the original (unsimplified) session.
+        Y_abs_true: [T, H] absolute target path for reuse in ORS.
+    """
+    # reconstruct absolute predictions and targets
+    P_abs, Y_abs = reconstruct_abs_from_bundle(
+        bundle=bundle,
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+    )
+
+    # flatten to [T, H] for power-only targets
+    P_pow = P_abs[..., 0]
+    Y_pow = Y_abs[..., 0]
+
+    err = macro_rmse_from_abs(P_pow, Y_pow, decay_lambda=decay_lambda, t_min_eval=t_min_eval)
+    label = "abnormal" if err >= float(threshold) else "normal"
+
+    # reuse targets as ground truth for perturbation-based evaluation
+    return label, err, Y_pow
 
 
 # ----------------------------------------- stage-1: dp and rdp ---------------------------------------- #
@@ -570,41 +682,50 @@ def interpolate_batch_from_pivots(
     return out
 
 
-
-def fragility_uniform_band_batched(bundle,
-                                   model: torch.nn.Module,
-                                   pivots: np.ndarray,
-                                   sts_y: np.ndarray,
-                                   *,
-                                   R: int,
-                                   eps: float,
-                                   base_label: int,
-                                   power_scaler,
-                                   soc_scaler,
-                                   idx_power_inp: int,
-                                   idx_soc_inp: int,
-                                   power_weight: float,
-                                   decay_lambda: float,
-                                   t_min_eval: int,
-                                   anchor_endpoints: Literal["both", "last"] = "last",
-                                   Y_abs_true: np.ndarray,
-                                   threshold: float,
-                                   seed: Optional[int]) -> float:
-    """Estimate fragility by sampling uniform ±epsilon at pivot values and reclassifying."""
+def fragility_uniform_band_batched(
+    bundle: SessionPredsBundle,
+    model: torch.nn.Module,
+    pivots: np.ndarray,
+    sts_y: np.ndarray,
+    *,
+    R: int,
+    eps: float,
+    base_label: int,
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    decay_lambda: float,
+    t_min_eval: int,
+    anchor_endpoints: Literal["both", "last"] = "last",
+    Y_abs_true: np.ndarray,
+    threshold: float,
+    seed: Optional[int],
+) -> float:
+    """estimate fragility by sampling uniform ±epsilon at pivot values and reclassifying."""
     rng = np.random.default_rng(seed)
     k = len(pivots) - 1
     T = sts_y.size
+
     pv = sts_y[pivots].astype(float)                                # (k+1,)
     noise = rng.uniform(-eps, +eps, size=(R, k + 1)).astype(float)  # (R, k+1)
     pv_batch = pv[None, :] + noise                                  # (R, k+1)
-    power_batch = interpolate_batch_from_pivots(T, pivots, pv_batch, 
-                                                t_min_eval=t_min_eval, anchor_endpoints=anchor_endpoints)  # (R, T)
+    power_batch = interpolate_batch_from_pivots(
+        T,
+        pivots,
+        pv_batch,
+        t_min_eval=t_min_eval,
+        anchor_endpoints=anchor_endpoints,
+    )  # (R, T)
 
-    errs = macro_rmse_for_power_batch(bundle, model, power_batch,
-                                      power_scaler=power_scaler, soc_scaler=soc_scaler,
-                                      idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                                      power_weight=power_weight, decay_lambda=decay_lambda,
-                                      t_min_eval=t_min_eval, Y_abs_true=Y_abs_true)
+    errs = macro_rmse_for_power_batch(
+        bundle,
+        model,
+        power_batch,
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+        decay_lambda=decay_lambda,
+        t_min_eval=t_min_eval,
+        Y_abs_true=Y_abs_true,
+    )
     labels = (errs > float(threshold)).astype(int)
     flips = np.count_nonzero(labels != int(base_label))
     return float(flips) / float(R)
@@ -644,10 +765,7 @@ def ors(bundle: SessionPredsBundle,
         params: ORSParams,
         *,
         power_scaler,
-        soc_scaler,
         idx_power_inp: int,
-        idx_soc_inp: int,
-        power_weight: float=1.0,  # set this to x in [0.0, 1.0) if model prediction targets are multivariate, 1.0 if univariate
         decay_lambda: float,
         threshold: float) -> Optional[Dict]:
     """Run ORS end-to-end with fallbacks, keeping the label-consistency constraint.
@@ -672,7 +790,6 @@ def ors(bundle: SessionPredsBundle,
       params: ORSParams configuration.
       power_scaler, soc_scaler: scalers for inverse transforms.
       idx_power_inp, idx_soc_inp: column indices in X for power/SOC.
-      power_weight, decay_lambda, threshold: macro-RMSE configuration.
 
     Returns:
       dict with keys {obj,k,piv,sts,frag,err,label} on success; None if no valid candidate. 
@@ -714,13 +831,16 @@ def ors(bundle: SessionPredsBundle,
         return _with_soc(dict(obj=0.0, k=1, piv=piv, sts=sts, frag=0.0, err=0.0, label="normal"))
 
     # base label on original series
-    base_lbl, base_err, Y_abs_true = base_label_from_bundle(
+    base_lbl_str, base_err, Y_abs_true = base_label_from_bundle(
         bundle,
-        power_scaler=power_scaler, soc_scaler=soc_scaler,
-        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-        power_weight=power_weight, decay_lambda=decay_lambda,
-        t_min_eval=params.t_min_eval, threshold=threshold
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+        decay_lambda=decay_lambda,
+        t_min_eval=params.t_min_eval,
+        threshold=threshold,
     )
+    # internal numeric label: 1 = abnormal, 0 = normal
+    base_lbl = 1 if base_lbl_str == "abnormal" else 0
 
     # epsilon for robustness sampling
     eps = _epsilon_from_range(y_min, y_max, params)
@@ -734,56 +854,80 @@ def ors(bundle: SessionPredsBundle,
                   f"consider increasing dp_q or reducing gamma.")
 
     def evaluate_candidates(cands_list: List[Tuple[float, np.ndarray]], p: ORSParams) -> Optional[Dict]:
-        """Evaluate Stage-1 candidates under constraints; return best dict or None."""
+        """evaluate stage-1 candidates under constraints; return best dict or None."""
         best: Optional[Dict] = None
         for cost_es, piv in cands_list:
-            k = int(len(piv) - 1)  # calculate k = number of pivots in pivot set -1
+            k = int(len(piv) - 1)
             if k < int(p.min_k) or k > int(p.max_k):
                 continue
 
-            sts = interpolate_from_pivots(T, piv, y[piv], t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints)
+            sts = interpolate_from_pivots(
+                T, piv, y[piv], t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints
+            )
             l2_err = float(np.sum((y - sts) ** 2))
 
             lbl_sts, err_sts = classify_macro_rmse_from_power(
-                bundle, model, sts,
-                power_scaler=power_scaler, soc_scaler=soc_scaler,
-                idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                power_weight=power_weight, decay_lambda=decay_lambda,
-                t_min_eval=p.t_min_eval, Y_abs_true=Y_abs_true, threshold=threshold
+                bundle,
+                model,
+                sts,
+                power_scaler=power_scaler,
+                idx_power_inp=idx_power_inp,
+                decay_lambda=decay_lambda,
+                t_min_eval=p.t_min_eval,
+                Y_abs_true=Y_abs_true,
+                threshold=threshold,
             )
-            if lbl_sts != base_lbl:
-                continue  # keeps the label-consistency constraint
+
+            # enforces label-consistency. keep only simplifications that preserve the base label
+            if int(lbl_sts) != base_lbl:
+                continue
 
             frag = fragility_uniform_band_batched(
-                bundle, model, pivots=piv, sts_y=sts, R=p.R, eps=eps, base_label=base_lbl,
-                power_scaler=power_scaler, soc_scaler=soc_scaler,
-                idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-                power_weight=power_weight, decay_lambda=decay_lambda,
-                t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints, 
-                Y_abs_true=Y_abs_true, threshold=threshold,
-                seed=p.random_seed
+                bundle,
+                model,
+                pivots=piv,
+                sts_y=sts,
+                R=p.R,
+                eps=eps,
+                base_label=base_lbl,  # int: 0 or 1
+                power_scaler=power_scaler,
+                idx_power_inp=idx_power_inp,
+                decay_lambda=decay_lambda,
+                t_min_eval=p.t_min_eval,
+                anchor_endpoints=p.anchor_endpoints,
+                Y_abs_true=Y_abs_true,
+                threshold=threshold,
+                seed=p.random_seed,
             )
 
-            # Stage-1 cost_es is:
-            #  - DP: dp_alpha*l2 + beta*k
-            #  - RDP: l2 + beta*k 
-            # Stage-2 adds gamma*frag
+            # stage-1 cost_es is:
+            #  - dp: dp_alpha*l2_err + beta*k
+            #  - rdp: l2_err + beta*k
+            # stage-2 adds gamma*frag
             total = float(cost_es + p.gamma * frag)
-
+            robust_prob=1.0 - frag
             cand = dict(
-                obj=total, k=k, piv=piv, sts=sts, frag=float(frag),
-                err=float(err_sts), label=("abnormal" if lbl_sts == 1 else "normal")
+                obj=total,
+                k=k,
+                piv=piv,
+                sts=sts,
+                frag=float(frag),
+                robust_prob=robust_prob,
+                err=float(err_sts),
+                label=("abnormal" if lbl_sts == 1 else "normal"),
+                l2_err=l2_err,
             )
             if (best is None) or (cand["obj"] < best["obj"]):
                 best = cand
         return best
 
-    # ----- evaluate initial candidates -----
+
+    # ------ evaluate initial candidates ------ #
     best = evaluate_candidates(cands, params)
     if best is not None:
         return _with_soc(best)
 
-    # ----- Fallback #1: log + rerun with dp_q*2 (if DP) and beta*4 -----
+    # ----- Fallback #1: log + rerun with dp_q*2 (if DP) and beta*4 ----- #
     k_min, k_max = _k_span(cands)
     print(f"[ORS][warn] sid={sid} no valid candidates after constraints "
           f"(mode={params.stage1_mode}, k_span={k_min}..{k_max}, dp_q={params.dp_q}, beta={params.beta}). "
@@ -801,7 +945,7 @@ def ors(bundle: SessionPredsBundle,
         if best is not None:
             return _with_soc(best)
 
-    # ----- Fallback #2: switch to RDP with large stage1_candidates -----
+    # ----- Fallback #2: switch to RDP with large stage1_candidates ----- #
     k_min1, k_max1 = _k_span(cands1 or [])
     print(f"[ORS][warn] sid={sid} still no valid candidates "
           f"(fb#1 k_span={k_min1}..{k_max1}, dp_q={getattr(p_fb1, 'dp_q', None)}, beta={p_fb1.beta}). "

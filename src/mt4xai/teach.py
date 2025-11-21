@@ -17,15 +17,14 @@ import pandas as pd
 from scipy.signal import find_peaks, peak_prominences, peak_widths
 import matplotlib.pyplot as plt
 import sklearn
+from sklearn.preprocessing import MinMaxScaler
 import torch
 from IPython.display import display
 
-# ---- mt4xai project modules ----
-from .ors import ORSParams, ors, build_true_abs_from_series, macro_rmse_from_abs
-from .inference import predict_residuals, inverse_targets_np, reconstruct_abs_from_residuals_batch
-from .data import fetch_charging_session, ChargingSession, ChargingSessionSimplification
-from .model import load_lstm_model
-
+# mt4xai project modules
+from .ors import ORSParams, ors
+from .inference import compute_session_MRMSE, classify_by_threshold, make_bundle_from_session_df
+from .data import fetch_charging_session, ChargingSession, ChargingSessionSimplification, SessionPredsBundle
 
 # ----------------- Teaching Pool ------------------------- #
 
@@ -51,17 +50,19 @@ class TeachingPool:
     meta: dict = field(default_factory=dict)
     config: TeachingPoolConfig = None
 
+
     @classmethod
     def construct_from_cfg(
         cls,
         model: torch.nn.Module | None,
         *,
         config: TeachingPoolConfig,
-        test_loader: torch.utils.data.DataLoader,
+        loader: torch.utils.data.DataLoader,
         power_scaler: sklearn.preprocessing.MinMaxScaler,
         soc_scaler: sklearn.preprocessing.MinMaxScaler,
         idx_power_inp: int,
         idx_soc_inp: int,
+        df_scaled: pd.DataFrame | None = None,
     ) -> "TeachingPool":
         """Constructs the teaching pool on disk and returns a loaded `TeachingPool`.
 
@@ -70,309 +71,445 @@ class TeachingPool:
         snapshot, then loads the Parquet into memory and wires up paths/metadata.
 
         Args:
-            model: Forecasting model (LSTM). If None, a loader inside `build` loads it from `config.model_path`.
+            model: Forecasting model (LSTM). If None, a loader inside `build` loads it
+                from ``config.model_path`.
             config: TeachingPoolConfig controlling thresholds, dirs and ORS params.
-            test_loader: DataLoader for the test set sessions.
+            loader: DataLoader for the charging sessions.
             power_scaler: Fitted scaler for the power channel (inverse-transform).
             soc_scaler: Fitted scaler for the SOC channel (inverse-transform).
             idx_power_inp: Index of the power feature in the input tensor.
             idx_soc_inp: Index of the SOC feature in the input tensor.
-
+            df_scaled: Optional scaled long-format DataFrame for the dataset. If not provided, the
+                method attempts to read `loader.dataset.df`.
         Returns:
-            TeachingPool: a ready-to-use pool object with `pool_df` loaded and standard `paths` initialised.
+            TeachingPool: a ready-to-use pool object with `pool_df` loaded and
+            standard `paths` initialised.
         """
+
         # build artefacts to disk
         cls.build(
             model=model,
             config=config,
-            test_loader=test_loader,
+            loader=loader,
             power_scaler=power_scaler,
             soc_scaler=soc_scaler,
             idx_power_inp=idx_power_inp,
             idx_soc_inp=idx_soc_inp,
+            df_scaled=df_scaled,
         )
 
         # load snapshot
-        root = Path(config.output_dir)
-        pool_parquet = root / "pool.parquet"
+        out_root = Path(config.output_dir)
+        pool_parquet = out_root / "pool.parquet"
         pool_df = pd.read_parquet(pool_parquet)
 
         paths = {
-            "root": root,
+            "root": out_root,
             "pool_parquet": pool_parquet,
-            "cache_sqlite": root / "pool_cache.db",
-            "sample_plan": root / "sampled_normals.json",
+            "cache_sqlite": out_root / "pool.sqlite",
+            "sample_plan": out_root / "sampled_normals.json",
         }
+
         meta = {
-            "model_id": Path(config.model_path).name,
-            "threshold": config.ad_threshold,
-            "random_seed": config.random_seed,
-            "timestamp": int(time.time()),
+            "model_id": getattr(config, "model_id", None),
+            "threshold": float(config.ad_threshold),
+            "random_seed": int(config.random_seed),
+            "timestamp": time.time(),
         }
-        return cls(pool_df=pool_df, paths=paths, meta=meta, config=config)
+
+        tp = cls()
+        tp.pool_df = pool_df
+        tp.paths = paths
+        tp.meta = meta
+        tp.config = config
+
+        return tp
+
 
     @classmethod
     def load_from_parquet(
-        cls, 
-        pool_parquet: str | Path, *, 
-        root_dir: str | Path | None = None, 
-        config: Optional[TeachingPoolConfig] = None
+        cls,
+        pool_parquet: str | Path, *,
+        root_dir: str | Path | None = None,
+        config: Optional["TeachingPoolConfig"] = None
     ) -> "TeachingPool":
         """Loads a pool from an existing Parquet snapshot.
-        Args: 
-            config: Pass in the config to set the optional TeachingPool.config attr"""
+
+        Args:
+            pool_parquet: Path to pool.parquet.
+            root_dir: Optional override for the root directory that holds cache/artefacts.
+            config: Optional config to attach to the returned object.
+
+        Returns:
+            TeachingPool with pool_df loaded and standard paths initialised.
+        """
         pq = Path(pool_parquet)
-        root = Path(root_dir) if root_dir is not None else pq.parent
+        out_root = Path(root_dir) if root_dir is not None else pq.parent
         pool_df = pd.read_parquet(pq)
+
         paths = {
-            "root": root,
+            "root": out_root,
             "pool_parquet": pq,
-            "cache_sqlite": root / "pool_cache.db",
-            "sample_plan": root / "sampled_normals.json",
+            "cache_sqlite": out_root / "pool.sqlite",
+            "sample_plan": out_root / "sampled_normals.json",
+            "power_raw": out_root / "power_raw",
+            "soc_raw": out_root / "soc_raw",
+            "power_piv": out_root / "power_pivots",
+            "power_sts": out_root / "power_sts",
+            "soc_piv": out_root / "soc_pivots",
+            "soc_sts": out_root / "soc_sts",
         }
         return cls(pool_df=pool_df, paths=paths, meta={}, config=config)
 
-    # ---------- building (moved from free function) ----------
 
     @classmethod
     def build(
         cls,
-        model: torch.nn.Module | None,
+        model: torch.nn.Module,
         config: "TeachingPoolConfig",
-        test_loader: torch.utils.data.DataLoader,
-        power_scaler: sklearn.preprocessing.MinMaxScaler,
-        soc_scaler: sklearn.preprocessing.MinMaxScaler,
+        loader: torch.utils.data.DataLoader,
+        power_scaler: MinMaxScaler,
+        soc_scaler: MinMaxScaler,
         idx_power_inp: int,
         idx_soc_inp: int,
+        df_scaled: pd.DataFrame | None = None,
     ) -> None:
-        """Builds and caches the ORS teaching pool used in the MT4XAI pipeline.
+        """Builds the teaching pool on disk (SQLite + Parquet + .npy artefacts).
 
-        Writes:
-            - SQLite cache (`pool_cache.db`) with metadata and embeddings.
-            - Parquet snapshot (`pool.parquet`) for downstream analysis.
-            - Sampling plan (`sampled_normals.json`).
-            - JSON config with provenance.
+        This method mirrors the anomaly-detection and curve-simplification notebooks:
+        it constructs SessionPredsBundle objects with ``make_bundle_from_session_df``
+        and passes them to ``ors(...)``, which reconstructs absolute predictions
+        internally from residuals.
 
-        Raises:
-            RuntimeError: If SOC is missing/invalid when saving raw SOC arrays.
-            ValueError: If not enough normal sessions are available to match abnormals.
+        Steps:
+          1. Computes base macro-RMSE labels on the whole val set (teach) / test set (exam).
+          2. Samples all abnormals + an equal number of normals.
+          3. For each sampled session id:
+             - builds a SessionPredsBundle,
+             - clamps ORS parameters to the session length,
+             - runs ORS to obtain power and optional SOC simplifications,
+             - saves raw power/SOC curves and knot arrays to disk,
+             - upserts a row into the SQLite cache.
+          4. Periodically exports a Parquet snapshot and writes build metadata.
         """
-        if model is None:
-            model, ckpt = load_lstm_model(config.model_path, device=config.device)
-            model.eval()
-            cfg_model = ckpt["config"]
-            config.power_weight = float(cfg_model.get("power_weight", config.power_weight))
-            config.decay_lambda = float(cfg_model.get("decay_lambda", config.decay_lambda))
-            print(f"[teach] loaded model config: \n{config}")
-
-        dirs = cls.ensure_dirs(Path(config.output_dir))
-        db_path = dirs["root"] / "pool_cache.db"
-        conn = cls.db_connect(db_path)
-        cls.create_main_table(conn)
-
-        sp_json = dirs["root"] / "sampled_normals.json"
-        if sp_json.exists():
-            plan = json.loads(sp_json.read_text())
-            abn_ids = plan.get("abnormal", [])
-            norm_ids_sampled = plan.get("normal", [])
-            print(f"[teach] loaded existing sampling plan: abnormal={len(abn_ids)}, normal={len(norm_ids_sampled)}")
-        else:
-            print("[teach] computing base labels on test set ...")
-            abn_ids, norm_ids, err_by_id = cls.compute_base_labels(
-                test_loader,
-                model,
-                config.device,
-                power_scaler=power_scaler,
-                soc_scaler=soc_scaler,
-                idx_power_inp=idx_power_inp,
-                idx_soc_inp=idx_soc_inp,
-                power_weight=config.power_weight,
-                decay_lambda=config.decay_lambda,
-                t_min_eval=config.ors_params.t_min_eval,
-                threshold=config.ad_threshold,
-            )
-            # quick diagnostic: run inside TeachingPool.build just after compute_base_labels(...) returns
-            q = np.quantile(np.fromiter(err_by_id.values(), dtype=float), [0.5, 0.8, 0.9, 0.95, 0.99])
-            print(f"[sanity] Macro-RMSE quantiles now (pw={config.power_weight}, λ={config.decay_lambda}):",
-                dict(zip(["p50","p80","p90","p95","p99"], q)))
-            print(f"[sanity] threshold used: {config.ad_threshold}")
-
-            print(f"[teach] base labels: abnormal={len(abn_ids)}, normal={len(norm_ids)}")
-            plan = cls.sample_sessions(abn_ids, norm_ids, random_seed=config.random_seed)
-            (dirs["root"] / "sampled_normals.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
-            print(f"[teach] wrote sampling plan → {sp_json}")
-
-        target_ids = list(sorted(set(plan["abnormal"]) | set(plan["normal"])))
-        print(f"[teach] sampling plan: abnormal={len(plan['abnormal'])}, normal={len(plan['normal'])}, total={len(target_ids)}")
-
-        cached_ids = set(int(x[0]) for x in conn.execute("SELECT session_id FROM ors_pool").fetchall())
-        to_process = [sid for sid in target_ids if sid not in cached_ids]
-        if cached_ids:
-            print(f"[teach] found {len(cached_ids)} already cached; skipping those.")
-        else:
-            print("[teach] no cached rows yet.")
-
         start_time = time.time()
-        last_export = 0
-        total = len(to_process)
+        out_root = Path(config.output_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
+        db_path = out_root / "pool.sqlite"
 
-        params = config.ors_params
-        params.model_id = Path(config.model_path).name
-        for n_done, sid in enumerate(to_process, start=1):
-            # fetch bundle by session_id
-            b = fetch_charging_session(
-                model,
-                test_loader,
-                batch_index=None,
-                sample_index=None,
-                session_id=int(sid),
-                device=config.device,
-                power_scaler=power_scaler,
-                soc_scaler=soc_scaler,
-                idx_power_inp=idx_power_inp,
-                idx_soc_inp=idx_soc_inp,
+        # sqlite schema 
+        with sqlite3.connect(db_path) as conn:
+            _create_main_table(conn)  # creates ors_pool table + indexes if missing
+
+        # 1) --------- dataset introspection: we need df_scaled, features and horizon --------
+        ds = loader.dataset
+        # prefers an explicitly provided dataframe, otherwise falls back to dataset.df
+        if df_scaled is None:
+            if hasattr(ds, "df"):
+                df_scaled = ds.df  # type: ignore[attr-defined]
+            else:
+                raise ValueError(
+                    "TeachingPool.build requires a scaled long-format DataFrame. "
+                    "Pass `df_scaled=` explicitly or ensure `loader.dataset` "
+                    "defines a `df` attribute."
+                )
+        # normalise index, regardless of source
+        df_scaled = df_scaled.reset_index(drop=True)
+
+        if not hasattr(ds, "input_features") or not hasattr(ds, "target_features"):
+            raise ValueError(
+                "TeachingPool.build expects dataset to define 'input_features' and "
+                "'target_features' attributes."
             )
+        input_features: list[str] = ds.input_features
+        target_features: list[str] = ds.target_features
 
-            # enforce length range
-            T_seq = int(getattr(b, "length", None) or getattr(b, "T", None) or len(b.true_power_unscaled))
-            lr = config.length_range
-            if lr is not None:
-                lo_raw, hi_raw = lr
-                lo_ok = True if lo_raw is None else T_seq >= int(lo_raw)
-                hi_ok = True if hi_raw is None else T_seq <= int(hi_raw)
-                if not (lo_ok and hi_ok):
-                    # light logging; avoid spamming every row
-                    if (n_done % 50) == 0:
-                        print(f"[teach] skip sid={sid}: T={T_seq} outside "
-                            f"[{0 if lo_raw is None else int(lo_raw)}, "
-                            f"{'inf' if hi_raw is None else int(hi_raw)}]")
+        if not hasattr(ds, "horizon"):
+            raise ValueError(
+                "TeachingPool.build expects dataset to define a 'horizon' attribute."
+            )
+        horizon: int = int(ds.horizon)
+
+        # ------- 2) compute / load base labels + targets (macro-RMSE AD labelling) ----
+        sample_plan_path = out_root / "sampled_normals.json"
+        print("[teaching_pool] computing base labels...")
+        abnormal_ids, normal_ids_all, err_by_id = cls.compute_base_labels(
+            loader,
+            model,
+            config.device,
+            power_scaler=power_scaler,
+            idx_power_inp=idx_power_inp,
+            decay_lambda=config.decay_lambda,
+            t_min_eval=config.ors_params.t_min_eval,
+            threshold=config.ad_threshold,
+        )
+
+        # derive or load target counts per class
+        target_abn: int
+        target_norm: int
+
+        if sample_plan_path.exists():
+            with sample_plan_path.open("r", encoding="utf-8") as f:
+                plan = json.load(f)
+
+            if "target" in plan:
+                target_abn = int(plan["target"].get("abnormal", len(abnormal_ids)))
+                target_norm = int(plan["target"].get("normal", min(len(normal_ids_all), len(abnormal_ids))))
+            else:
+                # legacy plan without explicit targets. infers a balanced target and persists
+                target_abn = len(plan.get("abnormal", abnormal_ids))
+                # normals target is capped to abnormals for a balanced pool
+                target_norm = min(len(plan.get("normal", normal_ids_all)), target_abn)
+
+                plan["target"] = {"abnormal": int(target_abn), "normal": int(target_norm)}
+                with sample_plan_path.open("w", encoding="utf-8") as f:
+                    json.dump(plan, f, indent=2)
+                print(f"[teaching_pool][fix] added target counts to {sample_plan_path.name}.")
+        else:
+            # no previous plan: default to "all abnormals + same number of normals"
+            target_abn = len(abnormal_ids)
+            target_norm = min(len(normal_ids_all), target_abn)
+            plan = {
+                "target": {"abnormal": int(target_abn), "normal": int(target_norm)},
+                "abnormal": [int(x) for x in abnormal_ids],
+                "normal": [int(x) for x in normal_ids_all],
+            }
+            with sample_plan_path.open("w", encoding="utf-8") as f:
+                json.dump(plan, f, indent=2)
+            print(f"[teaching_pool] wrote sampling plan to {sample_plan_path}")
+
+        print(
+            f"[teaching_pool] targets: {target_abn} abnormals, "
+            f"{target_norm} normals (base candidates: {len(abnormal_ids)} abn, {len(normal_ids_all)} norm)"
+        )
+
+        # persistent mapping {session_id -> base_label} over the full candidate set
+        base_labels: dict[int, int] = {}
+        for sid in abnormal_ids:
+            base_labels[int(sid)] = 1
+        for sid in normal_ids_all:
+            base_labels[int(sid)] = 0
+
+        # resume logic: decide which sessions still need processin
+        # which session_ids are already cached in sqlite?
+        with sqlite3.connect(db_path) as conn:
+            cached_ids = {int(r[0]) for r in conn.execute("SELECT session_id FROM ors_pool")}
+
+        # count how many abnormals/normals are already in the cache (according to base_labels)
+        cached_abn = [sid for sid in cached_ids if base_labels.get(sid) == 1]
+        cached_norm = [sid for sid in cached_ids if base_labels.get(sid) == 0]
+        n_abn_cached = len(cached_abn)
+        n_norm_cached = len(cached_norm)
+        remaining_abn = max(0, target_abn - n_abn_cached)
+        remaining_norm = max(0, target_norm - n_norm_cached)
+
+        print(
+            f"[teaching_pool] cached counts: {n_abn_cached} abn, {n_norm_cached} norm. "
+            f"remaining targets: {remaining_abn} abn, {remaining_norm} norm."
+        )
+
+        if remaining_abn == 0 and remaining_norm == 0:
+            # nothing left to do; ensure parquet is up to date and return early
+            out_parquet = out_root / "pool.parquet"
+            cls.rows_to_parquet(db_path, out_parquet)
+            print(f"[teaching_pool] target reached for both classes, exported existing pool to {out_parquet}.")
+            return
+
+        rng = np.random.default_rng(config.random_seed)
+
+        # candidates not yet cached
+        remaining_abn_ids = [int(sid) for sid in abnormal_ids if int(sid) not in cached_ids]
+        remaining_norm_ids = [int(sid) for sid in normal_ids_all if int(sid) not in cached_ids]
+
+        # sample as many as we still need for each class
+        if remaining_abn > 0:
+            if remaining_abn >= len(remaining_abn_ids):
+                to_process_abn = remaining_abn_ids
+            else:
+                to_process_abn = rng.choice(remaining_abn_ids, size=remaining_abn, replace=False).tolist()
+        else:
+            to_process_abn = []
+
+        if remaining_norm > 0:
+            if remaining_norm >= len(remaining_norm_ids):
+                to_process_norm = remaining_norm_ids
+            else:
+                to_process_norm = rng.choice(remaining_norm_ids, size=remaining_norm, replace=False).tolist()
+        else:
+            to_process_norm = []
+
+        # final processing queue
+        to_process = sorted(set(int(s) for s in (to_process_abn + to_process_norm)))
+        total = len(to_process)
+        print(f"[teaching_pool] processing queue size: {total}")
+
+        # ensure output dirs exist
+        paths = {
+            "power_raw": out_root / "power_raw",
+            "soc_raw": out_root / "soc_raw",
+            "power_piv": out_root / "power_pivots",
+            "power_sts": out_root / "power_sts",
+            "soc_piv": out_root / "soc_pivots",
+            "soc_sts": out_root / "soc_sts",
+        }
+        for p in paths.values():
+            p.mkdir(parents=True, exist_ok=True)
+
+        processed = 0
+        try:
+            for sid in to_process:
+                sid_int = int(sid)
+
+                # ensure we have a macro-RMSE value
+                if sid_int not in err_by_id:
+                    print(f"[teaching_pool][warn] skipping sid={sid_int}: no macro-RMSE in cache.")
                     continue
 
-            # persist raw power and raw SOC for overlays
-            try:
-                np.save(dirs["raw_power"] / f"{sid}.npy", np.asarray(b.true_power_unscaled, dtype=np.float32))
-            except Exception as e:
-                print(f"[teach][warn] cannot save raw power sid={sid}: {e}")
-            try:
-                soc_arr = np.asarray(b.true_soc_unscaled, dtype=np.float32).reshape(-1)
-                if soc_arr.size == 0 or not np.all(np.isfinite(soc_arr)):
-                    raise ValueError("missing or invalid SOC series")
-                np.save(dirs["raw_soc"] / f"{sid}.npy", soc_arr)
-            except Exception as e:
-                raise RuntimeError(f"[teach] session {sid}: SOC missing or cannot save: {e}") from e
+                # build bundle
+                try:
+                    bundle = make_bundle_from_session_df(
+                        model=model,
+                        df_scaled=df_scaled,
+                        sid=sid_int,
+                        device=config.device,
+                        input_features=input_features,
+                        target_features=target_features,
+                        horizon=horizon,
+                        power_scaler=power_scaler,
+                        soc_scaler=soc_scaler,
+                        idx_power_inp=idx_power_inp,
+                        idx_soc_inp=idx_soc_inp,
+                    )
+                except Exception as e:
+                    print(f"[teaching_pool][warn] skipping sid={sid_int} in make_bundle_from_session_df: {e}")
+                    continue
 
-            # clamp ORS params to sequence length
-            p_local = cls.prepare_ors_params_for_T(params, T_seq if T_seq > 0 else 2)
+                T = int(bundle.length)
+                # optional length filtering
+                if config.length_range is not None:
+                    min_len, max_len = config.length_range
+                    if T < min_len or (max_len is not None and T > max_len):
+                        continue
 
-            # run ORS safely
-            try:
-                res = ors(
-                    b,
-                    model,
-                    p_local,
-                    power_scaler=power_scaler,
-                    soc_scaler=soc_scaler,
-                    idx_power_inp=idx_power_inp,
-                    idx_soc_inp=idx_soc_inp,
-                    power_weight=config.power_weight,
-                    decay_lambda=config.decay_lambda,
-                    threshold=config.ad_threshold,
-                )
-            except Exception as e:
-                print(f"[teach][warn] ORS raised for sid={sid}: {type(e).__name__}: {e}")
-                continue
+                # clamp ors params to T
+                ors_params_checked = cls.prepare_ors_params_for_T(config.ors_params, T)
 
-            ok, why = cls.validate_ors_result(res)
-            if not ok:
-                print(f"[teach][warn] ORS invalid for sid={sid} ({why}); skipping.")
-                continue
+                # run ors
+                try:
+                    res = ors(
+                        bundle,
+                        model,
+                        ors_params_checked,
+                        power_scaler=power_scaler,
+                        idx_power_inp=idx_power_inp,
+                        decay_lambda=config.decay_lambda,
+                        threshold=config.ad_threshold,
+                    )
+                except Exception as e:
+                    print(f"[teaching_pool][warn] ORS raised for sid={sid_int}: {e}")
+                    continue
 
-            # metrics
-            try:
-                robust_prob = float(1.0 - float(res["frag"]))
-                lbl_text = str(res["label"])
-                lbl_int = 1 if lbl_text == "abnormal" else 0
-                margin = float(config.ad_threshold - res["err"]) if lbl_int == 0 else float(res["err"] - config.ad_threshold)
-            except Exception as e:
-                print(f"[teach][warn] metric cast failure sid={sid}: {e}; skipping.")
-                continue
+                ok, reason = cls.validate_ors_result(res)
+                if not ok:
+                    print(f"[teaching_pool][warn] skipping sid={sid_int}: {reason}")
+                    continue
 
-            # save power arrays
-            try:
-                sts = np.asarray(res["sts"], dtype=np.float32)
-                piv = np.asarray(res["piv"], dtype=np.int32)
-                sts_path = dirs["sts_full"] / f"{sid}.npy"
-                piv_path = dirs["piv"] / f"{sid}.npy"
-                np.save(sts_path, sts)
-                np.save(piv_path, piv)
-            except Exception as e:
-                print(f"[teach][warn] saving arrays failed sid={sid}: {e}; skipping.")
-                continue
+                # save raw power
+                true_power = np.asarray(bundle.true_power_unscaled, dtype=float)
+                raw_power_path = paths["power_raw"] / f"{sid_int}.npy"
+                np.save(raw_power_path, true_power)
 
-            # save soc arrays (optional)
-            piv_soc_path: Path | None = None
-            sts_soc_path: Path | None = None
-            try:
-                piv_soc = res.get("piv_soc", None)
-                sts_soc = res.get("sts_soc", None)
-                if piv_soc is not None and sts_soc is not None:
-                    piv_soc = np.asarray(piv_soc, dtype=np.int32)
-                    sts_soc = np.asarray(sts_soc, dtype=np.float32)
-                    piv_soc_path = dirs["piv_soc"] / f"{sid}.npy"
-                    sts_soc_path = dirs["sts_soc"] / f"{sid}.npy"
-                    np.save(piv_soc_path, piv_soc)
-                    np.save(sts_soc_path, sts_soc)
-            except Exception:
-                print(f"[teach][warn] saving soc simplification arrays failed for sid={sid}, proceeding with only raw SOC ")
-                piv_soc_path, sts_soc_path = None, None
+                # save raw soc if present
+                raw_soc_path: Path | None = None
+                if getattr(bundle, "true_soc_unscaled", None) is not None:
+                    true_soc = np.asarray(bundle.true_soc_unscaled, dtype=float)
+                    raw_soc_path = paths["soc_raw"] / f"{sid_int}.npy"
+                    np.save(raw_soc_path, true_soc)
 
-            # embedding
-            try:
-                emb = cls.compute_embedding(sts, L=config.L, P=config.P)
-                emb_blob = emb.tobytes()
-            except Exception as e:
-                print(f"[teach][warn] embedding failed sid={sid}: {e}; skipping.")
-                continue
+                # save ors outputs for power (+ optional soc)
+                piv_path = None
+                sts_full_path = None
+                if res.get("piv") is not None:
+                    piv_path = paths["power_piv"] / f"{sid_int}.npy"
+                    np.save(piv_path, np.asarray(res["piv"], dtype=float))
+                if res.get("sts") is not None:
+                    sts_full_path = paths["power_sts"] / f"{sid_int}.npy"
+                    np.save(sts_full_path, np.asarray(res["sts"], dtype=float))
 
-            row = dict(
-                session_id=int(sid),
-                label_text=lbl_text,
-                label_int=int(lbl_int),
-                k=float(res["k"]),
-                err=float(res["err"]),
-                frag=float(res["frag"]),
-                robust_prob=robust_prob,
-                margin=margin,
-                threshold=float(config.ad_threshold),
-                model_id=p_local.model_id,
-                ts_unix=float(time.time()),
-                raw_power_path=str((dirs["raw_power"] / f"{sid}.npy").as_posix()),
-                raw_soc_path=str((dirs["raw_soc"] / f"{sid}.npy").as_posix()),
-                sts_full_path=str(sts_path.as_posix()),
-                sts_soc_path=(str(sts_soc_path.as_posix()) if sts_soc_path is not None else None),
-                piv_path=str(piv_path.as_posix()),
-                piv_soc_path=(str(piv_soc_path.as_posix()) if piv_soc_path is not None else None),
-                emb_dim=int(2 * config.L + 2 * config.P),
-                emb=emb_blob,
-            )
-            cls.upsert_row(conn, row)
+                piv_soc_path = None
+                sts_soc_path = None
+                if res.get("piv_soc") is not None:
+                    piv_soc_path = paths["soc_piv"] / f"{sid_int}.npy"
+                    np.save(piv_soc_path, np.asarray(res["piv_soc"], dtype=float))
+                if res.get("sts_soc") is not None:
+                    sts_soc_path = paths["soc_sts"] / f"{sid_int}.npy"
+                    np.save(sts_soc_path, np.asarray(res["sts_soc"], dtype=float))
 
-            # progress and periodic export
-            pct = (n_done / total) * 100.0 if total > 0 else 100.0
-            print(f"[teach] ORS {n_done:4d}/{total} ({pct:4.1f}%) sid={sid}")
-            if (n_done - last_export) >= config.export_every or n_done == total:
-                print("[teach] exporting parquet snapshot ...")
-                cls.rows_to_parquet(db_path, dirs["root"] / "pool.parquet")
-                last_export = n_done
+                # compute embedding from sts
+                emb_dim: int | None = None
+                emb_vec: np.ndarray | None = None
+                emb_blob: bytes | None = None
+                try:
+                    sts_dense = np.asarray(res["sts"], dtype=float).reshape(-1)
+                    emb_vec = cls.compute_embedding(sts_dense, L=int(config.L), P=int(config.P))
+                    emb_dim = int(emb_vec.size)
+                    emb_blob = emb_vec.astype(np.float32).tobytes()  # decoded later in rows_to_parquet
+                except Exception as e:
+                    print(f"[teaching_pool][warn] embedding failed for sid={sid_int}: {e}")
 
-        cls.export_config(config, dirs["root"], n_abn=len(plan["abnormal"]), n_norm=len(plan["normal"]))
-        cls.rows_to_parquet(db_path, dirs["root"] / "pool.parquet")
+                # metadata
+                k = int(res["k"]) if res.get("k") is not None else None
+                err = float(res["err"]) if res.get("err") is not None else None
+                frag = float(res["frag"]) if res.get("frag") is not None else None
+                robust_prob = res.get("robust_prob", 1 - frag if frag is not None else None)
+                margin = None
+                if err is not None and config.ad_threshold is not None:
+                    margin = float(config.ad_threshold) - float(err)
+                label_int = int(base_labels[sid_int])
 
-        dt = time.time() - start_time
-        hh, rem = divmod(int(dt), 3600)
-        mm, ss = divmod(rem, 60)
-        print(f"[teach] done. processed {len(to_process)} sessions in {hh:d} h {mm:d} m.")
-        print(f"parquet: {dirs['root'] / 'pool.parquet'}")
+                row = {
+                    "session_id": sid_int,
+                    "label_text": "abnormal" if label_int == 1 else "normal",
+                    "label_int": label_int,
+                    "k": k,
+                    "err": err,
+                    "frag": frag,
+                    "robust_prob": robust_prob,
+                    "margin": margin,
+                    "threshold": float(config.ad_threshold),
+                    "model_id": str(Path(config.model_path).name) if hasattr(config, "model_path") else "unknown",
+                    "ts_unix": float(time.time()),
+                    "sts_full_path": str(sts_full_path) if sts_full_path is not None else None,
+                    "piv_path": str(piv_path) if piv_path is not None else None,
+                    "emb_dim": emb_dim,
+                    "emb": emb_blob,
+                    "raw_power_path": str(raw_power_path),
+                    "raw_soc_path": str(raw_soc_path) if raw_soc_path is not None else None,
+                    "piv_soc_path": str(piv_soc_path) if piv_soc_path is not None else None,
+                    "sts_soc_path": str(sts_soc_path) if sts_soc_path is not None else None,
+                }
+
+                with sqlite3.connect(db_path) as conn:
+                    cls.upsert_row(conn, row)
+
+                processed += 1
+                if processed % int(config.export_every) == 0 or processed == total:
+                    out_parquet = out_root / "pool.parquet"
+                    cls.rows_to_parquet(db_path, out_parquet)
+                    elapsed = time.time() - start_time
+                    print(f"[teaching_pool] processed {processed}/{total} sessions in {elapsed/60:.1f} min")
+
+        except KeyboardInterrupt:
+            print("[teaching_pool] received KeyboardInterrupt, exporting snapshot before exit …")
+            out_parquet = out_root / "pool.parquet"
+            cls.rows_to_parquet(db_path, out_parquet)
+            raise
+        finally:
+            # always write the latest snapshot (noop if identical)
+            out_parquet = out_root / "pool.parquet"
+            cls.rows_to_parquet(db_path, out_parquet)
+
+        print(f"[teaching_pool] build complete. processed {processed}/{total} sessions. artefacts under: {out_root}")
 
     # ---------- binning & budgets (inlined logic) ----------
 
@@ -393,7 +530,7 @@ class TeachingPool:
 
         Args:
             binning: "quantile" (per-class qcut with robust fallbacks) or "fixed" (use fixed_edges_per_class).
-            target_bins, min_bins, max_bins: knobs for quantile binning; ignored if binning="fixed".
+            target_bins, min_bins, max_bins: knobs for quantile binning, ignored if binning="fixed".
             fixed_edges_per_class: optional dict {"0": [e0,...,eN], "1": [...]}. Only used if binning="fixed".
             ensure_extrema: if True, clamp first/last bin labels to each class's min_k/max_k (display only).
             save_outputs: if True, writes parquet + JSON meta to output_dir.
@@ -406,7 +543,7 @@ class TeachingPool:
             meta: Metadata dict with edges per class, counts per bin, class-k histograms, etc.
         """
         if "pool_parquet" not in self.paths:
-            raise ValueError("paths['pool_parquet'] not set; call TeachingPool.load_from_parquet(...) or construct(...) first.")
+            raise ValueError("paths['pool_parquet'] not set, call TeachingPool.load_from_parquet(...) or construct(...) first.")
         out_dir = Path(self.paths["root"])
         out_dir.mkdir(parents=True, exist_ok=True)
         out_parquet = out_dir / "binned_pool.parquet"
@@ -425,7 +562,7 @@ class TeachingPool:
             raise ValueError("label_source must be 'base' or 'simplified'")
 
         if "k" not in df.columns:
-            raise ValueError("pool parquet must contain column 'k'")
+            raise ValueError("[teaching_pool] pool parquet must contain column 'k'")
         df["k"] = pd.to_numeric(df["k"], errors="coerce").round().astype("Int64")
 
         # diagnostics (per-class k hist)
@@ -621,7 +758,7 @@ class TeachingPool:
         densest bins). For "proportional", splits by per-bin availability and fixes rounding drift.
 
         Args:
-            per_class_target: Target count per class (upper bound; may be reduced by availability).
+            per_class_target: Target count per class (upper bound, may be reduced by availability).
             bin_allocation: "even" or "proportional".
 
         Returns:
@@ -757,74 +894,62 @@ class TeachingPool:
 
     @staticmethod
     def compute_base_labels(
-        test_loader,
+        loader,
         model: torch.nn.Module,
         device: torch.device,
         *,
         power_scaler,
-        soc_scaler,
         idx_power_inp: int,
-        idx_soc_inp: int,
-        power_weight: float,
         decay_lambda: float,
         t_min_eval: int,
         threshold: float,
     ) -> tuple[list[int], list[int], dict[int, float]]:
-        """Runs one pass over the test set to compute Macro-RMSE and base labels.
+        """computes per-session macro-RMSE and base labels for the dataset.
 
-        Returns:
-            Tuple of (abnormal_ids, normal_ids, err_by_id).
+        this uses the power-only anomaly-detection pipeline:
+        - compute_session_MRMSE to obtain per-session macro-RMSE (kW)
+        - classify_by_threshold to map errors to 'normal'/'abnormal'
+
+        soc-related arguments are accepted for backwards compatibility but not used.
+
+        returns:
+            abnormal_ids: list of session ids labelled 'abnormal'.
+            normal_ids: list of session ids labelled 'normal'.
+            err_by_id: mapping {session_id -> macro-RMSE error}.
         """
-        abnormal, normal = [], []
-        err_by_id: dict[int, float] = {}
+        # run the standard macro-RMSE scoring over the loader
+        df_errs = compute_session_MRMSE(
+            model=model,
+            loader=loader,
+            device=device,
+            power_scaler=power_scaler,
+            idx_power_inp=idx_power_inp,
+            t_min_eval=t_min_eval,
+            horizon_weights_decay=decay_lambda,
+        )
 
-        for b_idx, batch in enumerate(test_loader):
-            if len(batch) == 4:
-                sids, Xb, Yb, Ls = batch
-                sids = [int(x) for x in (sids.tolist() if hasattr(sids, "tolist") else sids)]
-            else:
-                Xb, Yb, Ls = batch
-                sids = [None] * Xb.shape[0]
+        # classify by fixed threshold (same semantics as AD notebook)
+        df_cls = classify_by_threshold(df_errs, threshold=float(threshold))
 
-            B = Xb.shape[0]
-            X_dev = Xb.to(device)
-            L_cpu = Ls.cpu() if hasattr(Ls, "cpu") else torch.tensor(Ls)
+        abnormal_ids = (
+            df_cls.loc[df_cls["label"] == "abnormal", "charging_id"]
+            .astype(int)
+            .tolist()
+        )
+        normal_ids = (
+            df_cls.loc[df_cls["label"] == "normal", "charging_id"]
+            .astype(int)
+            .tolist()
+        )
 
-            # reconstruct absolute predictions in original units
-            P_res = predict_residuals(model, X_dev, L_cpu, device=device)
-            P_abs_scaled = reconstruct_abs_from_residuals_batch(Xb, P_res, idx_power_inp, idx_soc_inp)
-            P_abs = inverse_targets_np(P_abs_scaled.numpy(), power_scaler, soc_scaler)
+        err_by_id: dict[int, float] = {
+            int(row["charging_id"]): float(row["error"])
+            for _, row in df_cls.iterrows()
+        }
 
-            for i in range(B):
-                T = int(L_cpu[i].item())
-                power_true = power_scaler.inverse_transform(Xb[i, :T, [idx_power_inp]].numpy()).ravel()
-                soc_true = soc_scaler.inverse_transform(Xb[i, :T, [idx_soc_inp]].numpy()).ravel()
-                H = P_abs.shape[2]
-                Y_abs_true = build_true_abs_from_series(power_true, soc_true, H)
-                err = macro_rmse_from_abs(P_abs[i, :T], Y_abs_true, power_weight, decay_lambda, t_min_eval)
-                sid = sids[i]
-                if sid is None:
-                    b = fetch_charging_session(
-                        model,
-                        test_loader,
-                        batch_index=b_idx,
-                        sample_index=i,
-                        device=device,
-                        power_scaler=power_scaler,
-                        soc_scaler=soc_scaler,
-                        idx_power_inp=idx_power_inp,
-                        idx_soc_inp=idx_soc_inp,
-                        session_id=None,
-                    )
-                    sid = int(b.session_id)
-                sid = int(sid)
-                err_by_id[sid] = float(err)
-                if err > float(threshold):
-                    abnormal.append(sid)
-                else:
-                    normal.append(sid)
+        return abnormal_ids, normal_ids, err_by_id
 
-        return abnormal, normal, err_by_id
+
 
     @staticmethod
     def load_base_labels(sample_plan_json: str | Path) -> dict[int, int]:
@@ -889,21 +1014,19 @@ class TeachingPoolConfig:
         L: Resampling length used in embeddings.
         P: Number of top peaks used in embeddings.
         ors_params: Parameters for robust simplification.
-        power_weight: Macro-RMSE weighting for power.
         decay_lambda: Exponential decay factor in Macro-RMSE.
         length_range: Optional (min_len, max_len) in timesteps. sessions outside are skipped at pool build stage.
                       Use None for open bounds, e.g. (11, None) enforces a minimum length of 11 with no upper cap.
     """
     model_path: str = "../Models/final/final_model.pth"
     output_dir: str = "../Data/teaching_pool"
-    ad_threshold: float = 8.5962
+    ad_threshold: float = 13.3423
     random_seed: Optional[int] = None
     device: torch.device = torch.device("cuda"),
     export_every: int = 10
     L: int = 128
     P: int = 4
     length_range: tuple[int | None, int | None] | None = None
-    power_weight: Optional[float] = 0.5
     decay_lambda: Optional[float] = 0.2
     ors_params: ORSParams = field(
         default_factory=lambda: ORSParams(
@@ -914,7 +1037,7 @@ class TeachingPoolConfig:
             dp_alpha=0.001,
             beta=3.0,
             gamma=0.05,
-            R=10000,
+            R=3000,
             epsilon_mode="fraction",
             epsilon_value=0.3,
             t_min_eval=1,
@@ -963,8 +1086,6 @@ class TeachingSet:
         lambda_robust: Weight for the robustness-probability linear term.
         normalize_embeddings: If True, L2-normalises embeddings before cosine similarity.
         lazy_prune: If True, uses lazy upper bounds to reduce recomputations in greedy selection.
-        dtw_tie_refine: If True, applies an optional DTW-based tie-break; ignored if no ties occur.
-        dtw_params: Optional DTW parameters (kept for compatibility; not required by the core objective).
         sim_clip_min: Lower clip for pairwise sim (e.g. 0.0 keeps only non-negative contributions).
         random_seed: RNG seed for deterministic budget splits and iterator sampling.
         min_per_k: Enforces at least this many seeds per distinct k in a (class, k-bin) before greedy fill.
@@ -1001,15 +1122,13 @@ class TeachingSet:
                  lambda_robust: float = 0.05,
                  normalize_embeddings: bool = True,
                  lazy_prune: bool = True,
-                 dtw_tie_refine: bool = False,
-                 dtw_params: dict | None = None,
                  sim_clip_min: float | None = 0.0,
                  random_seed: int | None = None,
                  min_per_k: int = 0,
                  output_dir: str | Path | None = None) -> None:
 
         if pool.bins_df is None:
-            raise ValueError("pool.bins_df is None; run pool.bin_pool(...) first.")
+            raise ValueError("pool.bins_df is None, run pool.bin_pool(...) first.")
         out_dir = Path(output_dir) if output_dir is not None else pool.paths.get("root", Path("."))
 
         selected_df, meta = self.construct(
@@ -1023,8 +1142,6 @@ class TeachingSet:
             lambda_robust=lambda_robust,
             normalize_embeddings=normalize_embeddings,
             lazy_prune=lazy_prune,
-            dtw_tie_refine=dtw_tie_refine,
-            dtw_params=dtw_params,
             sim_clip_min=sim_clip_min,
             random_seed=random_seed,
             output_dir=(Path(output_dir) if output_dir else pool.paths["root"]),
@@ -1055,8 +1172,6 @@ class TeachingSet:
                   lambda_robust: float = 0.05,
                   normalize_embeddings: bool = True,
                   lazy_prune: bool = True,
-                  dtw_tie_refine: bool = False,
-                  dtw_params: dict | None = None,
                   sim_clip_min: float | None = 0.0,
                   random_seed: Optional[int] = None,
                   output_dir: str | Path = "Data/teaching_pool",
@@ -1080,8 +1195,6 @@ class TeachingSet:
             lambda_robust: Weight for robustness-probability bonus.
             normalize_embeddings: If True, applies L2 normalisation before cosine similarity.
             lazy_prune: Enables lazy upper bounds for faster greedy selection.
-            dtw_tie_refine: Optional DTW-based tie-break (kept for compatibility).
-            dtw_params: DTW parameters if `dtw_tie_refine` is True.
             sim_clip_min: Lower bound clip for similarities (e.g. 0.0 discards negative sim).
             random_seed: RNG seed for deterministic behaviour.
             output_dir: Output directory for `selection.parquet` and `selection_config.json`.
@@ -1308,7 +1421,6 @@ class TeachingSet:
             "objective": "facility_location + lambda_margin*margin + lambda_robust*robust_prob",
             "similarity": "cosine on L2-normalized embeddings",
             "lazy_greedy": bool(lazy_prune),
-            "dtw_tie_refine": bool(dtw_tie_refine),
             "lambda_margin": float(lambda_margin),
             "lambda_robust": float(lambda_robust),
             "min_per_k": int(min_per_k),
@@ -1449,16 +1561,15 @@ class TeachingSet:
                     i = (i + 1) % len(leftovers)
             out[str(c)] = shrunk
         return out
-
-    # ---------------- existing public API below (unchanged) ---------------- #
-
+    
+    # ---------------- group iterators and serving ---------------- #
     def build_group_iterators(self) -> dict[str, TeachIterator]:
         """
         Builds and stores group iterators on this TeachingSet.
         alternation n/a/n/a… is handled inside TeachIterator.
         """
         if self.teaching_set_df is None:
-            raise ValueError("selected_df is None; run selection first.")
+            raise ValueError("selected_df is None, run selection first.")
 
         dfA = self.sample_group(group="A")
         dfB = self.sample_group(group="B")
@@ -1573,10 +1684,10 @@ class TeachingSet:
         """Writes `selection.parquet` and `selection_config.json` beside the pool files."""
         if self.teaching_set_df is None:
             raise ValueError("selected_df is None.")
-        root = Path(output_dir) if output_dir is not None else self.pool.paths.get("root", Path("."))
-        root.mkdir(parents=True, exist_ok=True)
-        self.teaching_set_df.to_parquet(root / "selection.parquet", index=False)
-        with open(root / "selection_config.json", "w") as f:
+        out_root = Path(output_dir) if output_dir is not None else self.pool.paths.get("root", Path("."))
+        out_root.mkdir(parents=True, exist_ok=True)
+        self.teaching_set_df.to_parquet(out_root / "selection.parquet", index=False)
+        with open(out_root / "selection_config.json", "w") as f:
             json.dump(self.meta, f, indent=2)
 
     def describe(self) -> None:
@@ -1598,6 +1709,303 @@ class TeachingSet:
                 if c in self.meta["per_bin_selected"]:
                     print(f"  class {c}: {self.meta['per_bin_selected'][c]}")
 
+    # ---------------- exam set construction ---------------- #
+    def construct_exam_sets(
+        self,
+        per_set_total: int,
+        output_dir: Path,
+        random_seed: int | None = None,
+        save_images: bool = True,
+        image_format: Literal["png", "jpg"] = "png",
+    ) -> dict:
+        """Builds two exam sets (set1, set2) from the *existing* teaching_set_df.
+
+        This method does not (re)construct the teaching set. It takes whatever is
+        already in `self.teaching_set_df`, splits it into up to two sets of size
+        `per_set_total` each (allowing shortfalls), randomises order for exams, and
+        optionally writes RAW/OVERLAY images for groups A/B and RAW for C.
+
+        Args:
+            per_set_total: Target number of examples per exam set (upper bound).
+            output_dir: Root directory where exam sets are written (set1/, set2/…).
+            random_seed: RNG seed for deterministic shuffling.
+            bin_allocation: Present for backward compatibility; not enforced here.
+            enforce_even_class_dist: Present for backward compatibility; not enforced here.
+            save_images: If True, renders images for A/B (RAW + OVERLAY) and C (RAW).
+            image_format: 'png' or 'jpg'.
+
+        Returns:
+            A small metadata dictionary with written paths and counts.
+        """
+        rng = np.random.default_rng(random_seed)
+        out_root = Path(output_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        # 0) fetch the *already selected* teaching set; fail clearly if missing
+        if getattr(self, "teaching_set_df", None) is None or len(self.teaching_set_df) == 0:
+            raise ValueError(
+                "teaching_set_df is empty or not set. Build the teaching set first "
+                "(e.g. via TeachingSet.construct(...)) before calling construct_exam_sets()."
+            )
+
+        df = self.teaching_set_df.copy().reset_index(drop=True)
+
+        # 1) shuffle once; we will then take alternating chunks into set1 / set2
+        #    this preserves the overall class/k distribution in expectation
+        idx = np.arange(len(df), dtype=int)
+        rng.shuffle(idx)
+        df = df.loc[idx].reset_index(drop=True)
+
+        # 2) split flexibly: we do *not* enforce exact per-class totals.
+        #    just fill set1 up to per_set_total, then set2 up to per_set_total.
+        n_target_total = int(per_set_total)
+        n_avail = len(df)
+
+        if n_avail == 0:
+            # nothing to do
+            return {
+                "paths": {},
+                "counts": {"set1": 0, "set2": 0},
+                "note": "no rows in teaching_set_df; nothing written",
+            }
+
+        take1 = min(n_target_total, n_avail)
+        take2 = min(n_target_total, max(0, n_avail - take1))
+
+        df_e1 = df.iloc[:take1].copy().reset_index(drop=True).assign(set_id=1)
+        df_e2 = df.iloc[take1 : take1 + take2].copy().reset_index(drop=True).assign(set_id=2)
+
+        # as a light touch towards balance without being strict: if one set is short and
+        # there is still slack in the other half, try to interleave by class quickly.
+        # this is optional and keeps behaviour robust when one class is scarce.
+        def _interleave_flex(sub: pd.DataFrame, cap: int) -> pd.DataFrame:
+            if len(sub) <= cap:
+                # already fits
+                return sub.sample(frac=1.0, random_state=int(rng.integers(0, 1 << 31))).reset_index(drop=True)
+
+            # two buckets by class; round-robin while we have space
+            a = sub[sub["class_label"].astype(int) == 0].index.to_list()
+            b = sub[sub["class_label"].astype(int) == 1].index.to_list()
+            rng.shuffle(a)
+            rng.shuffle(b)
+            pick = []
+            ia = ib = 0
+            # alternate while space remains; if one bucket empties, keep taking from the other
+            while len(pick) < cap and (ia < len(a) or ib < len(b)):
+                if ia < len(a):
+                    pick.append(a[ia]); ia += 1
+                    if len(pick) >= cap:
+                        break
+                if ib < len(b):
+                    pick.append(b[ib]); ib += 1
+            return sub.loc[pick].sample(frac=1.0, random_state=int(rng.integers(0, 1 << 31))).reset_index(drop=True)
+
+        df_e1 = _interleave_flex(df_e1, cap=n_target_total)
+        df_e2 = _interleave_flex(df_e2, cap=n_target_total)
+
+        # 3) write images (random order is handled by TeachIterator with exam_mode=True)
+        paths = {
+            "set1": {
+                "A_raw": str(out_root / "set1" / "A" / "raw"),
+                "A_overlay": str(out_root / "set1" / "A" / "overlay"),
+                "B_raw": str(out_root / "set1" / "B" / "raw"),
+                "B_overlay": str(out_root / "set1" / "B" / "overlay"),
+                "C_raw": str(out_root / "set1" / "C" / "raw"),
+            },
+            "set2": {
+                "A_raw": str(out_root / "set2" / "A" / "raw"),
+                "A_overlay": str(out_root / "set2" / "A" / "overlay"),
+                "B_raw": str(out_root / "set2" / "B" / "raw"),
+                "B_overlay": str(out_root / "set2" / "B" / "overlay"),
+                "C_raw": str(out_root / "set2" / "C" / "raw"),
+            },
+        }
+
+        if save_images:
+            # set 1
+            if len(df_e1) > 0:
+                self._render_exam_images(
+                    set_id=1,
+                    df_set=df_e1,
+                    root=out_root,
+                    random_seed=random_seed,
+                    image_format=image_format,
+                )
+            # set 2
+            if len(df_e2) > 0:
+                self._render_exam_images(
+                    set_id=2,
+                    df_set=df_e2,
+                    root=out_root,
+                    random_seed=random_seed,
+                    image_format=image_format,
+                )
+
+        # 4) return minimal meta so the notebook cell can print paths and counts
+        return {
+            "paths": paths,
+            "counts": {"set1": int(len(df_e1)), "set2": int(len(df_e2))},
+            "note": (
+                "flexible split: no strict per-class enforcement; counts may be below targets "
+                "if the selected teaching set lacks supply."
+            ),
+        }
+
+    @staticmethod
+    def _check_required_cols(df: pd.DataFrame, cols: list[str]) -> None:
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"required columns missing: {missing}")
+
+    @staticmethod
+    def _round_robin_two_way(
+        items_by_bin: dict[str, list[int]],
+        target_per_set: int,
+        rng: np.random.Generator,
+    ) -> tuple[list[int], list[int]]:
+        """Splits indices into two buckets by round-robin over bins (balanced coverage)."""
+        e1, e2 = [], []
+        bin_keys = list(items_by_bin.keys())
+        cursor = {b: 0 for b in bin_keys}
+        total_needed = 2 * target_per_set
+        while len(e1) + len(e2) < total_needed:
+            for b in bin_keys:
+                arr = items_by_bin[b]
+                if cursor[b] == 0 and len(arr) > 1:
+                    rng.shuffle(arr)
+                if cursor[b] < len(arr):
+                    choose_e1 = (len(e1) <= len(e2))
+                    if choose_e1 and len(e1) < target_per_set:
+                        e1.append(arr[cursor[b]])
+                    elif len(e2) < target_per_set:
+                        e2.append(arr[cursor[b]])
+                    else:
+                        return e1, e2
+                    cursor[b] += 1
+        return e1, e2
+
+    def split_balanced_two_sets(
+        self,
+        selected_df: pd.DataFrame,
+        *,
+        per_set_total: int,
+        random_seed: int | None = None
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Splits a balanced 2·per_set_total selection into E1/E2 with strict per-class totals & even bin spread."""
+        self._check_required_cols(selected_df, ["session_id", "class_label", "k_bin_label"])
+        rng = np.random.default_rng(random_seed)
+
+        per_class_target_per_set = per_set_total // 2
+        total_expected = 2 * per_set_total
+        df = selected_df.copy().reset_index(drop=True)
+
+        # Strict global balance across both sets
+        counts = df["class_label"].value_counts().to_dict()
+        for c in (0, 1):
+            need = 2 * per_class_target_per_set
+            have = int(counts.get(c, 0))
+            if have != need:
+                raise ValueError(
+                    f"selected_df must have exactly {need} rows for class {c}, found {have}. "
+                    "Re-run selection to enforce strict per-class targets for exams."
+                )
+        if len(df) != total_expected:
+            raise ValueError(f"selected_df must have exactly {total_expected} rows, found {len(df)}.")
+
+        # Split per class with round-robin over k-bins
+        parts = []
+        for cls in (0, 1):
+            sub = df[df["class_label"].astype(int) == cls].copy().reset_index(drop=True)
+            by_bin = {str(b): g.index.to_list() for b, g in sub.groupby("k_bin_label")}
+            idx_e1, idx_e2 = self._round_robin_two_way(by_bin, target_per_set=per_class_target_per_set, rng=rng)
+            parts.append((sub.loc[idx_e1].index, sub.loc[idx_e2].index))
+
+        # Map back to global indices
+        e1_rows, e2_rows = [], []
+        for cls, (i1, i2) in zip((0, 1), parts):
+            global_idx = df.index[df["class_label"].astype(int) == cls]
+            e1_rows.extend(global_idx[i1].to_list())
+            e2_rows.extend(global_idx[i2].to_list())
+
+        df_e1 = df.loc[sorted(e1_rows)].reset_index(drop=True).assign(set_id=1)
+        df_e2 = df.loc[sorted(e2_rows)].reset_index(drop=True).assign(set_id=2)
+        return df_e1, df_e2
+
+    def _render_exam_images(
+        self,
+        *,
+        set_id: int,
+        df_set: pd.DataFrame,
+        root: Path,
+        random_seed: Optional[int] = None,
+        image_format: Literal["png", "jpg"] = "png",
+    ) -> None:
+        """Renders exam images for a given set into RAW/OVERLAY variants as required by groups.
+
+        Layout:
+          root/set{set_id}/A/raw,     root/set{set_id}/A/overlay
+          root/set{set_id}/B/raw,     root/set{set_id}/B/overlay
+          root/set{set_id}/C/raw
+        """
+        set_dir = root / f"set{set_id}"
+        # make y-limits consistent within the set
+        y_max = _compute_global_power_max([df_set])
+        y_lim = (0.0, y_max)
+
+        def _ensure(p: Path) -> Path:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+
+        def _save(fig, dest_dir: Path, meta: dict, ordinal: int) -> None:
+            sid = meta.get("session_id", "unknown")
+            lbl = str(meta.get("label", "unknown")).lower().replace(" ", "-")
+            k = meta.get("k", None)
+            if k is None:
+                fname = f"ex_{ordinal:03d}_{lbl}__{sid}.{image_format}"
+            else:
+                fname = f"ex_{ordinal:03d}_{lbl}_k{k}__{sid}.{image_format}"
+            path = dest_dir / fname
+            fig.savefig(path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+        # Groups A and B: produce RAW and OVERLAY
+        for g in ("A", "B"):
+            for variant, overlay in (("raw", False), ("overlay", True)):
+                dest = _ensure(set_dir / g / variant)
+                it = TeachIterator(
+                    df=df_set,
+                    group=g,
+                    parent=self,
+                    random_seed=random_seed,
+                    y_lim=y_lim,
+                    exam_mode=True, # random order for exams
+                    show_simpl_overlays=overlay, #force RAW/OVERLAY
+                )
+                ordinal = 1
+                for item in it:
+                    fig = item.pop("fig", None)
+                    if isinstance(fig, Figure):
+                        _save(fig, dest, item, ordinal)
+                        ordinal += 1
+
+        # Group C: RAW only
+        g = "C"
+        dest = _ensure(set_dir / g / "raw")
+        it = TeachIterator(
+            df=df_set,
+            group=g,
+            parent=self,
+            random_seed=random_seed,
+            y_lim=y_lim,
+            exam_mode=True,                 # random order
+            show_simpl_overlays=False,      # raw only
+        )
+        ordinal = 1
+        for item in it:
+            fig = item.pop("fig", None)
+            if isinstance(fig, Figure):
+                _save(fig, dest, item, ordinal)
+                ordinal += 1
 
 # ------------------ teaching session, e.g. serving examples from a teaching set -----------------------
 
@@ -1609,17 +2017,34 @@ class TeachIterator:
     (raw power .npy + knots .npy or, for legacy assets, a dense simplification),
     plots immediately, and returns a compact metadata dict for logging.
 
-    Group semantics:
-      - 'A': raw power with simplification overlay, ordered
+    Group semantics (teaching mode):
+      - 'A': raw power with simplification overlay, ordered (by difficulty via k & margin)
       - 'B': raw power with simplification overlay, random order
       - 'C': raw power only, random order
+
+    Exam semantics:
+      - `exam_mode=True` forces random order for all groups.
+      - Overlays are controlled by `show_simpl_overlays` if provided, otherwise by group defaults.
+        This lets us save RAW and OVERLAY variants for A/B without changing group labels.
+
+    Attributes:
+        df: DataFrame of selected items (must include session paths/metadata).
+        group: 'A' | 'B' | 'C'.
+        parent: Owning TeachingSet instance (for params like t_min_eval, anchor_endpoints).
+        random_seed: RNG seed for deterministic ordering.
+        y_lim: Optional y-axis limits for plotting.
+        show_simpl_overlays: Optional override (True/False) for overlay behaviour.
+        exam_mode: If True, always randomises order (no curriculum sorting).
     """
     df: pd.DataFrame
     group: Literal["A", "B", "C"]
     parent: TeachingSet
-    random_seed: Optional[int]= None
+    random_seed: Optional[int] = None
     y_lim: tuple[float, float] | None = None
     sort_key: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
+    show_simpl_overlays: Optional[bool] = None
+    exam_mode: bool = False
+
     _curriculum: Optional[np.ndarray] = None
     _cursor: int = 0
 
@@ -1627,47 +2052,66 @@ class TeachIterator:
         df = self.df.reset_index(drop=True)
         if "class_label" not in df.columns:
             raise ValueError("class_label missing from DataFrame columns")
-        
-        # split by class
+
+        rng = np.random.default_rng(self.random_seed)
+
+        # ----- Exam mode: fully random over the whole set (class balance is already enforced upstream)
+        if self.exam_mode:
+            idx = np.arange(len(df), dtype=int)
+            rng.shuffle(idx)
+            self._curriculum = idx
+            self._cursor = 0
+            self.df = df
+            return
+
+        # ----- Teaching mode (existing behaviour preserved)
         normals_arr = df.index[df["class_label"].astype(int) == 0].to_numpy()
         abnormals_arr = df.index[df["class_label"].astype(int) == 1].to_numpy()
-        
+
         def order_within_class(idxs: np.ndarray) -> np.ndarray:
-            """Ensures the correct drawing order, in case the TeachingSet's 
-            DataFrame has been altered between construction and serving.
-            """
+            """Order by curriculum when group='A', otherwise random order."""
             if idxs.size == 0:
                 return idxs
             class_subset = df.loc[idxs]
+
             if self.group == "A":
-                # normals (0): k & margin asc. abnormals (1): k & margin desc.
+                # normals (0): k & margin asc; abnormals (1): k & margin desc
                 if not {"k", "margin"}.issubset(class_subset.columns):
                     raise ValueError("k or margin missing from df.columns")
                 asc_k = int(class_subset["class_label"].iloc[0]) == 0
                 ordered_df = class_subset.sort_values(["k", "margin"], ascending=[asc_k, asc_k])
             else:
-                ordered_df = class_subset.sample(frac=1.0, random_state=self.random_seed)
-            
-            # cap after ordering for curriculum truncation (we cut the most challenging examples)
+                ordered_df = class_subset.sample(frac=1.0, random_state=int(self.random_seed) if self.random_seed is not None else None)
+
+            # respect an optional max_per_class attr if provided externally
             if getattr(self, "max_per_class", None) is not None:
                 ordered_df = ordered_df.head(self.max_per_class)
-            
+
             return ordered_df.index.to_numpy()
 
         normals_curriculum = order_within_class(normals_arr)
         abnormals_curriculum = order_within_class(abnormals_arr)
+        if self.group == "A" and not self.exam_mode:
+            # A: Interleave normal/abnormal (starts with normals). If one class runs out, append the rest.
+            merged: list[int] = []
+            i0 = i1 = 0
+            while i0 < len(normals_curriculum) or i1 < len(abnormals_curriculum):
+                if i0 < len(normals_curriculum):
+                    merged.append(int(normals_curriculum[i0]))
+                    i0 += 1
+                if i1 < len(abnormals_curriculum):
+                    merged.append(int(abnormals_curriculum[i1]))
+                    i1 += 1
+            merged_curriculum = np.asarray(merged, dtype=int)
+        else:
+            # B and C: random global order (no alternation), still respecting any per-class caps
+            merged_curriculum = np.concatenate([normals_curriculum, abnormals_curriculum]).astype(int)
+            rng = np.random.default_rng(self.random_seed)
+            rng.shuffle(merged_curriculum)
 
-        # interleave: start with normals (0) and alternate. 
-        merged_curriculum: list[int] = []
-        i0 = i1 = 0
-        while i0 < len(normals_curriculum) or i1 < len(abnormals_curriculum):
-            if i0 < len(normals_curriculum):
-                merged_curriculum.append(int(normals_curriculum[i0])); i0 += 1
-            if i1 < len(abnormals_curriculum): # if one side runs out, append the rest
-                merged_curriculum.append(int(abnormals_curriculum[i1])); i1 += 1
-
-        self._curriculum = np.asarray(merged_curriculum, dtype=int)
+        self._curriculum = merged_curriculum
         self._cursor = 0
+        self.df = df
 
     def __iter__(self) -> Iterator[dict]:
         return self
@@ -1681,37 +2125,18 @@ class TeachIterator:
         meta = self._serve_row(row)
         return meta
 
-    # build session, plot immediately, and return a small log dict
     def _serve_row(self, row: pd.Series) -> dict:
+        """Builds a plot for a single row and returns a small log dict (incl. fig)."""
         sid = int(row.get("session_id", row.get("charging_id", -1)))
-        # paths
+
+        # locate files
         sts_full_path = row.get("sts_full_path", None)
         piv_path = row.get("piv_path", None)
-        raw_power_path = row.get("raw_power_path", None) or ( _derive_raw_power_path(sts_full_path) if sts_full_path else None )
+        raw_power_path = row.get("raw_power_path", None) or (_derive_raw_power_path(sts_full_path) if sts_full_path else None)
         if raw_power_path is None:
             raise ValueError("cannot locate raw_power_path for session")
 
-        power = _load_power(raw_power_path)
-        T = int(power.shape[0])
-
-       # overlay simplification if we have it
-        simp = None
-        if self.group in ("A", "B"):
-            if piv_path is not None and Path(piv_path).exists():
-                idx, val = _load_knots(piv_path, base_series=power)
-                simp = ChargingSessionSimplification(
-                    power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
-                )
-            elif sts_full_path is not None and Path(sts_full_path).exists():
-                # fallback for dense curves; estimate indices, then take values from dense
-                dense = _safe_load(sts_full_path).astype(float)
-                idx, _ = _dense_to_knots(dense)
-                idx, val = _align_knots(idx, dense[idx], T)
-                simp = ChargingSessionSimplification(
-                    power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
-                )
-        sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
-        # immediate plot with group-specific SOC rules
+        # classify label text
         if "label" in row and pd.notna(row["label"]):
             label_str = str(row["label"])
         elif "class_label" in row and pd.notna(row["class_label"]):
@@ -1719,31 +2144,47 @@ class TeachIterator:
         else:
             label_str = "unknown"
 
-        # derive file paths
-        sts_full_path = row.get("sts_full_path", None)
-        piv_path = row.get("piv_path", None)
-        raw_power_path = row.get("raw_power_path", None) or str(_derive_raw_power_path(sts_full_path)) if sts_full_path else None
+        # SOC paths (raw or simplified)
         raw_soc_path = row.get("raw_soc_path", None) or (str(_derive_raw_soc_path(sts_full_path)) if sts_full_path else None)
         piv_soc_path = row.get("piv_soc_path", None)
         sts_soc_path = row.get("sts_soc_path", None)
 
-        if self.group == "C":
-            # C: raw power + raw SOC only
-            power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
-            soc_raw = _safe_load(raw_soc_path) if raw_soc_path else _safe_load(_derive_raw_soc_path(sts_full_path))
-            sess_c = ChargingSession(session_id=sid, power_kw=power, soc_pct=np.asarray(soc_raw, dtype=float))
-            fig, _ = sess_c.plot_raw(soc_mode="raw", title=None, y_lim=self.y_lim)
-        else:
-            # A/B: raw+simpl power + simplified SOC only
-            power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
-            idx, val = _load_knots(piv_path, base_series=power)
-            simp = ChargingSessionSimplification(
-                power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
-            )
-            # attach SOC simpl if present, else fallback to raw SOC densification via dense->knots
-            sidx, sval = None, None
+        # Decide overlay behaviour: override > default-by-group
+        overlay_enabled = (
+            bool(self.show_simpl_overlays)
+            if self.show_simpl_overlays is not None
+            else (self.group in ("A", "B"))
+        )
 
-            # load a base soc series to derive values from if pivots are indices-only
+        # Load power for plotting limits/knots
+        power = _load_power(raw_power_path)
+
+        if not overlay_enabled:
+            # RAW ONLY: power + raw SOC (used for group C and A/B pre-teaching exam)
+            soc_raw = _safe_load(raw_soc_path) if raw_soc_path else _safe_load(_derive_raw_soc_path(sts_full_path))
+            sess_raw = ChargingSession(session_id=sid, power_kw=power, soc_pct=np.asarray(soc_raw, dtype=float))
+            fig, _ = sess_raw.plot_raw(soc_mode="raw", title=None, y_lim=self.y_lim)
+            k_val = None
+            piv_soc_used = None
+        else:
+            # OVERLAY: raw+simplified power + simplified SOC (A/B teaching & A/B post-teaching exam)
+            # power simplification
+            simp = None
+            if piv_path is not None and Path(piv_path).exists():
+                idx, val = _load_knots(piv_path, base_series=power)
+                simp = ChargingSessionSimplification(
+                    power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
+                )
+            elif sts_full_path is not None and Path(sts_full_path).exists():
+                dense = _safe_load(sts_full_path).astype(float)
+                idx, _ = _dense_to_knots(dense)
+                idx, val = _align_knots(idx, dense[idx], int(power.shape[0]))
+                simp = ChargingSessionSimplification(
+                    power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
+                )
+
+            # SOC simplified (prefer pivots; fallback: dense -> knots)
+            sidx, sval = None, None
             soc_base: np.ndarray | None = None
             if raw_soc_path is not None:
                 try:
@@ -1751,43 +2192,236 @@ class TeachIterator:
                 except Exception:
                     soc_base = None
             if soc_base is None and sts_soc_path is not None:
-                # fallback to dense simplified soc as base
                 try:
                     soc_base = np.asarray(_safe_load(sts_soc_path), dtype=float).reshape(-1)
                 except Exception:
                     soc_base = None
 
             if piv_soc_path is not None:
-                # passes the soc series so 1D index pivots can be mapped to values
                 sidx, sval = _load_knots(piv_soc_path, base_series=soc_base)
             elif sts_soc_path is not None:
-                # erives pivots and values from dense soc if pivots missing
                 sidx, sval = _dense_to_knots(_safe_load(sts_soc_path))
 
-            if sidx is not None and sval is not None:
+            if (sidx is not None) and (sval is not None) and (simp is not None):
                 simp.soc_knot_idx = np.asarray(sidx, dtype=int)
                 simp.soc_knot_val_pct = np.asarray(sval, dtype=float)
 
-            sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
-            # subtext = f"example {self._cursor} has k={simp.k_power} segments" if (simp and simp.k_power is not None) else None
-            fig, _ = sess.plot_raw(soc_mode="simpl", title=None, y_lim=self.y_lim, 
-                               anchor_endpoints=self.parent.ors_params.anchor_endpoints, 
-                               t_min_eval=int(self.parent.ors_params.t_min_eval))
+            sess_simpl = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
+            fig, _ = sess_simpl.plot_raw(
+                soc_mode="simpl",
+                title=None,
+                y_lim=self.y_lim,
+                anchor_endpoints=self.parent.ors_params.anchor_endpoints,
+                t_min_eval=int(self.parent.ors_params.t_min_eval),
+            )
+            k_val = int(simp.k_power) if (simp and simp.k_power is not None) else None
 
         result = {
             "session_id": sid,
             "group": self.group,
-            "k": (int(simp.k_power) if simp and simp.k_power is not None else None),
+            "k": k_val,
             "label": label_str,
-            "sts_full_path": row.get("sts_full_path", None),
+            "sts_full_path": sts_full_path,
             "sts_soc_path": sts_soc_path,
-            "piv_path": row.get("piv_path", None),
+            "piv_path": piv_path,
             "piv_soc_path": piv_soc_path,
             "raw_power_path": str(raw_power_path),
             "raw_soc_path": raw_soc_path,
             "fig": fig,
         }
         return result
+
+
+# @dataclass
+# class TeachIterator:
+#     """Iterator over canonical ChargingSession objects for an MT4XAI user group.
+
+#     The iterator constructs sessions from file-backed arrays produced by the ORS pool
+#     (raw power .npy + knots .npy or, for legacy assets, a dense simplification),
+#     plots immediately, and returns a compact metadata dict for logging.
+
+#     Group semantics:
+#       - 'A': raw power with simplification overlay, ordered
+#       - 'B': raw power with simplification overlay, random order
+#       - 'C': raw power only, random order
+#     """
+#     df: pd.DataFrame
+#     group: Literal["A", "B", "C"]
+#     parent: TeachingSet
+#     random_seed: Optional[int]= None
+#     y_lim: tuple[float, float] | None = None
+#     sort_key: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
+#     show_simpl_overlays: Optional[bool] = None  # NB! overrides the group defaults if not None
+#     _curriculum: Optional[np.ndarray] = None
+#     _cursor: int = 0
+
+#     def __post_init__(self):
+#         df = self.df.reset_index(drop=True)
+#         if "class_label" not in df.columns:
+#             raise ValueError("class_label missing from DataFrame columns")
+        
+#         # split by class
+#         normals_arr = df.index[df["class_label"].astype(int) == 0].to_numpy()
+#         abnormals_arr = df.index[df["class_label"].astype(int) == 1].to_numpy()
+        
+#         def order_within_class(idxs: np.ndarray) -> np.ndarray:
+#             """Ensures the correct drawing order, in case the TeachingSet's 
+#             DataFrame has been altered between construction and serving.
+#             """
+#             if idxs.size == 0:
+#                 return idxs
+#             class_subset = df.loc[idxs]
+#             if self.group == "A":
+#                 # normals (0): k & margin asc. abnormals (1): k & margin desc.
+#                 if not {"k", "margin"}.issubset(class_subset.columns):
+#                     raise ValueError("k or margin missing from df.columns")
+#                 asc_k = int(class_subset["class_label"].iloc[0]) == 0
+#                 ordered_df = class_subset.sort_values(["k", "margin"], ascending=[asc_k, asc_k])
+#             else:
+#                 ordered_df = class_subset.sample(frac=1.0, random_state=self.random_seed)
+            
+#             # cap after ordering for curriculum truncation (we cut the most challenging examples)
+#             if getattr(self, "max_per_class", None) is not None:
+#                 ordered_df = ordered_df.head(self.max_per_class)
+            
+#             return ordered_df.index.to_numpy()
+
+#         normals_curriculum = order_within_class(normals_arr)
+#         abnormals_curriculum = order_within_class(abnormals_arr)
+
+#         # interleave: start with normals (0) and alternate. 
+#         merged_curriculum: list[int] = []
+#         i0 = i1 = 0
+#         while i0 < len(normals_curriculum) or i1 < len(abnormals_curriculum):
+#             if i0 < len(normals_curriculum):
+#                 merged_curriculum.append(int(normals_curriculum[i0]))
+#                 i0 += 1
+#             if i1 < len(abnormals_curriculum): # if one side runs out, append the rest
+#                 merged_curriculum.append(int(abnormals_curriculum[i1]))
+#                 i1 += 1
+
+#         self._curriculum = np.asarray(merged_curriculum, dtype=int)
+#         self._cursor = 0
+
+#     def __iter__(self) -> Iterator[dict]:
+#         return self
+
+#     def __next__(self) -> dict:
+#         if self._cursor >= len(self._curriculum):
+#             raise StopIteration
+#         i = int(self._curriculum[self._cursor])
+#         self._cursor += 1
+#         row = self.df.iloc[i]
+#         meta = self._serve_row(row)
+#         return meta
+
+#     # build session, plots, and returns a small log dict
+#     def _serve_row(self, row: pd.Series) -> dict:
+#         sid = int(row.get("session_id", row.get("charging_id", -1)))
+#         # paths
+#         sts_full_path = row.get("sts_full_path", None)
+#         piv_path = row.get("piv_path", None)
+#         raw_power_path = row.get("raw_power_path", None) or ( _derive_raw_power_path(sts_full_path) if sts_full_path else None )
+#         if raw_power_path is None:
+#             raise ValueError("cannot locate raw_power_path for session")
+
+#         power = _load_power(raw_power_path)
+#         T = int(power.shape[0])
+
+#        # overlay simplification if we have it
+#         simp = None
+#         if self.group in ("A", "B"):
+#             if piv_path is not None and Path(piv_path).exists():
+#                 idx, val = _load_knots(piv_path, base_series=power)
+#                 simp = ChargingSessionSimplification(
+#                     power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
+#                 )
+#             elif sts_full_path is not None and Path(sts_full_path).exists():
+#                 # fallback for dense curves, estimate indices, then take values from dense
+#                 dense = _safe_load(sts_full_path).astype(float)
+#                 idx, _ = _dense_to_knots(dense)
+#                 idx, val = _align_knots(idx, dense[idx], T)
+#                 simp = ChargingSessionSimplification(
+#                     power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
+#                 )
+#         sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
+#         # immediate plot with group-specific SOC rules
+#         if "label" in row and pd.notna(row["label"]):
+#             label_str = str(row["label"])
+#         elif "class_label" in row and pd.notna(row["class_label"]):
+#             label_str = "normal" if int(row["class_label"]) == 0 else "abnormal"
+#         else:
+#             label_str = "unknown"
+
+#         # derive file paths
+#         sts_full_path = row.get("sts_full_path", None)
+#         piv_path = row.get("piv_path", None)
+#         raw_power_path = row.get("raw_power_path", None) or str(_derive_raw_power_path(sts_full_path)) if sts_full_path else None
+#         raw_soc_path = row.get("raw_soc_path", None) or (str(_derive_raw_soc_path(sts_full_path)) if sts_full_path else None)
+#         piv_soc_path = row.get("piv_soc_path", None)
+#         sts_soc_path = row.get("sts_soc_path", None)
+
+#         if self.group == "C":
+#             # C: raw power + raw SOC only
+#             power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
+#             soc_raw = _safe_load(raw_soc_path) if raw_soc_path else _safe_load(_derive_raw_soc_path(sts_full_path))
+#             sess_c = ChargingSession(session_id=sid, power_kw=power, soc_pct=np.asarray(soc_raw, dtype=float))
+#             fig, _ = sess_c.plot_raw(soc_mode="raw", title=None, y_lim=self.y_lim)
+#         else:
+#             # A/B: raw+simpl power + simplified SOC only
+#             power = _load_power(raw_power_path) if raw_power_path else _load_power(_derive_raw_power_path(sts_full_path))
+#             idx, val = _load_knots(piv_path, base_series=power)
+#             simp = ChargingSessionSimplification(
+#                 power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
+#             )
+#             # attach SOC simpl if present, else fallback to raw SOC densification via dense->knots
+#             sidx, sval = None, None
+
+#             # load a base soc series to derive values from if pivots are indices-only
+#             soc_base: np.ndarray | None = None
+#             if raw_soc_path is not None:
+#                 try:
+#                     soc_base = np.asarray(_safe_load(raw_soc_path), dtype=float).reshape(-1)
+#                 except Exception:
+#                     soc_base = None
+#             if soc_base is None and sts_soc_path is not None:
+#                 # fallback to dense simplified soc as base
+#                 try:
+#                     soc_base = np.asarray(_safe_load(sts_soc_path), dtype=float).reshape(-1)
+#                 except Exception:
+#                     soc_base = None
+
+#             if piv_soc_path is not None:
+#                 # passes the soc series so 1D index pivots can be mapped to values
+#                 sidx, sval = _load_knots(piv_soc_path, base_series=soc_base)
+#             elif sts_soc_path is not None:
+#                 # erives pivots and values from dense soc if pivots missing
+#                 sidx, sval = _dense_to_knots(_safe_load(sts_soc_path))
+
+#             if sidx is not None and sval is not None:
+#                 simp.soc_knot_idx = np.asarray(sidx, dtype=int)
+#                 simp.soc_knot_val_pct = np.asarray(sval, dtype=float)
+
+#             sess = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
+#             # subtext = f"example {self._cursor} has k={simp.k_power} segments" if (simp and simp.k_power is not None) else None
+#             fig, _ = sess.plot_raw(soc_mode="simpl", title=None, y_lim=self.y_lim, 
+#                                anchor_endpoints=self.parent.ors_params.anchor_endpoints, 
+#                                t_min_eval=int(self.parent.ors_params.t_min_eval))
+
+#         result = {
+#             "session_id": sid,
+#             "group": self.group,
+#             "k": (int(simp.k_power) if simp and simp.k_power is not None else None),
+#             "label": label_str,
+#             "sts_full_path": row.get("sts_full_path", None),
+#             "sts_soc_path": sts_soc_path,
+#             "piv_path": row.get("piv_path", None),
+#             "piv_soc_path": piv_soc_path,
+#             "raw_power_path": str(raw_power_path),
+#             "raw_soc_path": raw_soc_path,
+#             "fig": fig,
+#         }
+#         return result
 
 
 # ------------------- helpers & utils: database (CRUD), schema, embeddings ------------ #
@@ -1843,7 +2477,7 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalise_embedding_column(df: pd.DataFrame, expected_dim: int) -> pd.DataFrame:
-    """Ensures 'emb' exists as list[float] of expected length; repairs from alternatives if needed."""
+    """Ensures 'emb' exists as list[float] of expected length, repairs from alternatives if needed."""
     d = df.copy()
     if "emb" not in d.columns:
         for cand in ["embedding", "embeddings", "vec"]:
@@ -1954,14 +2588,15 @@ def _create_main_table(conn: sqlite3.Connection) -> None:
         emb_dim INTEGER,
         emb BLOB,
         raw_power_path TEXT,
-        raw_soc_path   TEXT,
-        piv_soc_path   TEXT,
-        sts_soc_path   TEXT
+        raw_soc_path TEXT,
+        piv_soc_path TEXT,
+        sts_soc_path TEXT
     );
     """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ors_pool_label ON ors_pool(label_int);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ors_pool_k ON ors_pool(k);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_margin ON ors_pool(margin);")
     conn.commit()
 
 
@@ -2093,7 +2728,6 @@ def _export_config(cfg: TeachingPoolConfig, out_dir: Path, n_abn: int, n_norm: i
         "abnormal_count": n_abn,
         "normal_count": n_norm,
         "decay_lambda": float(cfg.decay_lambda),
-        "power_weight": float(cfg.power_weight),
         "random_seed": int(cfg.random_seed),
         "device": str(cfg.device),
         "export_every": int(cfg.export_every),
@@ -2183,7 +2817,8 @@ def _align_knots(idx: np.ndarray, val: np.ndarray, T: int) -> tuple[np.ndarray, 
     val = val[order]
     # deduplicate identical indices, keep the last value
     keep = np.concatenate(([True], np.diff(idx) > 0))
-    idx = idx[keep]; val = val[keep]
+    idx = idx[keep]
+    val = val[keep]
     # ensure endpoints
     if idx.size == 0 or idx[0] != 0:
         idx = np.insert(idx, 0, 0)
@@ -2348,3 +2983,103 @@ def _verify_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "k_bin_label" not in d.columns and "k_bin" in d.columns:
         d = d.rename(columns={"k_bin": "k_bin_label"})
     return d
+
+
+# ---------------------------------- Exam Set construction ------------------------
+# Code for constructing the Exam Sets, which are really just TeachingSets 
+# constructed from the test set instead of the validation set. Used for MT4XAI experiment with human/LLM participants. 
+
+def _check_required_cols(df: pd.DataFrame, cols: list[str]) -> None:
+    """raises if required columns are missing."""
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"required columns missing: {missing}")
+
+def _round_robin_two_way(items_by_bin: dict[str, list[int]], target_per_set: int, rng: np.random.Generator
+                         ) -> tuple[list[int], list[int]]:
+    """splits indices into two balanced buckets by round-robin over bins."""
+    e1, e2 = [], []
+    # interleave across bins to keep distribution similar
+    bin_keys = list(items_by_bin.keys())
+    cursor = {b: 0 for b in bin_keys}
+    # flatten counts for a quick stop condition
+    total_needed = 2 * target_per_set
+    while len(e1) + len(e2) < total_needed:
+        for b in bin_keys:
+            arr = items_by_bin[b]
+            # randomise once up front
+            if cursor[b] == 0 and len(arr) > 1:
+                rng.shuffle(arr)
+            if cursor[b] < len(arr):
+                # choose the set with fewer so far (keeps them equal)
+                choose_e1 = (len(e1) <= len(e2))
+                if choose_e1 and len(e1) < target_per_set:
+                    e1.append(arr[cursor[b]])
+                elif len(e2) < target_per_set:
+                    e2.append(arr[cursor[b]])
+                else:
+                    # both sets full
+                    return e1, e2
+                cursor[b] += 1
+        # fallthrough continues cycling bins
+    return e1, e2
+
+def split_balanced_two_sets(selected_df: pd.DataFrame, *, per_set_total: int, random_seed: int | None = None
+                            ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Splits a balanced 2·per_set_total selection into E1/E2 with strict per-class totals and even bin spread.
+
+    Args:
+        selected_df: DataFrame containing selected exam candidates. Must be balanced across classes
+            and include columns 'session_id', 'class_label', 'k_bin_label'.
+        per_set_total: total rows desired in each exam set (e.g. 20).
+        random_seed: optional RNG seed for deterministic splits.
+
+    Returns:
+        (df_e1, df_e2): two DataFrames with exactly `per_set_total` rows each,
+        holding 50/50 class balance and similar k-bin coverage.
+    """
+    _check_required_cols(selected_df, ["session_id", "class_label", "k_bin_label"])
+    rng = np.random.default_rng(random_seed)
+
+    # enforces a strict 50/50 class balance. Each set must have per_set_total/2 per class
+    per_class_target_per_set = per_set_total // 2
+    total_expected = 2 * per_set_total
+    df = selected_df.copy().reset_index(drop=True)
+
+    # sanity: global balance across both sets
+    counts = df["class_label"].value_counts().to_dict()
+    for c in (0, 1):
+        need = 2 * per_class_target_per_set
+        have = int(counts.get(c, 0))
+        if have != need:
+            raise ValueError(
+                f"selected_df must have exactly {need} rows for class {c}, found {have}."
+                " Re-run selection to enforce strict per-class targets for exams."
+            )
+    if len(df) != total_expected:
+        raise ValueError(f"selected_df must have exactly {total_expected} rows, found {len(df)}.")
+
+    # split per class with round-robin over k-bins
+    parts = []
+    for cls in (0, 1):
+        sub = df[df["class_label"].astype(int) == cls].copy().reset_index(drop=True)
+        by_bin = {}
+        for b, g in sub.groupby("k_bin_label"):
+            by_bin[str(b)] = g.index.to_list()
+        idx_e1, idx_e2 = _round_robin_two_way(by_bin, target_per_set=per_class_target_per_set, rng=rng)
+        parts.append((
+            sub.loc[idx_e1].index,  # original row indices in df for class subset
+            sub.loc[idx_e2].index
+        ))
+
+    # stitch class-wise selections back into df rows
+    e1_rows, e2_rows = [], []
+    for cls, (i1, i2) in zip((0, 1), parts):
+        # map class-subset idx back to global df indices
+        global_idx = df.index[df["class_label"].astype(int) == cls]
+        e1_rows.extend(global_idx[i1].to_list())
+        e2_rows.extend(global_idx[i2].to_list())
+
+    df_e1 = df.loc[sorted(e1_rows)].reset_index(drop=True).assign(set_id=1)
+    df_e2 = df.loc[sorted(e2_rows)].reset_index(drop=True).assign(set_id=2)
+    return df_e1, df_e2

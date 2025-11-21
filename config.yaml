@@ -6,8 +6,10 @@ project:
   # root_dir is dynamically resolved automatically in config.py
   root_dir: null
 
-paths:
+paths:  
+  # paths must be relative from project root
   # Data paths
+  data_dir: "Data"
   dataset: "Data/etron55-charging-sessions.parquet"
   teaching_pool: "Data/teaching_pool"
   # Model paths

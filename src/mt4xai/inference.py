@@ -1,6 +1,5 @@
 # src/mt4xai/inference.py
 from __future__ import annotations
-import math  # postpones evaluation of type hints to speed up imports
 import torch
 from torch import nn
 from torch import Tensor
@@ -10,8 +9,12 @@ import pandas as pd
 from typing import Dict, Iterable, List, Optional, Tuple
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
-from .data import SessionPredsBundle, ChargingSessionDataset, reconstruct_abs_from_bundle, make_bundle_from_session_df, session_collate_fn
+import pandas as pd
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from torch import nn
 from .model import horizon_weights
+from .data import SessionPredsBundle, ChargingSessionDataset, reconstruct_abs_from_bundle, session_collate_fn
 
 _RWSE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
 _EPS: float = 1e-8
@@ -168,100 +171,157 @@ def inverse_targets_np(arr_scaled: np.ndarray,
     return out
 
 
+@torch.inference_mode()
+def make_bundle_from_session_df(
+    model: torch.nn.Module,
+    df_scaled: pd.DataFrame,
+    sid: int,
+    device: torch.device,
+    *,
+    input_features: list[str],
+    target_features: list[str],
+    horizon: int,
+    power_scaler,
+    soc_scaler,
+    idx_power_inp: int,
+    idx_soc_inp: int,
+) -> SessionPredsBundle:
+    """
+    Create a SessionPredsBundle for a single charging session.
+
+    Args:
+        model: Trained residual model.
+        df_scaled: Scaled dataframe containing all sessions.
+        sid: Session ID to extract.
+        device: Torch device.
+        input_features: Ordered list of input features used for training.
+        target_features: Ordered list of targets (power or power+SOC).
+        horizon: Prediction horizon.
+        power_scaler: Fitted MinMaxScaler for power.
+        soc_scaler: Fitted MinMaxScaler for SOC.
+        idx_power_inp: Index of 'power' in the input feature vector.
+        idx_soc_inp: Index of 'soc' in the input feature vector.
+
+    Returns:
+        SessionPredsBundle containing tensors, truths, and metadata.
+    """
+    df_session = df_scaled[df_scaled["charging_id"] == sid].copy()
+    df_session = df_session.sort_values("minutes_elapsed").reset_index(drop=True)
+
+    X_np = df_session[input_features].to_numpy(dtype=np.float32)
+    Y_np = df_session[target_features].to_numpy(dtype=np.float32)
+
+    T = X_np.shape[0]
+    lengths = torch.tensor([T], dtype=torch.long)
+
+    X = torch.from_numpy(X_np).unsqueeze(0)
+    Y = torch.from_numpy(Y_np).unsqueeze(0)
+
+    with torch.no_grad():
+        pred_resid, _ = model(X.to(device), lengths)
+        pred_resid = pred_resid.cpu()
+
+    # Prepare unscaled truths (power always present; SOC optional)
+    true_power_unscaled = power_scaler.inverse_transform(
+        X_np[:, idx_power_inp].reshape(-1, 1)
+    ).reshape(-1)
+
+    if "soc" in input_features:
+        true_soc_unscaled = soc_scaler.inverse_transform(
+            X_np[:, idx_soc_inp].reshape(-1, 1)
+        ).reshape(-1)
+    else:
+        true_soc_unscaled = None
+
+    return SessionPredsBundle(
+        batch_index=0,
+        sample_index=0,
+        length=T,
+        horizon=horizon,
+        num_targets=len(target_features),
+        X_sample=X.squeeze(0),
+        Y_sample=Y.squeeze(0),
+        P_sample=pred_resid.squeeze(0),
+        true_power_unscaled=true_power_unscaled,
+        true_soc_unscaled=true_soc_unscaled,
+        session_id=sid,
+    )
+
+
 def macro_rmse_per_session(
     P_abs: Tensor,
     Y_abs: Tensor,
     lengths: Tensor,
-    power_min: float | Tensor,
-    power_max: float | Tensor,
-    horizon_decay: float | None = None,
+    power_min: float,
+    power_max: float,
+    decay: float,
+    t_min_eval: int,
 ) -> Tensor:
-    """computes per-sequence macro-RMSE (kW) for a single target across horizons.
+    """computes macro-RMSE in kW per sequence for a single-target power forecaster.
 
-    it inverse-transforms scaled absolute predictions and targets to kW, applies
-    horizon weights, and aggregates RMSE over horizons for each sequence. it only
-    evaluates residuals on time steps that have valid targets for all horizons,
-    matching the training-time masking behaviour.
-    
     args:
-        P_abs: scaled absolute predictions with shape (B, T, H, 1) or (B, T, H).
-        Y_abs: scaled absolute targets with shape (B, T, H, 1) or (B, T, H).
-        lengths: 1d tensor of shape (B,) with original sequence lengths.
-        power_min: min value used by the power MinMaxScaler (float or 0d tensor).
-        power_max: max value used by the power MinMaxScaler (float or 0d tensor).
-        horizon_decay: optional exponential decay parameter alpha for horizon weights.
-                       if None or 0.0, uses uniform weights over horizons.
+        P_abs: scaled absolute predictions, shape (B, T, H) or (B, T, H, 1).
+        Y_abs: scaled absolute targets, same shape as P_abs.
+        lengths: 1d tensor of original sequence lengths, shape (B,).
+        power_min: minimum value used by MinMaxScaler for power.
+        power_max: maximum value used by MinMaxScaler for power.
+        decay: horizon decay parameter lambda; if 0.0 uses uniform weights.
+        t_min_eval: minimum time index from which errors contribute.
 
     returns:
-        tensor of shape (B,) with per-sequence macro-RMSE in kW. sequences with no
-        valid evaluation timesteps receive NaN.
+        tensor of shape (B,) with macro-RMSE in kW per sequence.
     """
-    # normalises power_min / power_max to plain floats
-    if isinstance(power_min, torch.Tensor):
-        pmin = float(power_min.item())
-    else:
-        pmin = float(power_min)
-
-    if isinstance(power_max, torch.Tensor):
-        pmax = float(power_max.item())
-    else:
-        pmax = float(power_max)
-
-    # ensures 4d tensors with a single target channel at the end
+    # normalise shapes to (B, T, H, 1)
     if P_abs.dim() == 3:
-        P_abs = P_abs.unsqueeze(-1)  # (B, T, H, 1)
+        P_abs = P_abs.unsqueeze(-1)
     if Y_abs.dim() == 3:
-        Y_abs = Y_abs.unsqueeze(-1)  # (B, T, H, 1)
+        Y_abs = Y_abs.unsqueeze(-1)
 
-    # works on the same device as the predictions
+    # choose device and move everything there
     device = P_abs.device
+    Y_abs = Y_abs.to(device)
+    lengths = lengths.to(device=device, dtype=torch.long)
 
-    # inverses min–max to kW, single target in channel 0
-    P_kw = P_abs[..., 0] * (pmax - pmin) + pmin  # (B, T, H)
-    Y_kw = Y_abs[..., 0] * (pmax - pmin) + pmin  # (B, T, H)
+    pmin = torch.tensor(float(power_min), device=device, dtype=P_abs.dtype)
+    pmax = torch.tensor(float(power_max), device=device, dtype=P_abs.dtype)
+    scale = pmax - pmin
 
-    B, T, H = P_kw.shape
+    # inverse transform to kW; single target in channel 0
+    P_kw = pmin + scale * P_abs[..., 0]  # (B, T, H)
+    Y_kw = pmin + scale * Y_abs[..., 0]  # (B, T, H)
 
-    # horizon weights: uniform if decay is None or 0
-    if horizon_decay is None or horizon_decay == 0.0:
-        w_h = torch.full((H,), 1.0 / H, dtype=P_kw.dtype, device=device)
+    B, T_max, H = P_kw.shape
+
+    # horizon weights
+    h = torch.arange(H, device=device, dtype=P_kw.dtype)
+    if decay is None or float(decay) == 0.0:
+        w_h = torch.full((H,), 1.0 / max(H, 1), device=device, dtype=P_kw.dtype)
     else:
-        # use the shared horizon_weights helper, as a (H,) vector on the correct device
-        w_h = horizon_weights(
-            H=H,
-            alpha=horizon_decay,
-            device=device,
-            normalise=True,
-            as_vector=True,
-        )  # (H,)
+        w_h = torch.exp(-float(decay) * h)
+        w_h = w_h / w_h.sum()
 
-    # masks out timesteps without valid residual targets
-    # this mirrors _vectorized_mask in train.py:
-    #   t in [1, length - H)  for all horizons, so every used timestep has valid y_{t+h}
-    lengths_dev = lengths.to(device=device)
-    t_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)  # (B, T)
-    end = lengths_dev.unsqueeze(1) - H                                # (B, 1)
-    mask_2d = (t_idx >= 1) & (t_idx < end)                            # (B, T)
-
-    errs = torch.full((B,), float("nan"), dtype=P_kw.dtype, device=device)
+    errs = torch.zeros(B, device=device, dtype=P_kw.dtype)
 
     for b in range(B):
-        valid_t = mask_2d[b]  # (T,)
-        n_valid = int(valid_t.sum().item())
-        if n_valid <= 0:
-            # no valid residuals for this sequence
+        T = int(lengths[b].item())
+        if T <= t_min_eval + 1:
+            errs[b] = 0.0
             continue
 
-        # selects the valid timesteps: shapes (n_valid, H)
-        y_b = Y_kw[b][valid_t, :]
-        p_b = P_kw[b][valid_t, :]
+        per_h_vals = []
+        for h_idx in range(H):
+            end = T - (h_idx + 1)
+            if end <= t_min_eval:
+                continue
+            diff = P_kw[b, t_min_eval:end, h_idx] - Y_kw[b, t_min_eval:end, h_idx]
+            rmse_h = torch.sqrt(torch.mean(diff * diff))
+            per_h_vals.append(rmse_h)
 
-        diff_sq = (p_b - y_b) ** 2  # (n_valid, H)
-        # mean squared error per horizon h
-        per_h_mse = diff_sq.mean(dim=0)  # (H,)
-        # weighted average over horizons, then square root
-        weighted_mse = torch.dot(w_h, per_h_mse)
-        errs[b] = torch.sqrt(weighted_mse)
+        if per_h_vals:
+            per_h = torch.stack(per_h_vals)
+            errs[b] = torch.sum(per_h * w_h[: len(per_h_vals)])
+        else:
+            errs[b] = 0.0
 
     return errs
 
@@ -272,141 +332,253 @@ def list_unique_session_ids(df_scaled: pd.DataFrame) -> np.ndarray:
     return np.asarray(np.sort(np.asarray(df_scaled["charging_id"].unique())), dtype=int)
 
 
-def _bundle_iter(model,
-                 df_scaled: pd.DataFrame,
-                 sids: Iterable[int],
-                 *,
-                 device,
-                 input_features: list[str],
-                 target_features: list[str],
-                 horizon: int,
-                 power_scaler,
-                 soc_scaler,
-                 idx_power_inp: int,
-                 idx_soc_inp: int,
-                 t_min_eval: int):
-    """Yields (sid, residuals[T,H,C], T) for each session, residuals in original units.
+# -------------------------------- RWSE: robust weighted squared error (power-only, single target) ---------------- #
 
-    Handles both power-only (C == 1) and power+SOC (C == 2) heads.
+def fit_rwse_robust_scalers(
+    model: nn.Module,
+    df_scaled: pd.DataFrame,
+    device: torch.device,
+    input_features: list[str],
+    target_features: list[str],
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    horizon: int,
+    t_min_eval: int = 1,
+    session_ids: Iterable[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fits robust location and scale parameters for RWSE on power residuals.
+
+    It collects power residuals (true minus predicted power in kW) across the
+    given sessions, for all horizons and time steps t >= t_min_eval. It then
+    computes the per-channel median and median absolute deviation (MAD).
+
+    Args:
+        model: trained residual forecaster.
+        df_scaled: panel of scaled charging sessions.
+        device: torch device used for inference.
+        input_features: list of input feature names.
+        target_features: list of target feature names (includes power only).
+        power_scaler: fitted MinMaxScaler for power.
+        idx_power_inp: index of power in the input feature vector.
+        horizon: forecast horizon H.
+        t_min_eval: minimum time index t included in the residuals.
+        session_ids: optional subset of charging ids to use.
+
+    Returns:
+        m: median of residuals for the power channel, shape (1,).
+        mad: MAD of residuals for the power channel, shape (1,).
     """
-    for sid in sids:
-        b = make_bundle_from_session_df(
-            model=model, df_scaled=df_scaled, sid=int(sid), device=device,
-            input_features=input_features, target_features=target_features, horizon=horizon,
-            power_scaler=power_scaler, soc_scaler=soc_scaler,
-            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp
+    if not session_ids:
+        session_ids = list(list_unique_session_ids(df_scaled))
+    else:
+        session_ids = list(map(int, session_ids))
+
+    resid_all: list[np.ndarray] = []
+
+    for sid in session_ids:
+        bundle = make_bundle_from_session_df(
+            model=model,
+            df_scaled=df_scaled,
+            sid=int(sid),
+            device=device,
+            input_features=input_features,
+            target_features=target_features,
+            horizon=horizon,
         )
-        Y_scaled = b.Y_sample.numpy()  # (T,H,C)
-        P_scaled = b.P_sample.numpy()  # (T,H,C)
-        T, H, C = Y_scaled.shape
 
-        # base in scaled space, matching number of channels in Y/P
-        if C == 1:
-            base = b.X_sample[:, [idx_power_inp]].unsqueeze(1).numpy()      # (T,1,1)
-        else:
-            base = b.X_sample[:, [idx_power_inp, idx_soc_inp]].unsqueeze(1).numpy()  # (T,1,2)
+        # single-session batch for reuse of reconstruction helper
+        X = bundle.X_sample.unsqueeze(0)          # [1, T, C_in]
+        P_res = bundle.P_sample.unsqueeze(0)      # [1, T, H, 1]
+        Y_res = bundle.Y_sample.unsqueeze(0)      # [1, T, H, 1]
+        lengths = torch.tensor([bundle.length], dtype=torch.long)
 
-        Y_abs_scaled = base + Y_scaled                 # (T,H,C)
-        P_abs_scaled = base + P_scaled                 # (T,H,C)
+        P_abs, Y_abs = reconstruct_abs_from_residuals_batch(
+            X_batch=X,
+            P_batch=P_res,
+            Y_batch=Y_res,
+            lengths=lengths,
+            idx_power_inp=idx_power_inp,
+            power_min=float(power_scaler.data_min_[0]),
+            power_max=float(power_scaler.data_max_[0]),
+        )
+        # drop batch and channel dims -> [T_common, H]
+        P = P_abs[0, :, :, 0].cpu().numpy()
+        Y = Y_abs[0, :, :, 0].cpu().numpy()
 
-        Y = inverse_targets_np(Y_abs_scaled, power_scaler, soc_scaler)  # (T,H,C)
-        P = inverse_targets_np(P_abs_scaled, power_scaler, soc_scaler)  # (T,H,C)
-        R = Y - P                                                      # (T,H,C)
+        if P.shape[0] <= t_min_eval:
+            continue
 
-        Tlen = R.shape[0]
-        t0 = min(int(t_min_eval), max(0, Tlen - 1))
-        yield int(sid), R[t0:], int(Tlen)
+        resid = Y[t_min_eval:, :] - P[t_min_eval:, :]   # [T_eff, H]
+        resid_all.append(resid.reshape(-1, 1))          # flatten over t,h
 
+    if not resid_all:
+        # degenerate fallback to avoid division by zero
+        m = np.zeros(1, dtype=float)
+        mad = np.ones(1, dtype=float)
+        return m, mad
 
-def fit_rwse_robust_scalers(model,
-                            val_scaled_df: pd.DataFrame,
-                            *,
-                            device,
-                            input_features: list[str],
-                            target_features: list[str],
-                            horizon: int,
-                            power_scaler,
-                            soc_scaler,
-                            idx_power_inp: int,
-                            idx_soc_inp: int,
-                            t_min_eval: int = 1,
-                            cache_key: str = "default") -> tuple[np.ndarray, np.ndarray]:
-    """Fits per-(h,c) median and MAD of residuals on the validation set; returns (m, mad) with shape (H,C)."""
-    key = ("robust_scalers", cache_key)
-    if key in _RWSE_CACHE:
-        return _RWSE_CACHE[key]
+    resid_all_arr = np.concatenate(resid_all, axis=0)  # [N, 1]
+    m = np.median(resid_all_arr, axis=0)
+    mad = np.median(np.abs(resid_all_arr - m), axis=0)
 
-    sids = list_unique_session_ids(val_scaled_df)
-    all_R: list[np.ndarray] = []
-    for _, R, _ in _bundle_iter(model, val_scaled_df, sids,
-                                device=device, input_features=input_features, target_features=target_features,
-                                horizon=horizon, power_scaler=power_scaler, soc_scaler=soc_scaler,
-                                idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp, t_min_eval=t_min_eval):
-        if R.size:
-            all_R.append(np.asarray(R, dtype=np.float64))
+    # avoid zero MAD which would blow up scaling
+    mad = np.where(mad < 1e-6, 1.0, mad)
+    return m.astype(float), mad.astype(float)
 
-    if not all_R:
-        raise RuntimeError("No residuals collected from validation set for RWSE scalers.")
-
-    R_cat = np.asarray(np.concatenate(all_R, axis=0), dtype=np.float64)    # (sum_T, H, C)
-    m   = np.median(R_cat, axis=0)                                         # (H,C)
-    mad = np.median(np.abs(R_cat - m), axis=0).astype(np.float64) + _EPS   # (H,C)
-
-    _RWSE_CACHE[key] = (m, mad)
-    return m, mad
 
 def rwse_score_from_bundle(
     bundle: SessionPredsBundle,
     m: np.ndarray,
     mad: np.ndarray,
-    *,
     power_scaler: MinMaxScaler,
-    soc_scaler: MinMaxScaler,
     idx_power_inp: int,
-    idx_soc_inp: int,
     w_h: np.ndarray,
-    w_c: np.ndarray,
     cap: float = 5.0,
     t_min_eval: int = 1,
 ) -> tuple[float, int]:
-    """Compute RWSE for one bundle using calibrated medians and MADs.
+    """Computes RWSE score for a single session bundle (power-only).
 
-    Works for power-only (C == 1) and power+SOC (C == 2) heads.
+    The score is the robust weighted squared error over horizons, where
+    residuals are scaled by median and MAD, capped at `cap`, and aggregated
+    with exponential horizon weights w_h.
+
+    Args:
+        bundle: session prediction bundle.
+        m: median residuals from fit_rwse_robust_scalers, shape (1,).
+        mad: MAD residuals from fit_rwse_robust_scalers, shape (1,).
+        power_scaler: fitted MinMaxScaler for power.
+        idx_power_inp: index of power in input feature vector.
+        w_h: horizon weights of shape (H,) that sum to 1.
+        cap: cap on |scaled residual|, applied before squaring.
+        t_min_eval: minimum time index t used in the score.
+
+    Returns:
+        score: RWSE value for this session.
+        t_eff: number of effective time steps contributing to the score.
     """
-    Y_scaled = np.asarray(bundle.Y_sample, dtype=np.float64)  # (T,H,C)
-    P_scaled = np.asarray(bundle.P_sample, dtype=np.float64)  # (T,H,C)
-    T, H, C = Y_scaled.shape
+    T = bundle.length
+    H = bundle.horizon
 
-    # base in scaled space
-    if C == 1:
-        base = bundle.X_sample[:, [idx_power_inp]].unsqueeze(1).numpy() # (T,1,1)
+    if T <= t_min_eval + 1:
+        return 0.0, 0
+
+    X = bundle.X_sample.unsqueeze(0)         # [1, T, C_in]
+    P_res = bundle.P_sample.unsqueeze(0)     # [1, T, H, 1]
+    Y_res = bundle.Y_sample.unsqueeze(0)     # [1, T, H, 1]
+    lengths = torch.tensor([bundle.length], dtype=torch.long)
+
+    P_abs, Y_abs = reconstruct_abs_from_residuals_batch(
+        X_batch=X,
+        P_batch=P_res,
+        Y_batch=Y_res,
+        lengths=lengths,
+        idx_power_inp=idx_power_inp,
+        power_min=float(power_scaler.data_min_[0]),
+        power_max=float(power_scaler.data_max_[0]),
+    )
+    P = P_abs[0, :, :, 0].cpu().numpy()   # [T_common, H]
+    Y = Y_abs[0, :, :, 0].cpu().numpy()
+
+    if P.shape[0] <= t_min_eval:
+        return 0.0, 0
+
+    P_use = P[t_min_eval:, :]    # [T_eff, H]
+    Y_use = Y[t_min_eval:, :]
+    t_eff = P_use.shape[0]
+
+    resid = Y_use - P_use              # [T_eff, H]
+    resid_vec = resid.reshape(-1, 1)   # [T_eff * H, 1]
+
+    m_power = float(m[0])
+    mad_power = float(mad[0]) if mad[0] != 0.0 else 1e-6
+
+    resid_scaled = (resid_vec - m_power) / mad_power
+    resid_scaled_sq = np.clip(resid_scaled**2, a_min=None, a_max=cap**2)
+
+    # reshape back to [T_eff, H, 1]; feature weights are 1 for power
+    per_h_res = resid_scaled_sq.reshape(t_eff, H, 1)
+    per_t_res = np.sqrt(np.sum(per_h_res, axis=2))      # [T_eff, H]
+
+    # aggregate over horizons with weights w_h (sum to 1)
+    score = float(np.sum(per_t_res * w_h[np.newaxis, :]))
+    return score, t_eff
+
+
+def compute_session_RWSE(
+    model: nn.Module,
+    df_scaled: pd.DataFrame,
+    device: torch.device,
+    input_features: list[str],
+    target_features: list[str],
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+    m: np.ndarray,
+    mad: np.ndarray,
+    horizon: int,
+    horizon_weights_decay: float = 0.4,
+    cap: float = 5.0,
+    t_min_eval: int = 1,
+    session_ids: Iterable[int] | None = None,
+) -> pd.DataFrame:
+    """Computes RWSE per charging session for a power-only residual model.
+
+    Args:
+        model: trained residual forecaster.
+        df_scaled: panel of scaled charging sessions.
+        device: torch device used for inference.
+        input_features: list of input feature names.
+        target_features: list of target feature names (includes power only).
+        power_scaler: fitted MinMaxScaler for power.
+        idx_power_inp: index of power in input feature vector.
+        m: median residuals from fit_rwse_robust_scalers, shape (1,).
+        mad: MAD residuals from fit_rwse_robust_scalers, shape (1,).
+        horizon: forecast horizon H.
+        horizon_weights_decay: decay for exponential horizon weights.
+        cap: cap on |scaled residual| in RWSE.
+        t_min_eval: minimum time index t used in the score.
+        session_ids: optional subset of charging ids to evaluate.
+
+    Returns:
+        DataFrame with columns: charging_id, length, error (RWSE).
+    """
+    rows: list[dict] = []
+
+    if not session_ids:
+        session_ids = list(list_unique_session_ids(df_scaled))
     else:
-        base = bundle.X_sample[:, [idx_power_inp, idx_soc_inp]].unsqueeze(1).numpy() # (T,1,2)
+        session_ids = list(map(int, session_ids))
 
-    Y_abs_scaled = base + Y_scaled
-    P_abs_scaled = base + P_scaled
+    w_h = make_horizon_weights(horizon, decay=horizon_weights_decay)
 
-    Y_abs = inverse_targets_np(Y_abs_scaled, power_scaler, soc_scaler)  # (T,H,C)
-    P_abs = inverse_targets_np(P_abs_scaled, power_scaler, soc_scaler) # (T,H,C)
+    for sid in session_ids:
+        bundle = make_bundle_from_session_df(
+            model=model,
+            df_scaled=df_scaled,
+            sid=int(sid),
+            device=device,
+            input_features=input_features,
+            target_features=target_features,
+            horizon=horizon,
+        )
+        s, L = rwse_score_from_bundle(
+            bundle=bundle,
+            m=m,
+            mad=mad,
+            power_scaler=power_scaler,
+            idx_power_inp=idx_power_inp,
+            w_h=w_h,
+            cap=cap,
+            t_min_eval=t_min_eval,
+        )
+        rows.append(
+            {
+                "charging_id": int(sid),
+                "length": int(L),
+                "error": float(s),
+            }
+        )
 
-    t0 = min(int(t_min_eval), max(0, T - 1))
-    R = (Y_abs - P_abs)[t0:]  # (T',H,C)
-    if R.size == 0:
-        return 0.0, T
-
-    m   = np.asarray(m,   dtype=np.float64) # (H,C)
-    mad = np.asarray(mad, dtype=np.float64) # (H,C)
-    w_h = np.asarray(w_h, dtype=np.float64) # (H,)
-    w_c = np.asarray(w_c, dtype=np.float64) # (C,)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        Z  = np.abs(R - m[None, :, :]) / mad[None, :, :]  # (T',H,C)
-        Z  = np.clip(Z, a_min=None, a_max=cap)
-        Zw = Z * w_h[None, :, None] * w_c[None, None, :]
-        Zw = np.nan_to_num(Zw, nan=0.0, posinf=cap, neginf=0.0)
-
-    score = Zw.sum(axis=(1, 2)).mean()
-    return float(score), T
+    return pd.DataFrame(rows)
 
 
 @torch.inference_mode()
@@ -415,28 +587,35 @@ def compute_session_MRMSE(
     loader: Iterable[Tuple[List[int], Tensor, Tensor, Tensor]],
     device: torch.device,
     power_scaler: MinMaxScaler,
-    soc_scaler: Optional[MinMaxScaler],
-    power_weight: float,
     idx_power_inp: int,
-    idx_soc_inp: Optional[int],
     t_min_eval: int,
-    horizon_weights_decay: Optional[float] = None,
+    horizon_weights_decay: float,
 ) -> pd.DataFrame:
-    """computes per-session Macro-RMSE (kW) for a *single-target* (power) residual forecaster.
+    """computes per-session macro-RMSE (kW) for a single-target power forecaster.
 
-    it reconstructs absolute power predictions from residuals, aligns prediction and
-    target time dimensions, and then calls `macro_rmse_per_session` to obtain one
-    error value per sequence. soc-related arguments are kept for backwards
-    compatibility but are ignored when the model predicts power only.
+    this is the power-only version used in the anomaly-detection and ORS notebooks.
+    any SOC-related arguments are accepted for backwards compatibility but ignored.
+
+    args:
+        model: trained residual forecasting model.
+        loader: iterable yielding (session_ids, X_batch, Y_batch, lengths).
+        device: torch device used for inference.
+        power_scaler: fitted MinMaxScaler for power.
+        idx_power_inp: index of power in the input feature vector.
+        t_min_eval: minimum time index from which errors contribute.
+        horizon_weights_decay: horizon decay parameter lambda.
+        soc_scaler: unused; kept for backwards compatibility.
+        power_weight: unused; kept for backwards compatibility.
+        idx_soc_inp: unused; kept for backwards compatibility.
+
+    returns:
+        dataframe with columns ["charging_id", "error", "length"].
     """
     model.eval()
     rows: list[dict[str, float | int]] = []
 
-    # allow both a DataLoader and a simple list [(session_ids, X, Y, lengths)]
-    for batch in loader:
-        session_ids, Xb, Yb, lengths = batch  # Xb: [B, T, D], Yb: [B, T, H, 1] or [B, T, H]
-
-        # ensure tensor types
+    for session_ids, Xb, Yb, lengths in loader:
+        # ensure tensors and dtypes
         if not torch.is_tensor(lengths):
             lengths = torch.as_tensor(lengths, dtype=torch.long)
         else:
@@ -445,53 +624,59 @@ def compute_session_MRMSE(
         Xb = Xb.to(device=device, non_blocking=True)
         Yb = Yb.to(device=device, non_blocking=True)
 
-        # model forward: lengths must be on cpu for packing
+        # forward pass: lengths on cpu for packing, outputs on device
         lengths_cpu = lengths.to(device="cpu", dtype=torch.long)
-        P_res, _ = model(Xb, lengths_cpu)  # [B, T_pred, H] or [B, T_pred, H, 1]
+        P_res, _ = model(Xb, lengths_cpu)          # [B, T_pred, H] or [B, T_pred, H, 1]
         if P_res.dim() == 3:
-            P_res = P_res.unsqueeze(-1)    # -> [B, T_pred, H, 1]
+            P_res = P_res.unsqueeze(-1)            # -> [B, T_pred, H, 1]
 
-        # reconstruct absolute *scaled* predictions; power-only when idx_soc_inp is None
-        P_abs_scaled = reconstruct_abs_from_residuals_batch(P_res, Xb, idx_power_inp, idx_soc_inp)
+        # reconstruct absolute predictions in scaled space
+        P_abs_scaled = reconstruct_abs_from_residuals_batch(
+            P_res=P_res,
+            X=Xb,
+            idx_power=idx_power_inp,
+            idx_soc=None,
+        )
         if P_abs_scaled.dim() == 3:
-            P_abs_scaled = P_abs_scaled.unsqueeze(-1)  # safety
+            P_abs_scaled = P_abs_scaled.unsqueeze(-1)
 
-        # absolute targets (scaled), using the same base power feature as during training
+        # absolute targets (scaled), using same base power as during training
         base_power = Xb[..., [idx_power_inp]].unsqueeze(2)  # [B, T, 1, 1]
         Y_abs_scaled = base_power + Yb                      # [B, T, H, 1]
 
-        # align time dimensions between predictions and targets
+        # align prediction / target time dims
         T_pred = P_abs_scaled.shape[1]
         T_true = Y_abs_scaled.shape[1]
         T_common = min(T_pred, T_true)
         if T_common <= 0:
-            continue  # nothing to evaluate
+            continue
 
         if T_pred != T_true:
-            P_use = P_abs_scaled[:, :T_common]            # [B, T_common, H, 1]
-            Y_use = Y_abs_scaled[:, :T_common]            # [B, T_common, H, 1]
-            lengths_use = lengths.clamp(max=T_common)     # keep consistent with T_common
+            P_use = P_abs_scaled[:, :T_common]
+            Y_use = Y_abs_scaled[:, :T_common]
+            lengths_use = lengths.clamp(max=T_common)
         else:
             P_use = P_abs_scaled
             Y_use = Y_abs_scaled
             lengths_use = lengths
 
-        # scalar min/max from the power scaler
         power_min = float(power_scaler.data_min_[0])
         power_max = float(power_scaler.data_max_[0])
-        decay = float(horizon_weights_decay) if horizon_weights_decay is not None else None
 
-        # single-target power channel
-        P_abs_power = P_use[..., 0:1]  # [B, T_common, H, 1]
+        errs_tensor = macro_rmse_per_session(
+            P_abs=P_use,
+            Y_abs=Y_use,
+            lengths=lengths_use,
+            power_min=power_min,
+            power_max=power_max,
+            decay=horizon_weights_decay,
+            t_min_eval=t_min_eval,
+        )
 
-        # compute per-sequence Macro-RMSE (kW); returns tensor of shape [B]
-        errs_tensor = macro_rmse_per_session(P_abs_power, Y_use, lengths_use, power_min, power_max, decay)
         errs = errs_tensor.detach().cpu().tolist()
         lens = lengths_use.detach().cpu().tolist()
 
         for sid, e, L in zip(session_ids, errs, lens):
-            if math.isnan(e):
-                continue
             rows.append(
                 {
                     "charging_id": int(sid),
@@ -560,7 +745,7 @@ def compute_bundle_error(bundle: SessionPredsBundle,
     T, H = bundle.length, bundle.horizon
 
     # scaled → absolute (scaled)
-    P_abs_scaled = reconstruct_abs_from_bundle(bundle, idx_power_inp, idx_soc_inp)  # (T,H,2)
+    P_abs_scaled = reconstruct_abs_from_bundle(bundle, power_scaler, idx_power_inp)  # (T,H,2)
     base = bundle.X_sample[:, [idx_power_inp, idx_soc_inp]].unsqueeze(1)  # (T,1,2)
     Y_abs_scaled = base + bundle.Y_sample  # (T,H,2)
 
@@ -662,7 +847,7 @@ def classify_session(
     power_max = torch.tensor(float(power_scaler.data_max_[0]))
 
     err_tensor = macro_rmse_per_session(
-        P_abs_b, Y_abs_b, lengths, power_min, power_max, decay
+        P_abs_b, Y_abs_b, lengths, power_min, power_max, decay, t_min_eval
     )
     error = float(err_tensor[0].item())
     label = int(error > float(threshold))

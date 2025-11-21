@@ -60,3 +60,15 @@ Examples are raw series, and are selected with random sampling (unordered).
     2. Calculate simplifications for all charging sessions. Store simplifications along with their simplicity (k), robustness, fidelity and margin (threshold - error for nomal; error - threshold for abnormal) metrics. 
     3. Order all sessions by k (ascending) and margin (descending). 
     4. 
+
+
+TASK FORMULATION FOR LLM EVALUATION
+There is an AI that has been trained on a large dataset of electric vehicle (EV) charging sessions. The AI is able to classify unseen charging sessions as "normal" or "abnormal" based on information such as the power transfer between the charger and battery in kW over time, the state of charge (SOC) of the battery over time, as well as other features such as temperature and charger specifications. 
+
+You don't know anything else about the AI. 
+
+We have provided you with 10 images (examples) of charging sessions. These examples include the power transfer in kW over time (minutes elapsed since the beginning of the charging session) and the SOC over time. These data are also given to the AI. In addition, we have provided you with a simplified version of the power curve. When given to the AI, this simplified version resulted in the exact same classification/label as for the original power curve, even though the AI never saw the original and simplified curves together as you do here. 
+
+Based on what you can infer about the AI's behaviour from these examples and the information above, what do you think the AI would classify each example as? Provide your guesses ("normal" vs "abnormal") for all 10 examples. 
+
+IMPORTANT: DO NOT USE INFORMATION IN THE IMAGE FILE NAME. 
