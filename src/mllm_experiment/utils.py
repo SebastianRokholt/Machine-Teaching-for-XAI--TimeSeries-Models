@@ -2,8 +2,41 @@
 # Logging, CSV / JSONL helpers
 from __future__ import annotations
 import csv
+import logging
 from pathlib import Path
 from typing import Any
+from pyparsing import Optional
+from typing_extensions import Literal
+
+
+def setup_logging(
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO", 
+    log_file: Optional[Path] = None,
+) -> None:
+    """Configure root logging for the experiment runner.
+
+    This function sets the global logging level based on the verbose
+    flag and attaches stream and optional file handlers.
+    """
+    log_level_mapper = {
+        "DEBUG": logging.DEBUG, 
+        "INFO": logging.INFO, 
+        "WARNING": logging.WARNING, 
+        "ERROR": logging.ERROR, 
+        "CRITICAL": logging.CRITICAL
+    }
+    log_level = log_level_mapper.get(log_level.upper(), logging.INFO)
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
 
 
 def write_dicts_to_csv(rows: list[dict[str, Any]], path: Path) -> None:

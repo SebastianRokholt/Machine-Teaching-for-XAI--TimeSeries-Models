@@ -1,6 +1,7 @@
 # src/mllm_experiment/config.py
 from dataclasses import dataclass
 from pathlib import Path
+from typing_extensions import Literal
 
 
 TEACHING_METADATA_FILENAME = "teaching_items.csv"
@@ -36,17 +37,16 @@ class ExperimentConfig:
     exam_root: Path
     metadata_root: Path
     output_root: Path
-    model_name: str = "gpt-5.1"
+    model_name: str = "gpt-5-mini"
     pre_exam_items: int = 20
     post_exam_items: int = 20
     teaching_items: int = 50
     random_seed: int = None
-
-    def ensure_output_directory(self) -> None:
-        """Create the output directory if it does not yet exist.
-
-        This method creates the output directory on disk. The teaching,
-        exam and metadata directories must already exist and are not
-        created here.
-        """
+    logfile_path: Path = None
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    
+    def __post_init__(self):
+        if self.logfile_path is None:
+            self.logfile_path = self.output_root / "experiment.log"
+        # Ensure the output directory
         self.output_root.mkdir(parents=True, exist_ok=True)
