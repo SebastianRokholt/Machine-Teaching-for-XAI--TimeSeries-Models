@@ -225,7 +225,7 @@ def build_teaching_metadata(groups: list[str]) -> None:
 
 def main() -> None:
     """Entry point for the script when run from the command line."""
-    groups = ["A", "B", "C"]
+    groups = ["A", "B", "C", "D"]
     build_teaching_metadata(groups)
 
 
