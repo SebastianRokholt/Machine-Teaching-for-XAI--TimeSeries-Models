@@ -3,11 +3,13 @@
 # trial.py
 from __future__ import annotations
 import json
+import logging
 from pathlib import Path
 import random
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from tqdm.auto import tqdm
 
 from .data_loading import (
     ExampleItem,
@@ -30,6 +32,8 @@ from .prompts import (
     exam_system_message,
 )
 from .config import ExperimentConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -69,9 +73,7 @@ class TrialRunner:
         self.client = client
         self.verbose = verbose
 
-        if self.verbose:
-            print("[trial] loading metadata")
-
+        logger.debug("[trial] loading metadata")
         self.teaching_by_group = load_teaching_metadata(config)
         self.exam_by_set = load_exam_metadata(config)
 
@@ -83,12 +85,13 @@ class TrialRunner:
             index: Index of the participant within this run.
         """
         participant = self._sample_participant_config(rng, index)
-        if self.verbose:
-            print(
-                f"[trial] starting participant {participant.participant_id} "
-                f"in group {participant.group.value}, "
-                f"pre={participant.exam_set_pre}, post={participant.exam_set_post}"
-            )
+        logger.info(
+            "[trial] starting participant %s in group %s, pre=%s, post=%s",
+            participant.participant_id,
+            participant.group.value,
+            participant.exam_set_pre,
+            participant.exam_set_post,
+        )
 
         # initialise chat history with a system message
         messages: list[dict[str, Any]] = [exam_system_message()]
@@ -133,6 +136,14 @@ class TrialRunner:
         }
         log_participant_summaries([summary_row], self.config.output_root)
 
+        logger.info(
+            "[trial] completed participant %s (accuracy_pre=%.3f, accuracy_post=%.3f, delta=%.3f)",
+            participant.participant_id,
+            pre_accuracy,
+            post_accuracy,
+            post_accuracy - pre_accuracy,
+        )
+
     def _sample_participant_config(self, rng: random.Random, index: int) -> ParticipantConfig:
         """Sample group and exam sets for one participant."""
         participant_id = f"p_{index:04d}_{uuid.uuid4().hex[:8]}"
@@ -142,6 +153,7 @@ class TrialRunner:
         exam_sets = list(self.exam_by_set.keys())
         if len(exam_sets) != 2:
             msg = f"Expected exactly two exam sets, found {len(exam_sets)}."
+            logger.exception(msg)
             raise ValueError(msg)
 
         rng.shuffle(exam_sets)
@@ -201,9 +213,9 @@ class TrialRunner:
             exam_items=item_paths,
         )
         messages.append({"role": "user", "content": user_content})
-        print("[trial] Sending exam prompt with "f"{len(item_paths)} items to model.")
-        print("[trial] Exam prompt content preview:")
-        print([c for c in user_content if c.get("type") == "text"])
+        logger.info("[trial] sending exam prompt with %d items to model.", len(item_paths))
+        logger.debug("[trial] exam prompt content preview: %s", [c for c in user_content if c.get("type") == "text"])
+
         model_response: ModelResponse = self.client.call(messages, verbose=self.verbose)
 
         # append assistant reply to history
@@ -239,8 +251,12 @@ class TrialRunner:
             rows.append(row)
 
         accuracy = correct / len(item_paths) if item_paths else 0.0
-        if self.verbose:
-            print(f"[trial] {participant.participant_id} phase={phase.value} accuracy={accuracy:.3f}")
+        logger.info(
+            "[trial] %s phase=%s accuracy=%.3f",
+            participant.participant_id,
+            phase.value,
+            accuracy,
+        )
 
         return rows, accuracy, messages
 
@@ -271,13 +287,16 @@ class TrialRunner:
             try:
                 obj = json.loads(text)
             except Exception:
+                logger.error("[trial] failed to parse model response as JSON. Response: %s", model_response.raw_text)
                 return answers
 
         if not isinstance(obj, dict):
+            logger.error("[trial] parsed JSON exam answers are not a dict")
             return answers
 
         answers_list = obj.get("answers")
         if not isinstance(answers_list, list):
+            logger.error("[trial] parsed JSON exam answers 'answers' field is not a list")
             return answers
 
         for entry in answers_list:
@@ -286,15 +305,15 @@ class TrialRunner:
             item_id = str(entry.get("item_id"))
             guess = str(entry.get("guess")).lower()
             if guess not in ("normal", "abnormal"):
+                logger.warning("[trial] invalid guess label '%s' for item_id=%s", guess, item_id)
                 continue
             answers[item_id] = guess
 
         if len(answers) != expected_count and expected_count > 0 and len(answers) == 0:
-            if self.verbose:
-                print(
-                    "[trial] warning: could not parse any valid answers "
-                    f"(expected {expected_count})"
-                )
+            logger.error(
+                "[trial] warning: could not parse any valid answers "
+                f"(expected {expected_count})"
+            )
 
         return answers
 
@@ -327,7 +346,7 @@ class TrialRunner:
 
         rows: list[dict[str, Any]] = []
 
-        for idx, item in enumerate(teaching_items, start=1):
+        for idx, item in tqdm(enumerate(teaching_items, start=1), desc="Teaching examples", unit="example"):
             image_path = resolve_teaching_image_path(self.config.teaching_root, item)
             user_content = build_teaching_user_content(
                 group=participant.group,
@@ -361,15 +380,14 @@ class TrialRunner:
             }
             rows.append(row)
 
-        if self.verbose:
-            print(f"[trial] teaching phase completed for {participant.participant_id}")
+        logger.info(f"[trial] teaching phase completed for {participant.participant_id}")
 
         return rows, messages
 
-    def debug_print_summary(self) -> None:
+    def debug_summary(self) -> None:
         """Print a small summary of loaded metadata for debugging."""
-        print("[trial] metadata summary")
+        logger.debug("[trial] metadata summary")
         for group, items in self.teaching_by_group.items():
-            print(f"  group {group.value}: {len(items)} teaching items")
+            logger.debug(f"  group {group.value}: {len(items)} teaching items")
         for exam_set_id, items in self.exam_by_set.items():
-            print(f"  exam set {exam_set_id}: {len(items)} exam items")
+            logger.debug(f"  exam set {exam_set_id}: {len(items)} exam items")

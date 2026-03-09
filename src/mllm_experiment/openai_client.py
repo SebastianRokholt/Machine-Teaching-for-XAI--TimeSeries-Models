@@ -3,11 +3,14 @@
 from __future__ import annotations
 import json
 import os
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 from openai import OpenAI
 from pyparsing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -63,6 +66,7 @@ class OpenAIChatClient:
         then be handled by the dummy call path.
         """
         if self.use_dummy:
+            logger.info("OpenAIChatClient initialised in dummy mode")
             self.client = None
             return
         if not os.getenv("OPENAI_API_KEY"):
@@ -73,8 +77,10 @@ class OpenAIChatClient:
                     "OPENAI_API_KEY is not set. Please export your API key before "
                     "running the experiment or use --dry-run."
                 )
+                logger.critical(msg)
                 raise RuntimeError(msg)
         self.client = OpenAI()
+        logger.debug("OpenAIChatClient initialised with model %s", self.model)
 
     def call(
         self,
@@ -92,13 +98,13 @@ class OpenAIChatClient:
             ModelResponse with raw text, parsed JSON and usage metadata.
         """
         if self.client is None and not self.use_dummy:
+            logger.critical("OpenAI client is not initialised.")
             raise RuntimeError("OpenAI client is not initialised.")
         
         if self.use_dummy:
             return self._dummy_call(messages, verbose=verbose)
 
-        if verbose:
-            print(f"[openai_client] sending {len(messages)} messages to model {self.model}")
+        logging.debug(f"[openai_client] sending {len(messages)} messages to model {self.model}")
 
         start = time.perf_counter()
 
@@ -120,7 +126,7 @@ class OpenAIChatClient:
 
         response = self.client.chat.completions.create(**kwargs)
         end = time.perf_counter()
-        latency_ms = (end - start) * 1000.0
+        latency_s = (end - start) * 1000000.0
         message = response.choices[0].message
 
         # message.content is usually a string, but be defensive in case
@@ -142,21 +148,22 @@ class OpenAIChatClient:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError:
             parsed = None
-            if verbose:
-                print("[openai_client] warning: response is not valid JSON")
-                preview = raw_content[:300].replace("\n", " ")
-                print(f"[openai_client] response: {response}")
+            preview_source = raw_text if isinstance(raw_text, str) else str(raw_text)
+            preview = preview_source[:300].replace("\n", " ")
+            logger.warning(
+                "[openai_client] response is not valid JSON; preview: %s ...",
+                preview,
+            )
 
         prompt_tokens = getattr(response.usage, "prompt_tokens", None)
         completion_tokens = getattr(response.usage, "completion_tokens", None)
 
-        if verbose:
-            print(f"[openai_client] latency: {latency_ms:.1f} ms")
+        logger.debug(f"[openai_client] latency: {latency_s:.1f}s")
 
         return ModelResponse(
             raw_text=raw_text,
             parsed_json=parsed,
-            latency_ms=latency_ms,
+            latency_ms=latency_s,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
@@ -185,8 +192,7 @@ class OpenAIChatClient:
         Returns:
             ModelResponse with synthetic JSON and zeroed usage metrics.
         """
-        if verbose:
-            print("[openai_client] dummy mode: generating synthetic response")
+        logger.debug("[openai_client] dummy mode: generating synthetic response")
 
         if not messages:
             raw_text = '{"acknowledged": true}'
@@ -228,11 +234,10 @@ class OpenAIChatClient:
             raw_text = '{"acknowledged": true}'
             parsed = {"acknowledged": True}
 
-        if verbose:
-            if exam_prompt:
-                print(f"[openai_client] dummy exam response with {len(item_ids)} answers")
-            else:
-                print("[openai_client] dummy teaching acknowledgement")
+        if exam_prompt:
+            logger.debug(f"[openai_client] dummy exam response with {len(item_ids)} answers")
+        else:
+            logger.debug("[openai_client] dummy teaching acknowledgement")
 
         return ModelResponse(
             raw_text=raw_text,
