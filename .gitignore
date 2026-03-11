@@ -10,6 +10,7 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Data
+Data/mllm_experiment_results/
 Data/map_data_for_plotting/
 Data/teaching_pool/*
 Data/exam_teaching_pool/*
@@ -38,3 +39,7 @@ Backups/
 
 # VS Code
 .vscode
+
+# Notes etc. 
+notes.md
+AGENTS.md
