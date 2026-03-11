@@ -2,13 +2,14 @@
 # wrapper around OpenAI Responses API
 from __future__ import annotations
 import json
-import os
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
 from openai import OpenAI
-from pyparsing import Optional
+
+from .utils import ExperimentEventLogger
 
 logger = logging.getLogger(__name__)
 
@@ -47,17 +48,18 @@ class OpenAIChatClient:
     Attributes:
         model: Name of the OpenAI model to use.
         temperature: Sampling temperature for the model.
-        max_output_tokens: Maximum number of tokens in the completion.
+        max_completion_tokens: Maximum number of tokens in the completion.
         use_dummy: If true, skip real API calls and return synthetic
             responses for dry-run debugging.
     """
 
     model: str
-    temperature: Optional[float] = None
-    max_completion_tokens: int = None
+    temperature: float | None = None
+    max_completion_tokens: int | None = None
     use_dummy: bool = False
-    client: Optional[Any] = field(init=False, default=None)
-    
+    event_logger: ExperimentEventLogger | None = None
+    client: Any | None = field(init=False, default=None)
+
     def __post_init__(self) -> None:
         """Initialise the underlying OpenAI client or dummy mode.
 
@@ -86,6 +88,7 @@ class OpenAIChatClient:
         self,
         messages: list[dict[str, Any]],
         verbose: bool = False,
+        call_context: dict[str, Any] | None = None,
     ) -> ModelResponse:
         """Call the OpenAI chat API or generate a dummy response.
 
@@ -93,6 +96,7 @@ class OpenAIChatClient:
             messages: Full chat history including system, user and
                 assistant messages.
             verbose: Flag that controls extra debug printing.
+            call_context: Optional context fields for structured logging.
 
         Returns:
             ModelResponse with raw text, parsed JSON and usage metadata.
@@ -100,16 +104,24 @@ class OpenAIChatClient:
         if self.client is None and not self.use_dummy:
             logger.critical("OpenAI client is not initialised.")
             raise RuntimeError("OpenAI client is not initialised.")
-        
-        if self.use_dummy:
-            return self._dummy_call(messages, verbose=verbose)
 
-        logging.debug(f"[openai_client] sending {len(messages)} messages to model {self.model}")
+        if self.use_dummy:
+            return self._dummy_call(
+                messages=messages,
+                verbose=verbose,
+                call_context=call_context,
+            )
+
+        logger.debug(
+            "[openai_client] sending model request model=%s messages=%d",
+            self.model,
+            len(messages),
+        )
 
         start = time.perf_counter()
 
         is_mini_model = "mini" in self.model
-        
+
         # uses kwargs so we can easily omit unsupported parameters.
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -126,7 +138,7 @@ class OpenAIChatClient:
 
         response = self.client.chat.completions.create(**kwargs)
         end = time.perf_counter()
-        latency_s = (end - start) * 1000000.0
+        latency_ms = (end - start) * 1000.0
         message = response.choices[0].message
 
         # message.content is usually a string, but be defensive in case
@@ -158,12 +170,21 @@ class OpenAIChatClient:
         prompt_tokens = getattr(response.usage, "prompt_tokens", None)
         completion_tokens = getattr(response.usage, "completion_tokens", None)
 
-        logger.debug(f"[openai_client] latency: {latency_s:.1f}s")
+        logger.debug("[openai_client] latency_ms=%.1f", latency_ms)
+
+        self._log_model_call_complete(
+            call_context=call_context,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            response_length=len(raw_text),
+            message_count=len(messages),
+        )
 
         return ModelResponse(
             raw_text=raw_text,
             parsed_json=parsed,
-            latency_ms=latency_s,
+            latency_ms=latency_ms,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
@@ -172,6 +193,7 @@ class OpenAIChatClient:
         self,
         messages: list[dict[str, Any]],
         verbose: bool = False,
+        call_context: dict[str, Any] | None = None,
     ) -> ModelResponse:
         """Generate a synthetic response for dry-run debugging.
 
@@ -188,6 +210,7 @@ class OpenAIChatClient:
             messages: Full chat history including system, user and
                 assistant messages.
             verbose: Flag that controls extra debug printing.
+            call_context: Optional context fields for structured logging.
 
         Returns:
             ModelResponse with synthetic JSON and zeroed usage metrics.
@@ -197,6 +220,14 @@ class OpenAIChatClient:
         if not messages:
             raw_text = '{"acknowledged": true}'
             parsed = json.loads(raw_text)
+            self._log_model_call_complete(
+                call_context=call_context,
+                latency_ms=0.0,
+                prompt_tokens=None,
+                completion_tokens=None,
+                response_length=len(raw_text),
+                message_count=0,
+            )
             return ModelResponse(
                 raw_text=raw_text,
                 parsed_json=parsed,
@@ -207,7 +238,7 @@ class OpenAIChatClient:
 
         last = messages[-1]
         content = last.get("content", [])
-        exam_prompt = False
+        text_parts: list[str] = []
         item_ids: list[str] = []
 
         for part in content:
@@ -215,8 +246,7 @@ class OpenAIChatClient:
                 continue
             if part.get("type") == "text":
                 text = str(part.get("text", ""))
-                if "answer with a JSON object of the form" in text:
-                    exam_prompt = True
+                text_parts.append(text)
                 if "item_id=" in text:
                     start = text.find("item_id=") + len("item_id=")
                     end = text.find(")", start)
@@ -226,7 +256,9 @@ class OpenAIChatClient:
                     if item_id:
                         item_ids.append(item_id)
 
-        if exam_prompt and item_ids:
+        exam_prompt = self._is_exam_prompt(text_parts=text_parts)
+
+        if exam_prompt:
             answers = [{"item_id": iid, "guess": "normal"} for iid in item_ids]
             raw_text = json.dumps({"answers": answers})
             parsed = {"answers": answers}
@@ -239,10 +271,79 @@ class OpenAIChatClient:
         else:
             logger.debug("[openai_client] dummy teaching acknowledgement")
 
+        self._log_model_call_complete(
+            call_context=call_context,
+            latency_ms=0.0,
+            prompt_tokens=None,
+            completion_tokens=None,
+            response_length=len(raw_text),
+            message_count=len(messages),
+        )
+
         return ModelResponse(
             raw_text=raw_text,
             parsed_json=parsed,
             latency_ms=0.0,
             prompt_tokens=None,
             completion_tokens=None,
+        )
+
+    def _is_exam_prompt(self, text_parts: list[str]) -> bool:
+        """Detect whether the current prompt is an exam prompt.
+
+        Args:
+            text_parts: Text segments from the last user message.
+
+        Returns:
+            True when the message asks for batch exam answers.
+        """
+        if not text_parts:
+            return False
+
+        text = " ".join(text_parts).lower()
+        has_answers = "'answers'" in text or '"answers"' in text
+        has_guess = "'guess'" in text or '"guess"' in text or "guess" in text
+        has_batch_exam = "batch" in text and "exam" in text
+        has_item_id = "item_id" in text
+        return (has_batch_exam and has_guess) or (has_answers and has_guess and has_item_id)
+
+    def _log_model_call_complete(
+        self,
+        call_context: dict[str, Any] | None,
+        latency_ms: float,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        response_length: int,
+        message_count: int,
+    ) -> None:
+        """Emit one structured model call summary event.
+
+        Args:
+            call_context: Optional context fields from the caller.
+            latency_ms: Call latency in milliseconds.
+            prompt_tokens: Prompt token count when available.
+            completion_tokens: Completion token count when available.
+            response_length: Length of raw response text.
+            message_count: Number of chat messages sent to the model.
+        """
+        if self.event_logger is None:
+            return
+
+        fields = dict(call_context or {})
+        fields.update(
+            {
+                "status": "completed",
+                "mode": "dummy" if self.use_dummy else "api",
+                "latency_ms": round(latency_ms, 3),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "response_length": response_length,
+                "message_count": message_count,
+            }
+        )
+        self.event_logger.log(
+            logger=logger,
+            event="model.call.complete",
+            level=logging.INFO,
+            **fields,
         )

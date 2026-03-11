@@ -4,7 +4,6 @@
 from __future__ import annotations
 import json
 import logging
-from pathlib import Path
 import random
 import uuid
 from dataclasses import dataclass
@@ -21,6 +20,7 @@ from .data_loading import (
     resolve_teaching_image_path,
 )
 from .utils import (
+    ExperimentEventLogger,
     log_exam_results,
     log_participant_summaries,
     log_teaching_results,
@@ -68,10 +68,17 @@ class TrialRunner:
         verbose: Flag that controls additional debug output.
     """
 
-    def __init__(self, config: ExperimentConfig, client: OpenAIChatClient, verbose: bool) -> None:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        client: OpenAIChatClient,
+        verbose: bool,
+        event_logger: ExperimentEventLogger | None = None,
+    ) -> None:
         self.config = config
         self.client = client
         self.verbose = verbose
+        self.event_logger = event_logger
 
         logger.debug("[trial] loading metadata")
         self.teaching_by_group = load_teaching_metadata(config)
@@ -85,12 +92,14 @@ class TrialRunner:
             index: Index of the participant within this run.
         """
         participant = self._sample_participant_config(rng, index)
-        logger.info(
-            "[trial] starting participant %s in group %s, pre=%s, post=%s",
-            participant.participant_id,
-            participant.group.value,
-            participant.exam_set_pre,
-            participant.exam_set_post,
+        self._log_event(
+            event="participant.start",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            group=participant.group.value,
+            exam_set_pre=participant.exam_set_pre,
+            exam_set_post=participant.exam_set_post,
+            status="started",
         )
 
         # initialise chat history with a system message
@@ -136,12 +145,17 @@ class TrialRunner:
         }
         log_participant_summaries([summary_row], self.config.output_root)
 
-        logger.info(
-            "[trial] completed participant %s (accuracy_pre=%.3f, accuracy_post=%.3f, delta=%.3f)",
-            participant.participant_id,
-            pre_accuracy,
-            post_accuracy,
-            post_accuracy - pre_accuracy,
+        self._log_event(
+            event="participant.complete",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            group=participant.group.value,
+            exam_set_pre=participant.exam_set_pre,
+            exam_set_post=participant.exam_set_post,
+            accuracy_pre=round(pre_accuracy, 6),
+            accuracy_post=round(post_accuracy, 6),
+            delta_accuracy=round(post_accuracy - pre_accuracy, 6),
+            status="completed",
         )
 
     def _sample_participant_config(self, rng: random.Random, index: int) -> ParticipantConfig:
@@ -213,15 +227,70 @@ class TrialRunner:
             exam_items=item_paths,
         )
         messages.append({"role": "user", "content": user_content})
-        logger.info("[trial] sending exam prompt with %d items to model.", len(item_paths))
-        logger.debug("[trial] exam prompt content preview: %s", [c for c in user_content if c.get("type") == "text"])
+        self._log_event(
+            event="phase.exam.start",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            phase=phase.value,
+            group=participant.group.value,
+            exam_set_id=exam_set_id,
+            items_count=len(item_paths),
+            modality=modality_shown,
+            status="started",
+        )
 
-        model_response: ModelResponse = self.client.call(messages, verbose=self.verbose)
+        text_part_count = sum(
+            1
+            for content in user_content
+            if isinstance(content, dict) and content.get("type") == "text"
+        )
+        image_part_count = sum(
+            1
+            for content in user_content
+            if isinstance(content, dict) and content.get("type") == "image_url"
+        )
+        logger.debug(
+            "[trial] exam prompt summary participant_id=%s phase=%s exam_set_id=%s "
+            "items=%d text_parts=%d image_parts=%d item_ids=%s",
+            participant.participant_id,
+            phase.value,
+            exam_set_id,
+            len(item_paths),
+            text_part_count,
+            image_part_count,
+            [item.item_id for item, _path in item_paths[:5]],
+        )
+
+        model_response: ModelResponse = self.client.call(
+            messages,
+            verbose=self.verbose,
+            call_context={
+                "participant_id": participant.participant_id,
+                "phase": phase.value,
+                "group": participant.group.value,
+                "exam_set_id": exam_set_id,
+                "call_type": "exam",
+                "items_count": len(item_paths),
+                "modality": modality_shown,
+            },
+        )
 
         # append assistant reply to history
         messages.append({"role": "assistant", "content": model_response.raw_text})
 
-        answers = self._parse_exam_answers(model_response, len(item_paths))
+        event_context = {
+            "participant_id": participant.participant_id,
+            "phase": phase.value,
+            "group": participant.group.value,
+            "exam_set_id": exam_set_id,
+            "call_type": "exam",
+            "modality": modality_shown,
+        }
+        answers = self._parse_exam_answers(
+            model_response=model_response,
+            expected_count=len(item_paths),
+            event_context=event_context,
+        )
         rows: list[dict[str, Any]] = []
         correct = 0
 
@@ -251,11 +320,19 @@ class TrialRunner:
             rows.append(row)
 
         accuracy = correct / len(item_paths) if item_paths else 0.0
-        logger.info(
-            "[trial] %s phase=%s accuracy=%.3f",
-            participant.participant_id,
-            phase.value,
-            accuracy,
+        self._log_event(
+            event="phase.exam.complete",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            phase=phase.value,
+            group=participant.group.value,
+            exam_set_id=exam_set_id,
+            items_count=len(item_paths),
+            parsed_answers_count=len(answers),
+            expected_answers_count=len(item_paths),
+            modality=modality_shown,
+            accuracy=round(accuracy, 6),
+            status="completed",
         )
 
         return rows, accuracy, messages
@@ -264,12 +341,14 @@ class TrialRunner:
         self,
         model_response: ModelResponse,
         expected_count: int,
+        event_context: dict[str, Any],
     ) -> dict[str, str]:
         """Parse the model's JSON exam answers into a dictionary.
 
         Args:
             model_response: ModelResponse returned by the OpenAI client.
             expected_count: Expected number of answers.
+            event_context: Context fields used for structured events.
 
         Returns:
             Dictionary mapping item_id to guessed class.
@@ -287,16 +366,37 @@ class TrialRunner:
             try:
                 obj = json.loads(text)
             except Exception:
-                logger.error("[trial] failed to parse model response as JSON. Response: %s", model_response.raw_text)
+                self._log_exam_parse_failure(
+                    event_context=event_context,
+                    expected_count=expected_count,
+                    parsed_count=0,
+                    error_type="json_decode_error",
+                    error_message="Model response is not valid JSON.",
+                    raw_text=model_response.raw_text,
+                )
                 return answers
 
         if not isinstance(obj, dict):
-            logger.error("[trial] parsed JSON exam answers are not a dict")
+            self._log_exam_parse_failure(
+                event_context=event_context,
+                expected_count=expected_count,
+                parsed_count=0,
+                error_type="invalid_json_shape",
+                error_message="Parsed JSON response is not an object.",
+                raw_text=model_response.raw_text,
+            )
             return answers
 
         answers_list = obj.get("answers")
         if not isinstance(answers_list, list):
-            logger.error("[trial] parsed JSON exam answers 'answers' field is not a list")
+            self._log_exam_parse_failure(
+                event_context=event_context,
+                expected_count=expected_count,
+                parsed_count=0,
+                error_type="missing_answers_list",
+                error_message="Parsed JSON response has no list in 'answers'.",
+                raw_text=model_response.raw_text,
+            )
             return answers
 
         for entry in answers_list:
@@ -310,9 +410,21 @@ class TrialRunner:
             answers[item_id] = guess
 
         if len(answers) != expected_count and expected_count > 0 and len(answers) == 0:
-            logger.error(
-                "[trial] warning: could not parse any valid answers "
-                f"(expected {expected_count})"
+            self._log_exam_parse_failure(
+                event_context=event_context,
+                expected_count=expected_count,
+                parsed_count=0,
+                error_type="no_valid_answers",
+                error_message="No valid answer entries were parsed.",
+                raw_text=model_response.raw_text,
+            )
+        elif len(answers) != expected_count:
+            logger.warning(
+                "[trial] parsed %d/%d answers for participant_id=%s phase=%s",
+                len(answers),
+                expected_count,
+                event_context.get("participant_id"),
+                event_context.get("phase"),
             )
 
         return answers
@@ -344,6 +456,25 @@ class TrialRunner:
         if participant.group in (Group.B, Group.C):
             rng.shuffle(teaching_items)
 
+        modality_shown = "overlay" if participant.group in (Group.A, Group.B) else "raw_only"
+        self._log_event(
+            event="phase.teaching.start",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            phase=Phase.TEACHING.value,
+            group=participant.group.value,
+            items_count=len(teaching_items),
+            modality=modality_shown,
+            status="started",
+        )
+        logger.debug(
+            "[trial] teaching prompt summary participant_id=%s group=%s items=%d item_ids=%s",
+            participant.participant_id,
+            participant.group.value,
+            len(teaching_items),
+            [item.item_id for item in teaching_items[:5]],
+        )
+
         rows: list[dict[str, Any]] = []
 
         for idx, item in tqdm(enumerate(teaching_items, start=1), desc="Teaching examples", unit="example"):
@@ -357,12 +488,22 @@ class TrialRunner:
             )
             messages.append({"role": "user", "content": user_content})
 
-            model_response = self.client.call(messages, verbose=self.verbose)
+            model_response = self.client.call(
+                messages,
+                verbose=self.verbose,
+                call_context={
+                    "participant_id": participant.participant_id,
+                    "phase": Phase.TEACHING.value,
+                    "group": participant.group.value,
+                    "item_id": item.item_id,
+                    "call_type": "teaching",
+                    "items_count": 1,
+                    "modality": modality_shown,
+                },
+            )
 
             # append assistant reply to history
             messages.append({"role": "assistant", "content": model_response.raw_text})
-
-            modality_shown = "overlay" if participant.group in (Group.A, Group.B) else "raw_only"
 
             row = {
                 "participant_id": participant.participant_id,
@@ -380,9 +521,89 @@ class TrialRunner:
             }
             rows.append(row)
 
-        logger.info(f"[trial] teaching phase completed for {participant.participant_id}")
+        self._log_event(
+            event="phase.teaching.complete",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            phase=Phase.TEACHING.value,
+            group=participant.group.value,
+            items_count=len(rows),
+            modality=modality_shown,
+            status="completed",
+        )
 
         return rows, messages
+
+    def _log_event(self, event: str, level: int = logging.INFO, **fields: Any) -> None:
+        """Write one structured event if the event logger is available.
+
+        Args:
+            event: Stable event name.
+            level: Logging level for the event.
+            **fields: Event context and diagnostic fields.
+        """
+        if self.event_logger is None:
+            return
+        self.event_logger.log(
+            logger=logger,
+            event=event,
+            level=level,
+            **fields,
+        )
+
+    def _log_exam_parse_failure(
+        self,
+        event_context: dict[str, Any],
+        expected_count: int,
+        parsed_count: int,
+        error_type: str,
+        error_message: str,
+        raw_text: str,
+    ) -> None:
+        """Record one structured parse failure event.
+
+        Args:
+            event_context: Context fields for the event.
+            expected_count: Expected number of answers.
+            parsed_count: Number of parsed valid answers.
+            error_type: Stable parse error type.
+            error_message: Human-readable parse failure message.
+            raw_text: Raw model response text.
+        """
+        preview = self._response_preview(raw_text=raw_text)
+        self._log_event(
+            event="exam.parse_failed",
+            level=logging.ERROR,
+            **event_context,
+            status="failed",
+            expected_answers_count=expected_count,
+            parsed_answers_count=parsed_count,
+            error_type=error_type,
+            error_message=error_message,
+            response_preview=preview,
+            response_length=len(raw_text),
+        )
+        logger.error(
+            "[trial] exam parse failure participant_id=%s phase=%s reason=%s",
+            event_context.get("participant_id"),
+            event_context.get("phase"),
+            error_message,
+        )
+
+    def _response_preview(self, raw_text: str, max_chars: int = 220) -> str:
+        """Create a compact one-line response preview.
+
+        Args:
+            raw_text: Raw text to preview.
+            max_chars: Maximum preview size.
+
+        Returns:
+            Sanitised single-line preview.
+        """
+        clean = raw_text.replace("\n", " ").replace("\r", " ").strip()
+        if len(clean) <= max_chars:
+            return clean
+        return f"{clean[: max_chars - 3]}..."
 
     def debug_summary(self) -> None:
         """Print a small summary of loaded metadata for debugging."""

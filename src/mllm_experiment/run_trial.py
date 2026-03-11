@@ -2,16 +2,14 @@
 # CLI entrypoint (python run_trial.py --participants 1 --teaching_set_dir ...)
 # run_trial.py
 from __future__ import annotations
-import logging
 import argparse
+import logging
 import random
+import uuid
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional
-from typing_extensions import Literal
 from tqdm.auto import tqdm
 
-from .utils import setup_logging
+from .utils import ExperimentEventLogger, setup_logging
 from .openai_client import OpenAIChatClient
 from .trial import TrialRunner
 from .config import ExperimentConfig
@@ -93,6 +91,20 @@ def parse_args() -> argparse.Namespace:
             "This validates metadata loading, message building and logging."
         ),
     )
+    parser.add_argument(
+        "--events_log_file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the structured JSONL events log. "
+            "Defaults to <output_dir>/experiment_events.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--http_debug",
+        action="store_true",
+        help="Enable verbose third-party HTTP and OpenAI library logging.",
+    )
     return parser.parse_args()
 
 
@@ -108,43 +120,90 @@ def main() -> None:
         model_name=args.model_name,
         random_seed=args.random_seed,
     )
+    events_log_file = args.events_log_file or (config.output_root / "experiment_events.jsonl")
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
 
-    setup_logging(log_level=config.log_level, log_file=config.logfile_path)
+    setup_logging(
+        log_level=config.log_level,
+        log_file=config.logfile_path,
+        events_log_file=events_log_file,
+        http_debug=args.http_debug,
+    )
+    event_logger = ExperimentEventLogger(run_id=run_id)
 
     if args.verbose:
-        logger.debug("[run_trial] configuration")
-        logger.debug(f"  log_level:     {config.log_level}")
-        logger.debug(f"  logfile_path:  {config.logfile_path}")
-        logger.debug(f"  teaching_root: {config.teaching_root}")
-        logger.debug(f"  exam_root:     {config.exam_root}")
-        logger.debug(f"  metadata_root: {config.metadata_root}")
-        logger.debug(f"  output_root:   {config.output_root}")
-        logger.debug(f"  logfile_path:  {config.logfile_path}")
-        logger.debug(f"  model_name:    {config.model_name}")
-        logger.debug(f"  random_seed:   {config.random_seed}")
-        logger.debug(f"  participants:  {args.participants}")
-        logger.debug(f"  dry_run:       {args.dry_run}")
+        logger.debug(
+            "[run_trial] config run_id=%s participants=%d dry_run=%s "
+            "log_level=%s model_name=%s random_seed=%s output_root=%s "
+            "logfile_path=%s events_log_file=%s",
+            run_id,
+            args.participants,
+            args.dry_run,
+            config.log_level,
+            config.model_name,
+            config.random_seed,
+            config.output_root,
+            config.logfile_path,
+            events_log_file,
+        )
 
-    client = OpenAIChatClient(model=config.model_name, use_dummy=args.dry_run)
-    runner = TrialRunner(config=config, client=client, verbose=args.verbose)
+    client = OpenAIChatClient(
+        model=config.model_name,
+        use_dummy=args.dry_run,
+        event_logger=event_logger,
+    )
+    runner = TrialRunner(
+        config=config,
+        client=client,
+        verbose=args.verbose,
+        event_logger=event_logger,
+    )
 
     if args.verbose:
         runner.debug_summary()
 
-    # sets up the base rng. If config.random_seed is None, rng will change between trials, 
-    # but seed is still printed for reproducability.
-    base_rng = random.Random(config.random_seed)
+    event_logger.log(
+        logger=logger,
+        event="run.start",
+        level=logging.INFO,
+        status="started",
+        mode="dummy" if args.dry_run else "api",
+        participants_total=args.participants,
+        model_name=config.model_name,
+        random_seed=config.random_seed,
+        log_level=config.log_level,
+        output_root=config.output_root,
+        log_file=config.logfile_path,
+        events_log_file=events_log_file,
+    )
 
-    for idx in tqdm(range(args.participants), desc="Participants", unit="participant"):
-        # derive a per-participant seed for reproducibility
-        seed = base_rng.randint(0, 2**31 - 1)
-        rng = random.Random(seed)
-        if args.verbose:
-            logger.debug(
-                f"[run_trial] running participant index={idx}, "
-                f"seed={seed}",
-            )
-        runner.run_participant(rng=rng, index=idx)
+    # This sets up the base RNG. If config.random_seed is None, the
+    # sequence changes between runs, but each participant seed is logged.
+    base_rng = random.Random(config.random_seed)
+    participants_completed = 0
+    run_status = "completed"
+
+    try:
+        for idx in tqdm(range(args.participants), desc="Participants", unit="participant"):
+            seed = base_rng.randint(0, 2**31 - 1)
+            rng = random.Random(seed)
+            if args.verbose:
+                logger.debug("[run_trial] participant index=%d seed=%d", idx, seed)
+            runner.run_participant(rng=rng, index=idx)
+            participants_completed += 1
+    except Exception:
+        run_status = "failed"
+        raise
+    finally:
+        event_logger.log(
+            logger=logger,
+            event="run.complete",
+            level=logging.INFO if run_status == "completed" else logging.ERROR,
+            status=run_status,
+            mode="dummy" if args.dry_run else "api",
+            participants_total=args.participants,
+            participants_completed=participants_completed,
+        )
 
 
 if __name__ == "__main__":
