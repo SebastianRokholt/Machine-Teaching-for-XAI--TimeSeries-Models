@@ -44,6 +44,9 @@ OVERLAY_PATTERN = re.compile(
     r"__\d+\.png$" # random tail
 )
 
+# pattern for simplified filenames from group D
+SIMPLIFIED_PATTERN = OVERLAY_PATTERN
+
 # pattern for raw filenames from group C (no k)
 RAW_PATTERN = re.compile(
     r"^ex_(\d+)_"  
@@ -62,6 +65,7 @@ class ExamExample:
         simplicity_k: Integer k value extracted from the filename.
         overlay_src: Source path of the overlay image.
         raw_src: Source path of the raw image.
+        simplified_src: Source path of the simplified-only image.
     """
 
     exam_set_id: str
@@ -70,6 +74,7 @@ class ExamExample:
     simplicity_k: int
     overlay_src: Path
     raw_src: Path
+    simplified_src: Path
 
 
 
@@ -80,8 +85,13 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
 
         Figures/exam_sets/<set_id>/A/overlay/*.png   # overlay modality
         Figures/exam_sets/<set_id>/C/raw/*.png       # raw modality
+        Figures/exam_sets/<set_id>/D/simplified/*.png  # simplified-only modality
 
     Overlay filenames follow:
+
+        ex_<index>_<label>_k<kvalue>__<id>.png
+
+    Simplified filenames follow:
 
         ex_<index>_<label>_k<kvalue>__<id>.png
 
@@ -93,10 +103,11 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
         exam_set_id: Name of the exam set, such as "set1" or "set2".
 
     Returns:
-        List of ExamExample objects with paired overlay and raw source paths.
+        List of ExamExample objects with paired overlay, raw and simplified source paths.
     """
     overlay_dir = EXAM_SOURCE_DIR / exam_set_id / "A" / "overlay"
     raw_dir = EXAM_SOURCE_DIR / exam_set_id / "C" / "raw"
+    simplified_dir = EXAM_SOURCE_DIR / exam_set_id / "D" / "simplified"
 
     if not overlay_dir.is_dir():
         raise FileNotFoundError(
@@ -106,9 +117,14 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
         raise FileNotFoundError(
             f"Raw directory not found for {exam_set_id}: {raw_dir}"
         )
+    if not simplified_dir.is_dir():
+        raise FileNotFoundError(
+            f"Simplified directory not found for {exam_set_id}: {simplified_dir}"
+        )
 
     overlay_by_idx: dict[int, tuple[str, int, Path]] = {}
     raw_by_idx: dict[int, Path] = {}
+    simplified_by_idx: dict[int, tuple[str, int, Path]] = {}
 
     # parse overlay filenames (label + k)
     for path in sorted(overlay_dir.glob("*.png")):
@@ -133,8 +149,22 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
         idx = int(idx_str)
         raw_by_idx[idx] = path
 
+    # parse simplified filenames (label + k)
+    for path in sorted(simplified_dir.glob("*.png")):
+        match = SIMPLIFIED_PATTERN.match(path.name)
+        if not match:
+            raise ValueError(
+                f"Could not parse simplified filename for {exam_set_id}: {path.name}"
+            )
+        idx_str, label, k_str = match.groups()
+        idx = int(idx_str)
+        k_val = int(k_str)
+        simplified_by_idx[idx] = (label, k_val, path)
+
     missing_in_raw = sorted(set(overlay_by_idx) - set(raw_by_idx))
     missing_in_overlay = sorted(set(raw_by_idx) - set(overlay_by_idx))
+    missing_in_simplified = sorted(set(overlay_by_idx) - set(simplified_by_idx))
+    missing_in_overlay_vs_simplified = sorted(set(simplified_by_idx) - set(overlay_by_idx))
 
     if missing_in_raw:
         raise ValueError(
@@ -144,11 +174,24 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
         raise ValueError(
             f"Overlay images missing for indices {missing_in_overlay} in {exam_set_id}"
         )
+    if missing_in_simplified:
+        raise ValueError(
+            f"Simplified images missing for indices {missing_in_simplified} in {exam_set_id}"
+        )
+    if missing_in_overlay_vs_simplified:
+        raise ValueError(
+            f"Overlay images missing for simplified indices {missing_in_overlay_vs_simplified} in {exam_set_id}"
+        )
 
     examples: list[ExamExample] = []
     for idx in sorted(overlay_by_idx):
         label, k_val, overlay_path = overlay_by_idx[idx]
         raw_path = raw_by_idx[idx]
+        simplified_label, simplified_k, simplified_path = simplified_by_idx[idx]
+        if label != simplified_label or k_val != simplified_k:
+            raise ValueError(
+                f"Overlay/simplified mismatch for index {idx} in {exam_set_id}"
+            )
         examples.append(
             ExamExample(
                 exam_set_id=exam_set_id,
@@ -157,6 +200,7 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
                 simplicity_k=k_val,
                 overlay_src=overlay_path,
                 raw_src=raw_path,
+                simplified_src=simplified_path,
             )
         )
 
@@ -165,9 +209,10 @@ def _parse_exam_filenames(exam_set_id: str) -> list[ExamExample]:
 
 def _anonymise_exam_set(examples: Iterable[ExamExample]) -> list[dict]:
     """Copy exam images into anonymised sets and build metadata rows.
-    For each example, this function creates two anonymised copies:
+    For each example, this function creates three anonymised copies:
         Figures/exam_sets/mllm_experiment_sets/<set_id>/overlay/<fname>
         Figures/exam_sets/mllm_experiment_sets/<set_id>/raw/<fname>
+        Figures/exam_sets/mllm_experiment_sets/<set_id>/simplified/<fname>
     The anonymised filenames do not contain labels or k values and have
     the format: ex_<index:03d>_<rand>.png
 
@@ -184,8 +229,10 @@ def _anonymise_exam_set(examples: Iterable[ExamExample]) -> list[dict]:
     set_id = examples[0].exam_set_id
     dst_overlay_dir = TRIAL_EXAM_DIR / set_id / "overlay"
     dst_raw_dir = TRIAL_EXAM_DIR / set_id / "raw"
+    dst_simplified_dir = TRIAL_EXAM_DIR / set_id / "simplified"
     dst_overlay_dir.mkdir(parents=True, exist_ok=True)
     dst_raw_dir.mkdir(parents=True, exist_ok=True)
+    dst_simplified_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict] = []
 
@@ -194,8 +241,10 @@ def _anonymise_exam_set(examples: Iterable[ExamExample]) -> list[dict]:
         filename = f"ex_{ex.index:03d}_{rand_id}.png"
         overlay_dst = dst_overlay_dir / filename
         raw_dst = dst_raw_dir / filename
+        simplified_dst = dst_simplified_dir / filename
         shutil.copy2(ex.overlay_src, overlay_dst)
         shutil.copy2(ex.raw_src, raw_dst)
+        shutil.copy2(ex.simplified_src, simplified_dst)
         item_id = f"{set_id}_ex_{ex.index:03d}"
 
         # margin is unknown here; you can overwrite this column later if needed
@@ -212,6 +261,7 @@ def _anonymise_exam_set(examples: Iterable[ExamExample]) -> list[dict]:
                 # keep original filenames for cross-checking with pool metadata
                 "source_overlay_filename": ex.overlay_src.name,
                 "source_raw_filename": ex.raw_src.name,
+                "source_simplified_filename": ex.simplified_src.name,
             }
         )
 
@@ -233,7 +283,9 @@ def build_exam_metadata(exam_sets: list[str]) -> None:
         rows = _anonymise_exam_set(examples)
         print(
             f"  copied {len(rows)} examples to "
-            f"{TRIAL_EXAM_DIR / set_id / 'overlay'} and 'raw'"
+            f"{TRIAL_EXAM_DIR / set_id / 'overlay'}, "
+            f"{TRIAL_EXAM_DIR / set_id / 'raw'} and "
+            f"{TRIAL_EXAM_DIR / set_id / 'simplified'}"
         )
         all_rows.extend(rows)
 
@@ -250,6 +302,7 @@ def build_exam_metadata(exam_sets: list[str]) -> None:
         "margin",
         "source_overlay_filename",
         "source_raw_filename",
+        "source_simplified_filename",
     ]
 
     with EXAM_CSV.open("w", newline="", encoding="utf-8") as f:

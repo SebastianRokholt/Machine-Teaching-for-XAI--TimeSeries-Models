@@ -36,7 +36,7 @@ class TeachingExample:
     """Represent one labelled teaching example before anonymisation.
 
     Attributes:
-        group: Teaching group the example belongs to ("A", "B" or "C").
+        group: Teaching group the example belongs to ("A", "B", "C" or "D").
         src_path: Original path of the labelled image.
         ai_class: AI-predicted class ("normal" or "abnormal").
         simplicity_k: Integer k value extracted from the filename or set
@@ -59,7 +59,7 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
 
     Expected patterns:
 
-        A/B: <GROUP>_ex_<index>_<label>_k<kvalue>__<id>.png
+        A/B/D: <GROUP>_ex_<index>_<label>_k<kvalue>__<id>.png
              e.g. A_ex_1_normal_k1__9489647.png
 
         C:   C_ex_<index>_<label>__<id>.png
@@ -71,7 +71,7 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
     in a separate table.
 
     Args:
-        group: Group identifier, such as "A", "B" or "C".
+        group: Group identifier, such as "A", "B", "C" or "D".
 
     Returns:
         List of TeachingExample instances for the group.
@@ -81,7 +81,7 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
         msg = f"labelled directory not found for group {group}: {labelled_dir}"
         raise FileNotFoundError(msg)
 
-    if group in {"A", "B"}:
+    if group in {"A", "B", "D"}:
         pattern = re.compile(
             rf"^{group}_ex_(\d+)_"           # index
             r"(normal|abnormal)_k(\d+)__"    # label, k
@@ -106,7 +106,7 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
                 f"could not parse filename for group {group}: {path.name}"
             )
 
-        if group in {"A", "B"}:
+        if group in {"A", "B", "D"}:
             idx_str, label, k_str, _random_tail = match.groups()
             simplicity_k = int(k_str)
         else:  # group C

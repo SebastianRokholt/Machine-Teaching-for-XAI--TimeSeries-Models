@@ -42,6 +42,21 @@ INTRO_OVERLAY = (
     "its decisions on new examples."
 )
 
+INTRO_SIMPLIFIED_ONLY = (
+    "There is an AI that has been trained on a large dataset of electric vehicle "
+    "(EV) charging sessions. The AI classifies each charging session as either "
+    "'normal' or 'abnormal'. It bases its decision only on patterns in the power "
+    "transfer between charger and battery (in kW) over time, the battery's state "
+    "of charge (SOC) over time, and a few technical features such as temperature "
+    "and charger specifications. You do not know the exact rule the AI uses. "
+    "You will be shown line charts of individual charging sessions. In each chart, "
+    "the solid red line shows a simplified version of the charging power in kW over "
+    "minutes since the start of charging, and the solid blue line shows the battery's "
+    "SOC in percent over time. Each chart was shown to the AI as simplified power and "
+    "SOC only. Your goal is to infer how this AI tends to behave and to simulate its "
+    "decisions on new examples."
+)
+
 INTRO_RAW_ONLY = (
     "There is an AI that has been trained on a large dataset of electric vehicle "
     "(EV) charging sessions. The AI classifies each charging session as either "
@@ -67,6 +82,18 @@ TEACHING_INTRO = (
     "form {'acknowledged': true} and nothing else if you saw and understood the "
     "image. If the image is missing, unreadable, or otherwise not understandable, "
     "respond with {'acknowledged': false} instead."
+)
+
+TEACHING_INTRO_SIMPLIFIED_ONLY = (
+    "We will now show you labelled examples that reveal how the AI behaved on "
+    "specific charging sessions. For each example you will see one charging-chart "
+    "image together with the AI's classification ('normal' or 'abnormal'). The chart "
+    "shows only simplified power and SOC. Study the relationship between the "
+    "simplified power curve and the SOC curve carefully and update your internal rule "
+    "for how the AI seems to decide. After you have looked at the image and read the "
+    "label, respond with a JSON object of the form {'acknowledged': true} and nothing "
+    "else if you saw and understood the image. If the image is missing, unreadable, or "
+    "otherwise not understandable, respond with {'acknowledged': false} instead."
 )
 
 # Should we include the 'decision rule' hint here?
@@ -104,7 +131,7 @@ def build_exam_user_content(
     group: Group,
     phase: Phase,
     exam_items: list[tuple[ExampleItem, Path]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str]:
     """Build multimodal user content for a pre- or post-teaching exam.
 
     The returned content is suitable for a single user message in the
@@ -112,19 +139,27 @@ def build_exam_user_content(
     the exam images.
 
     Args:
-        group: Participant group (A, B or C).
+        group: Participant group (A, B, C or D).
         phase: Experimental phase (PRE or POST).
         exam_items: List of (ExampleItem, image_path) pairs.
 
     Returns:
-        List of content parts for the user message.
+        Tuple containing:
+            - list of content parts for the user message,
+            - modality identifier shown to the participant.
     """
-    if group is Group.C or phase is Phase.PRE:
+    if phase is Phase.PRE:
         intro = INTRO_RAW_ONLY
         modality_shown = "raw_only"
     elif phase is Phase.POST and group in (Group.A, Group.B):
-            intro = INTRO_OVERLAY
-            modality_shown = "overlay"
+        intro = INTRO_OVERLAY
+        modality_shown = "overlay"
+    elif phase is Phase.POST and group is Group.D:
+        intro = INTRO_SIMPLIFIED_ONLY
+        modality_shown = "simplified_only"
+    elif phase is Phase.POST and group is Group.C:
+        intro = INTRO_RAW_ONLY
+        modality_shown = "raw_only"
     else: 
         raise ValueError(f"Invalid phase: {phase} and/or group: {group}."
                          f"Select group from {list(Group)} and phase from {list(Phase)}.")
@@ -185,7 +220,7 @@ def build_teaching_user_content(
     """Build multimodal user content for a single teaching example.
 
     Args:
-        group: Participant group (A, B or C).
+        group: Participant group (A, B, C or D).
         item: ExampleItem describing the teaching example.
         image_path: Path to the teaching image.
         index: Position of this example in the teaching sequence (1-based).
@@ -195,7 +230,10 @@ def build_teaching_user_content(
         List of content parts for the user message.
     """
     if index == 1:
-        header = TEACHING_INTRO + " "
+        if group is Group.D:
+            header = TEACHING_INTRO_SIMPLIFIED_ONLY + " "
+        else:
+            header = TEACHING_INTRO + " "
     else:
         header = ""
 

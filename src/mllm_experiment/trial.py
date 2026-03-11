@@ -42,7 +42,7 @@ class ParticipantConfig:
 
     Attributes:
         participant_id: Unique identifier for this participant.
-        group: Assigned teaching group (A, B or C).
+        group: Assigned teaching group (A, B, C or D).
         exam_set_pre: Exam set used in the pre-teaching phase.
         exam_set_post: Exam set used in the post-teaching phase.
     """
@@ -72,17 +72,39 @@ class TrialRunner:
         self,
         config: ExperimentConfig,
         client: OpenAIChatClient,
+        enabled_groups: list[Group],
         verbose: bool,
         event_logger: ExperimentEventLogger | None = None,
     ) -> None:
         self.config = config
         self.client = client
+        self.enabled_groups = tuple(enabled_groups)
         self.verbose = verbose
         self.event_logger = event_logger
 
+        if not self.enabled_groups:
+            msg = "At least one enabled group is required."
+            logger.error(msg)
+            raise ValueError(msg)
+
         logger.debug("[trial] loading metadata")
         self.teaching_by_group = load_teaching_metadata(config)
-        self.exam_by_set = load_exam_metadata(config)
+        self.exam_by_set = load_exam_metadata(
+            config=config,
+            enabled_groups=self.enabled_groups,
+        )
+        missing_teaching = [
+            group.value
+            for group in self.enabled_groups
+            if not self.teaching_by_group.get(group)
+        ]
+        if missing_teaching:
+            msg = (
+                "No teaching metadata rows found for selected group(s): "
+                f"{', '.join(missing_teaching)}"
+            )
+            logger.error(msg)
+            raise ValueError(msg)
 
     def run_participant(self, rng: random.Random, index: int) -> None:
         """Run a full trial for a single participant.
@@ -162,7 +184,7 @@ class TrialRunner:
         """Sample group and exam sets for one participant."""
         participant_id = f"p_{index:04d}_{uuid.uuid4().hex[:8]}"
 
-        group = rng.choice(list(Group))
+        group = rng.choice(self.enabled_groups)
 
         exam_sets = list(self.exam_by_set.keys())
         if len(exam_sets) != 2:
@@ -457,7 +479,12 @@ class TrialRunner:
         if participant.group in (Group.B, Group.C):
             rng.shuffle(teaching_items)
 
-        modality_shown = "overlay" if participant.group in (Group.A, Group.B) else "raw_only"
+        if participant.group in (Group.A, Group.B):
+            modality_shown = "overlay"
+        elif participant.group is Group.D:
+            modality_shown = "simplified_only"
+        else:
+            modality_shown = "raw_only"
         self._log_event(
             event="phase.teaching.start",
             level=logging.INFO,
@@ -609,6 +636,10 @@ class TrialRunner:
     def debug_summary(self) -> None:
         """Print a small summary of loaded metadata for debugging."""
         logger.debug("[trial] metadata summary")
+        logger.debug(
+            "  enabled groups: %s",
+            [group.value for group in self.enabled_groups],
+        )
         for group, items in self.teaching_by_group.items():
             logger.debug(f"  group {group.value}: {len(items)} teaching items")
         for exam_set_id, items in self.exam_by_set.items():

@@ -10,11 +10,60 @@ from pathlib import Path
 from tqdm.auto import tqdm
 
 from .utils import ExperimentEventLogger, setup_logging
+from .data_loading import Group
 from .openai_client import OpenAIChatClient
 from .trial import TrialRunner
 from .config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def parse_conditions_selector(raw_selector: str) -> tuple[str, list[Group]]:
+    """Parse and validate the group selection string.
+
+    Args:
+        raw_selector: Raw value passed to --conditions.
+
+    Returns:
+        Tuple of:
+            - canonical requested conditions string (letters A-F),
+            - enabled groups list for this stage.
+    """
+    selector = raw_selector.strip().lower()
+    if selector == "all":
+        selector = "abcdef"
+
+    if not selector:
+        msg = "Group selector is empty. Use 'all' or a combination of letters a-f."
+        raise ValueError(msg)
+
+    allowed_letters = "abcdef"
+    invalid_letters = sorted({char for char in selector if char not in allowed_letters})
+    if invalid_letters:
+        msg = (
+            "Group selector contains invalid characters: "
+            f"{', '.join(invalid_letters)}. Use only letters a-f or 'all'."
+        )
+        raise ValueError(msg)
+
+    selected_letters = [letter for letter in allowed_letters if letter in set(selector)]
+    requested_conditions = "".join(selected_letters).upper()
+    if not requested_conditions:
+        msg = "Group selector does not contain any valid group letters."
+        raise ValueError(msg)
+
+    deferred_groups = [letter.upper() for letter in selected_letters if letter in {"e", "f"}]
+    if deferred_groups:
+        msg = (
+            "Group(s) "
+            f"{', '.join(deferred_groups)} are not implemented yet in stage 1. "
+            "Use combinations of A, B, C and D."
+        )
+        raise ValueError(msg)
+
+    enabled_groups = [Group(letter.upper()) for letter in selected_letters]
+    return requested_conditions, enabled_groups
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the experiment runner.
@@ -35,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         "--teaching_set_dir",
         type=Path,
         required=True,
-        help="Root directory containing teaching sets A, B and C.",
+        help="Root directory containing teaching sets A, B, C and D.",
     )
     parser.add_argument(
         "--exam_sets_dir",
@@ -48,6 +97,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="Directory containing teaching_items.csv and exam_items.csv.",
+    )
+    parser.add_argument(
+        "--conditions",
+        type=str,
+        default="all",
+        help=(
+            "Group selection string. Use 'all' or a non-empty combination "
+            "of letters a-f (e.g. abc, bcd, abcdef). "
+            "Stage 1 supports A, B, C and D only."
+        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -111,6 +170,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Entry point for running one or more trials from the command line."""
     args = parse_args()
+    try:
+        requested_conditions, enabled_groups = parse_conditions_selector(args.conditions)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    effective_conditions = "".join(group.value for group in enabled_groups)
     config = ExperimentConfig(
         log_level=args.log_level,
         teaching_root=args.teaching_set_dir,
@@ -135,7 +200,8 @@ def main() -> None:
         logger.debug(
             "[run_trial] config run_id=%s participants=%d dry_run=%s "
             "log_level=%s model_name=%s random_seed=%s output_root=%s "
-            "logfile_path=%s events_log_file=%s",
+            "logfile_path=%s events_log_file=%s "
+            "conditions_requested=%s conditions_effective=%s",
             run_id,
             args.participants,
             args.dry_run,
@@ -145,6 +211,8 @@ def main() -> None:
             config.output_root,
             config.logfile_path,
             events_log_file,
+            requested_conditions,
+            effective_conditions,
         )
 
     client = OpenAIChatClient(
@@ -155,6 +223,7 @@ def main() -> None:
     runner = TrialRunner(
         config=config,
         client=client,
+        enabled_groups=enabled_groups,
         verbose=args.verbose,
         event_logger=event_logger,
     )
@@ -171,6 +240,8 @@ def main() -> None:
         participants_total=args.participants,
         model_name=config.model_name,
         random_seed=config.random_seed,
+        conditions_requested=requested_conditions,
+        conditions_effective=effective_conditions,
         log_level=config.log_level,
         output_root=config.output_root,
         log_file=config.logfile_path,
