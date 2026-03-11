@@ -20,9 +20,10 @@ class Group(str, Enum):
     A = "A"  # overlayed raw power, simplified power, simplified SOC with curriculum
     B = "B"  # As A but no curriculum (unordered)
     C = "C"  # As B (unordered) but raw-only, no simplifications
-    D = "D"  # As A (curriculum) but simplifications only
+    # TODO: Finish implementation of group D
+    # D = "D"  # As A (curriculum) but simplifications only
     # TODO: Add group E
-    # E = "E"  # As A but with enforced rule-of-thumb updating in teaching session
+    # E = "E"  # As D but with enforced rule-of-thumb updating in teaching session
     # TODO: Add group F
     # F = "F"  # No teaching at all, just pre and post exam (for baseline)
 
