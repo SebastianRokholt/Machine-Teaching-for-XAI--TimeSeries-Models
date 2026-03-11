@@ -197,8 +197,10 @@ class OpenAIChatClient:
     ) -> ModelResponse:
         """Generate a synthetic response for dry-run debugging.
 
-        This method inspects the last user message to detect whether the
-        query corresponds to an exam phase or a teaching phase.
+        This method first checks the structured call context to detect
+        whether the query corresponds to an exam phase or a teaching
+        phase. It falls back to prompt-text heuristics only when the
+        context does not include a call type.
 
         For exam phases, it returns a JSON object of the form
         {"answers": [{"item_id": "...", "guess": "normal"}, ...]} where
@@ -239,7 +241,7 @@ class OpenAIChatClient:
         last = messages[-1]
         content = last.get("content", [])
         text_parts: list[str] = []
-        item_ids: list[str] = []
+        prompt_item_ids: list[str] = []
 
         for part in content:
             if not isinstance(part, dict):
@@ -254,12 +256,44 @@ class OpenAIChatClient:
                         end = len(text)
                     item_id = text[start:end].strip()
                     if item_id:
-                        item_ids.append(item_id)
+                        prompt_item_ids.append(item_id)
 
-        exam_prompt = self._is_exam_prompt(text_parts=text_parts)
+        context_item_ids = self._item_ids_from_call_context(call_context=call_context)
+        call_type = str((call_context or {}).get("call_type", "")).strip().lower()
+        if call_type == "exam":
+            exam_prompt = True
+            detection_source = "call_context"
+        elif call_type == "teaching":
+            exam_prompt = False
+            detection_source = "call_context"
+        else:
+            exam_prompt = self._is_exam_prompt(text_parts=text_parts)
+            detection_source = "prompt_heuristic"
+
+        if exam_prompt:
+            item_ids = context_item_ids or prompt_item_ids
+        else:
+            item_ids = prompt_item_ids
+
+        logger.debug(
+            "[openai_client] dummy prompt routing source=%s call_type=%s exam_prompt=%s "
+            "context_item_ids=%d prompt_item_ids=%d",
+            detection_source,
+            call_type or "n/a",
+            exam_prompt,
+            len(context_item_ids),
+            len(prompt_item_ids),
+        )
 
         if exam_prompt:
             answers = [{"item_id": iid, "guess": "normal"} for iid in item_ids]
+            if not answers:
+                logger.warning(
+                    "[openai_client] dummy exam response contains no item_ids "
+                    "(call_type=%s detection_source=%s)",
+                    call_type or "n/a",
+                    detection_source,
+                )
             raw_text = json.dumps({"answers": answers})
             parsed = {"answers": answers}
         else:
@@ -287,6 +321,31 @@ class OpenAIChatClient:
             prompt_tokens=None,
             completion_tokens=None,
         )
+
+    def _item_ids_from_call_context(
+        self,
+        call_context: dict[str, Any] | None,
+    ) -> list[str]:
+        """Extract exam item identifiers from structured call context.
+
+        Args:
+            call_context: Optional context dictionary passed by the caller.
+
+        Returns:
+            List of string item identifiers in context order.
+        """
+        if call_context is None:
+            return []
+        raw_item_ids = call_context.get("item_ids")
+        if not isinstance(raw_item_ids, list):
+            return []
+
+        item_ids: list[str] = []
+        for item_id in raw_item_ids:
+            text = str(item_id).strip()
+            if text:
+                item_ids.append(text)
+        return item_ids
 
     def _is_exam_prompt(self, text_parts: list[str]) -> bool:
         """Detect whether the current prompt is an exam prompt.

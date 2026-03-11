@@ -271,6 +271,7 @@ class TrialRunner:
                 "exam_set_id": exam_set_id,
                 "call_type": "exam",
                 "items_count": len(item_paths),
+                "item_ids": [item.item_id for item, _path in item_paths],
                 "modality": modality_shown,
             },
         )
