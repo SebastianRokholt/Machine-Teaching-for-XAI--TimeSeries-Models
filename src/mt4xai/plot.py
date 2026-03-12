@@ -131,6 +131,90 @@ def plot_raw_session(
     fig.tight_layout()
     return fig, ax
 
+
+def plot_simpl_session(
+    power_simpl_kw: np.ndarray,
+    *,
+    soc_simpl_pct: np.ndarray | None = None,
+    title: str | None = None,
+    power_y_lim: tuple[float, float] = (0, 160),
+    figsize: Tuple[int, int] = (14, 5),
+) -> tuple[Figure, Axes]:
+    """Plots simplified power and optional simplified SOC.
+
+    Args:
+        power_simpl_kw: Dense simplified power in kW with shape (T,).
+        soc_simpl_pct: Optional dense simplified SOC in percent with shape (T,).
+        title: Optional figure title.
+        power_y_lim: Power axis range as (y_min, y_max).
+        figsize: Figure size as (width, height).
+
+    Returns:
+        Tuple of Matplotlib figure and left axis.
+    """
+    power = np.asarray(power_simpl_kw, dtype=float).reshape(-1)
+    t = np.arange(power.size, dtype=float)
+
+    fig = plt.figure(figsize=figsize)
+    ax = plt.gca()
+
+    ax.plot(
+        t,
+        power,
+        linewidth=2.2,
+        color=COLOUR_POWER_SIMPL,
+        label="power (simplified)",
+    )
+    ax.set_ylim(power_y_lim[0], power_y_lim[1])
+    ax.set_xlabel("Minutes elapsed", fontdict={"size": 15})
+    _axis_label_icons_raw_simp(
+        ax,
+        "Power (kW)",
+        colours=[COLOUR_POWER_SIMPL],
+        side="left",
+        fontsize=15,
+    )
+    if title:
+        ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    lines = ax.get_lines()
+    if soc_simpl_pct is not None:
+        soc = np.asarray(soc_simpl_pct, dtype=float).reshape(-1)
+        if soc.size != power.size:
+            raise ValueError(
+                "soc_simpl_pct must match power_simpl_kw length in simplified-only plots"
+            )
+        ax2 = ax.twinx()
+        ax2.set_ylim(0.0, 100.0)
+        _axis_label_icons_raw_simp(
+            ax2,
+            "Battery charge level (%)",
+            colours=[COLOUR_SOC],
+            side="right",
+            fontsize=15,
+        )
+        ax2.plot(
+            t,
+            np.clip(soc, 0.0, 100.0),
+            linewidth=1.6,
+            color=COLOUR_SOC,
+            label="battery charge level",
+        )
+        lines = lines + ax2.get_lines()
+
+    labels = [ln.get_label() for ln in lines]
+    ax.legend(
+        lines,
+        labels,
+        bbox_to_anchor=(0.18, -0.1),
+        frameon=True,
+        framealpha=0.9,
+        fontsize=10,
+    )
+    fig.tight_layout()
+    return fig, ax
+
 def plot_raw_pred_session(
     bundle: "SessionPredsBundle",
     power_scaler: MinMaxScaler, soc_scaler: MinMaxScaler,

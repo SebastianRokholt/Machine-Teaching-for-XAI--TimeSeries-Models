@@ -1067,7 +1067,7 @@ class TeachingSet:
     (e.g. during a teaching session) and set analytics. The construct method builds 
     a diverse teaching subset from a binned `TeachingPool` using a lazy-greedy facility-location 
     objective over spike-aware embeddings with optional linear terms for decision margin and robustness. 
-    It then exposes group-specific samplers (A/B/C) that differ in ordering and overlays, while sharing the
+    It then exposes group-specific samplers (A/B/C/D/E) that differ in ordering and rendering mode, while sharing the
     same teaching set (selected charging session IDs) across groups.
 
     The selection objective is:
@@ -1102,9 +1102,11 @@ class TeachingSet:
         - Class label column is `class_label` (mapped from `label_int` if needed).
         - k-bin label column is `k_bin_label` (or `k_bin`, which is renamed).
         - Group semantics:
-            A → curriculum in iterator, shows simplification overlays,
-            B → random in iterator, shows simplification overlays,
-            C → random in iterator, raw-only (no overlays).
+            A → curriculum in iterator, shows simplification overlays.
+            B → random in iterator, shows simplification overlays.
+            C → random in iterator, raw-only mode.
+            D → curriculum in iterator, simplified-only mode.
+            E → same as D and reuses D assets.
     """
 
     pool: TeachingPool = None
@@ -1157,6 +1159,8 @@ class TeachingSet:
         self.iter_A = None
         self.iter_B = None
         self.iter_C = None
+        self.iter_D = None
+        self.iter_E = None
         self.last_figs: dict[str, list[Figure]] | None = None
         self.last_meta: dict[str, list[dict]] | None = None
 
@@ -1564,28 +1568,67 @@ class TeachingSet:
     
     # ---------------- group iterators and serving ---------------- #
     def build_group_iterators(self) -> dict[str, TeachIterator]:
-        """
-        Builds and stores group iterators on this TeachingSet.
-        alternation n/a/n/a… is handled inside TeachIterator.
+        """Builds and stores iterators for groups A to E.
+
+        Returns:
+            Mapping from group label to iterator.
         """
         if self.teaching_set_df is None:
             raise ValueError("selected_df is None, run selection first.")
 
-        dfA = self.sample_group(group="A")
-        dfB = self.sample_group(group="B")
-        dfC = self.sample_group(group="C")
+        group_frames = {
+            g: self.sample_group(group=g).reset_index(drop=True)
+            for g in ("A", "B", "C", "D", "E")
+        }
 
-        # compute shared y-limits: [0, global max]
-        y_max = _compute_global_power_max([dfA, dfB, dfC])
+        # Uses A to D because E reuses D assets and y-limits.
+        y_max = _compute_global_power_max([group_frames[g] for g in ("A", "B", "C", "D")])
         y_lim = (0.0, y_max)
 
-        # creates iterators for each group
-        # Set TeachingSet as iterators' 'parent' attr to pass config/params
-        self.iter_A = TeachIterator(df=dfA.reset_index(drop=True), group="A", random_seed=self.random_seed, y_lim=y_lim, parent=self)
-        self.iter_B = TeachIterator(df=dfB.reset_index(drop=True), group="B", random_seed=self.random_seed, y_lim=y_lim, parent=self)
-        self.iter_C = TeachIterator(df=dfC.reset_index(drop=True), group="C", random_seed=self.random_seed, y_lim=y_lim, parent=self)
-        
-        return {"A": self.iter_A, "B": self.iter_B, "C": self.iter_C}
+        self.iter_A = TeachIterator(
+            df=group_frames["A"],
+            group="A",
+            random_seed=self.random_seed,
+            y_lim=y_lim,
+            parent=self,
+        )
+        self.iter_B = TeachIterator(
+            df=group_frames["B"],
+            group="B",
+            random_seed=self.random_seed,
+            y_lim=y_lim,
+            parent=self,
+        )
+        self.iter_C = TeachIterator(
+            df=group_frames["C"],
+            group="C",
+            random_seed=self.random_seed,
+            y_lim=y_lim,
+            parent=self,
+        )
+        self.iter_D = TeachIterator(
+            df=group_frames["D"],
+            group="D",
+            random_seed=self.random_seed,
+            y_lim=y_lim,
+            parent=self,
+        )
+        self.iter_E = TeachIterator(
+            df=group_frames["E"],
+            group="E",
+            random_seed=self.random_seed,
+            y_lim=y_lim,
+            parent=self,
+        )
+
+        print("[teach] built group iterators for A, B, C, D and E. Group E reuses D assets.")
+        return {
+            "A": self.iter_A,
+            "B": self.iter_B,
+            "C": self.iter_C,
+            "D": self.iter_D,
+            "E": self.iter_E,
+        }
 
     def ids(self) -> np.ndarray:
         """Returns the unique selected session IDs."""
@@ -1593,46 +1636,82 @@ class TeachingSet:
             return np.array([], dtype=int)
         return self.teaching_set_df["session_id"].unique()
 
-    def sample_group(self, group: Literal["A", "B", "C"]) -> pd.DataFrame:
-        """Returns a group-specific view without imposing order (ordering is in `TeachIterator`)."""
-        if group.upper() not in {"A", "B", "C"}:
-            raise ValueError(f"unknown group '{group}'")
-        df = self.teaching_set_df.copy()
-        return df.assign(group=group, show_simpl=group.upper() in ["A", "B"])
+    def sample_group(self, group: Literal["A", "B", "C", "D", "E"]) -> pd.DataFrame:
+        """Returns a group-specific view without imposing iterator order.
 
-    def serve_examples(self, group: Literal["A", "B", "C", "All"], *, 
-                       plot_examples: bool = False, n: Optional[int] = 10, 
-                       save_dir: Optional[str | Path] = None, show_meta: bool = False) -> dict[str, list[Figure]]:
-        """Serves and optionally saves and/or plots a batch of examples from the teaching set.
+        Args:
+            group: Group label in A to E.
 
-        Args: 
-            group: The teaching set / user study trial group we want to serve examples for. Can provide one of A/B/C, multiple or "All".
-                   Group A receives simplified + original power & simplified SOC ordered by k (normals asc, abnormals desc), 
-                   group B receives same as A but unordered, and group C same as B but only original/raw data (power + SOC).
-            plot_examples: Whether to immediately plot each example when serving
-            n: How many examples to serve in total across all classes (normal/abnormal).
-            save_dir: If specified, where to store the teaching set
-            show_mta: Whether to print metadata about the examples (charging sessions) in the set such as session ids, k values, paths 
-
-        Raises:
-            ValueError: If a group different than A/B/C is provided for `group`
-
-        Returns: 
-            dict[str, list[Figure]]: Groups are keys, values are a list of examples (figures) belonging to the group.
+        Returns:
+            Group-tagged teaching set view with render metadata.
         """
-        if self.iter_A is None or self.iter_B is None or self.iter_C is None:
+        group_key = str(group).upper()
+        if group_key not in {"A", "B", "C", "D", "E"}:
+            raise ValueError(f"unknown group '{group}'")
+
+        render_mode_by_group = {
+            "A": "overlay",
+            "B": "overlay",
+            "C": "raw",
+            "D": "simplified_only",
+            "E": "simplified_only",
+        }
+        asset_group = "D" if group_key == "E" else group_key
+        render_mode = render_mode_by_group[group_key]
+        df = self.teaching_set_df.copy()
+        return df.assign(
+            group=group_key,
+            asset_group=asset_group,
+            render_mode=render_mode,
+            show_simpl=(render_mode == "overlay"),
+        )
+
+    def serve_examples(
+        self,
+        group: Literal["A", "B", "C", "D", "E", "All"],
+        *,
+        plot_examples: bool = False,
+        n: Optional[int] = 10,
+        save_dir: Optional[str | Path] = None,
+        show_meta: bool = False,
+    ) -> dict[str, list[Figure]]:
+        """Serves and optionally saves examples for one or more groups.
+
+        Args:
+            group: Group label in A to E, or All. All serves A, B, C and D.
+            plot_examples: Whether to display each served example.
+            n: Number of examples to serve per group.
+            save_dir: Optional directory where images are written.
+            show_meta: Whether to print per-example metadata.
+
+        Returns:
+            Mapping from requested group label to served figures.
+        """
+        if any(it is None for it in (self.iter_A, self.iter_B, self.iter_C, self.iter_D, self.iter_E)):
             self.build_group_iterators()
-        groups: list[str] = ["A", "B", "C"] if str(group).upper() == "ALL" else [str(group).upper()]
+
+        groups: list[str] = (
+            ["A", "B", "C", "D"] if str(group).upper() == "ALL" else [str(group).upper()]
+        )
         for g in groups:
-            if g not in {"A", "B", "C"}:
+            if g not in {"A", "B", "C", "D", "E"}:
                 raise ValueError(f"unknown group '{group}'")
 
         base_dir: Optional[Path] = Path(save_dir) if save_dir is not None else None
         if base_dir is not None:
-            for g in groups:
-                (base_dir / g).mkdir(parents=True, exist_ok=True)
+            target_dirs = {"D" if g == "E" else g for g in groups}
+            for target in target_dirs:
+                (base_dir / target).mkdir(parents=True, exist_ok=True)
+            if "E" in groups:
+                print("[teach] group E reuses group D export paths and filenames.")
 
-        iters = {"A": self.iter_A, "B": self.iter_B, "C": self.iter_C}
+        iters = {
+            "A": self.iter_A,
+            "B": self.iter_B,
+            "C": self.iter_C,
+            "D": self.iter_D,
+            "E": self.iter_E,
+        }
         out_figs: dict[str, list[Figure]] = {g: [] for g in groups}
         out_meta: dict[str, list[dict]] = {g: [] for g in groups}
 
@@ -1643,17 +1722,22 @@ class TeachingSet:
             lbl = str(meta.get("label", "unknown")).lower().replace(" ", "-")
             kval = meta.get("k", None)
             k_str = f"k{kval}" if kval is not None else "kNA"
-            if g == "C":
-                fname = f"{g}_ex_{served+1}_{lbl}__{sid}.png"
+
+            asset_group = str(meta.get("asset_group", g)).upper()
+            if asset_group == "E":
+                asset_group = "D"
+
+            if asset_group == "C":
+                fname = f"{asset_group}_ex_{served+1}_{lbl}__{sid}.png"
             else:
-                fname = f"{g}_ex_{served+1}_{lbl}_{k_str}__{sid}.png"
-            path = (base_dir / g / fname)
+                fname = f"{asset_group}_ex_{served+1}_{lbl}_{k_str}__{sid}.png"
+            path = base_dir / asset_group / fname
             fig.savefig(path, dpi=200, bbox_inches="tight")
             return path
 
         for g in groups:
-            if plot_examples: 
-                print("--"*8, f" Teaching Set {g} ", "--"*8)
+            if plot_examples:
+                print("--" * 8, f" Teaching Set {g} ", "--" * 8)
             it = iters[g]
             served = 0
             while True:
@@ -1663,6 +1747,11 @@ class TeachingSet:
                     session_metadata = next(it)
                 except StopIteration:
                     break
+
+                if g == "E":
+                    session_metadata["group"] = "E"
+                    session_metadata["asset_group"] = "D"
+
                 fig = session_metadata.pop("fig", None)
                 out_meta[g].append(session_metadata)
                 if show_meta:
@@ -1670,7 +1759,10 @@ class TeachingSet:
                 if isinstance(fig, Figure):
                     _ = _save_if_needed(fig, g, session_metadata)
                     if plot_examples:
-                        print(f"Classification label: {session_metadata['label']}, k: {session_metadata['k']}, session ID: {session_metadata['session_id']}")
+                        print(
+                            f"Classification label: {session_metadata['label']}, "
+                            f"k: {session_metadata['k']}, session ID: {session_metadata['session_id']}"
+                        )
                         display(fig)
                     plt.close(fig)
                     out_figs[g].append(fig)
@@ -1723,7 +1815,7 @@ class TeachingSet:
         This method does not (re)construct the teaching set. It takes whatever is
         already in `self.teaching_set_df`, splits it into up to two sets of size
         `per_set_total` each (allowing shortfalls), randomises order for exams, and
-        optionally writes RAW/OVERLAY images for groups A/B and RAW for C.
+        optionally writes exam images for groups A, B, C and D.
 
         Args:
             per_set_total: Target number of examples per exam set (upper bound).
@@ -1731,7 +1823,7 @@ class TeachingSet:
             random_seed: RNG seed for deterministic shuffling.
             bin_allocation: Present for backward compatibility; not enforced here.
             enforce_even_class_dist: Present for backward compatibility; not enforced here.
-            save_images: If True, renders images for A/B (RAW + OVERLAY) and C (RAW).
+            save_images: If True, renders images for A/B (RAW + OVERLAY), C (RAW) and D (simplified-only).
             image_format: 'png' or 'jpg'.
 
         Returns:
@@ -1811,6 +1903,7 @@ class TeachingSet:
                 "B_raw": str(out_root / "set1" / "B" / "raw"),
                 "B_overlay": str(out_root / "set1" / "B" / "overlay"),
                 "C_raw": str(out_root / "set1" / "C" / "raw"),
+                "D_simplified": str(out_root / "set1" / "D" / "simplified"),
             },
             "set2": {
                 "A_raw": str(out_root / "set2" / "A" / "raw"),
@@ -1818,6 +1911,7 @@ class TeachingSet:
                 "B_raw": str(out_root / "set2" / "B" / "raw"),
                 "B_overlay": str(out_root / "set2" / "B" / "overlay"),
                 "C_raw": str(out_root / "set2" / "C" / "raw"),
+                "D_simplified": str(out_root / "set2" / "D" / "simplified"),
             },
         }
 
@@ -1845,9 +1939,10 @@ class TeachingSet:
         return {
             "paths": paths,
             "counts": {"set1": int(len(df_e1)), "set2": int(len(df_e2))},
+            "aliases": {"E": "D"},
             "note": (
                 "flexible split: no strict per-class enforcement; counts may be below targets "
-                "if the selected teaching set lacks supply."
+                "if the selected teaching set lacks supply. Group E reuses group D assets."
             ),
         }
 
@@ -1940,12 +2035,15 @@ class TeachingSet:
         random_seed: Optional[int] = None,
         image_format: Literal["png", "jpg"] = "png",
     ) -> None:
-        """Renders exam images for a given set into RAW/OVERLAY variants as required by groups.
+        """Renders exam images for one set using group-specific modalities.
 
         Layout:
-          root/set{set_id}/A/raw,     root/set{set_id}/A/overlay
-          root/set{set_id}/B/raw,     root/set{set_id}/B/overlay
-          root/set{set_id}/C/raw
+            root/set{set_id}/A/raw
+            root/set{set_id}/A/overlay
+            root/set{set_id}/B/raw
+            root/set{set_id}/B/overlay
+            root/set{set_id}/C/raw
+            root/set{set_id}/D/simplified
         """
         set_dir = root / f"set{set_id}"
         # make y-limits consistent within the set
@@ -1968,9 +2066,9 @@ class TeachingSet:
             fig.savefig(path, dpi=200, bbox_inches="tight")
             plt.close(fig)
 
-        # Groups A and B: produce RAW and OVERLAY
+        # Groups A and B: produces RAW and OVERLAY variants.
         for g in ("A", "B"):
-            for variant, overlay in (("raw", False), ("overlay", True)):
+            for variant, mode in (("raw", "raw"), ("overlay", "overlay")):
                 dest = _ensure(set_dir / g / variant)
                 it = TeachIterator(
                     df=df_set,
@@ -1978,8 +2076,8 @@ class TeachingSet:
                     parent=self,
                     random_seed=random_seed,
                     y_lim=y_lim,
-                    exam_mode=True, # random order for exams
-                    show_simpl_overlays=overlay, #force RAW/OVERLAY
+                    exam_mode=True,  # random order for exams
+                    render_mode=mode,  # force RAW or OVERLAY
                 )
                 ordinal = 1
                 for item in it:
@@ -1988,7 +2086,7 @@ class TeachingSet:
                         _save(fig, dest, item, ordinal)
                         ordinal += 1
 
-        # Group C: RAW only
+        # Group C: produces RAW only.
         g = "C"
         dest = _ensure(set_dir / g / "raw")
         it = TeachIterator(
@@ -1997,8 +2095,27 @@ class TeachingSet:
             parent=self,
             random_seed=random_seed,
             y_lim=y_lim,
-            exam_mode=True,                 # random order
-            show_simpl_overlays=False,      # raw only
+            exam_mode=True,  # random order
+            render_mode="raw",
+        )
+        ordinal = 1
+        for item in it:
+            fig = item.pop("fig", None)
+            if isinstance(fig, Figure):
+                _save(fig, dest, item, ordinal)
+                ordinal += 1
+
+        # Group D: produces simplified-only outputs.
+        g = "D"
+        dest = _ensure(set_dir / g / "simplified")
+        it = TeachIterator(
+            df=df_set,
+            group=g,
+            parent=self,
+            random_seed=random_seed,
+            y_lim=y_lim,
+            exam_mode=True,
+            render_mode="simplified_only",
         )
         ordinal = 1
         for item in it:
@@ -2021,27 +2138,32 @@ class TeachIterator:
       - 'A': raw power with simplification overlay, ordered (by difficulty via k & margin)
       - 'B': raw power with simplification overlay, random order
       - 'C': raw power only, random order
+      - 'D': simplified-only power and SOC, ordered like A
+      - 'E': same behaviour as D
 
     Exam semantics:
       - `exam_mode=True` forces random order for all groups.
-      - Overlays are controlled by `show_simpl_overlays` if provided, otherwise by group defaults.
-        This lets us save RAW and OVERLAY variants for A/B without changing group labels.
+      - Rendering is controlled by `render_mode` when provided.
+      - `show_simpl_overlays` remains as a backwards-compatible override for
+        legacy raw and overlay switching.
 
     Attributes:
         df: DataFrame of selected items (must include session paths/metadata).
-        group: 'A' | 'B' | 'C'.
+        group: 'A' | 'B' | 'C' | 'D' | 'E'.
         parent: Owning TeachingSet instance (for params like t_min_eval, anchor_endpoints).
         random_seed: RNG seed for deterministic ordering.
         y_lim: Optional y-axis limits for plotting.
+        render_mode: Optional render mode override in {'raw', 'overlay', 'simplified_only'}.
         show_simpl_overlays: Optional override (True/False) for overlay behaviour.
         exam_mode: If True, always randomises order (no curriculum sorting).
     """
     df: pd.DataFrame
-    group: Literal["A", "B", "C"]
+    group: Literal["A", "B", "C", "D", "E"]
     parent: TeachingSet
     random_seed: Optional[int] = None
     y_lim: tuple[float, float] | None = None
     sort_key: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
+    render_mode: Optional[Literal["raw", "overlay", "simplified_only"]] = None
     show_simpl_overlays: Optional[bool] = None
     exam_mode: bool = False
 
@@ -2052,6 +2174,8 @@ class TeachIterator:
         df = self.df.reset_index(drop=True)
         if "class_label" not in df.columns:
             raise ValueError("class_label missing from DataFrame columns")
+        if self.group not in {"A", "B", "C", "D", "E"}:
+            raise ValueError(f"unknown group '{self.group}'")
 
         rng = np.random.default_rng(self.random_seed)
 
@@ -2069,13 +2193,13 @@ class TeachIterator:
         abnormals_arr = df.index[df["class_label"].astype(int) == 1].to_numpy()
 
         def order_within_class(idxs: np.ndarray) -> np.ndarray:
-            """Order by curriculum when group='A', otherwise random order."""
+            """Orders by curriculum for A, D and E, otherwise randomises."""
             if idxs.size == 0:
                 return idxs
             class_subset = df.loc[idxs]
 
-            if self.group == "A":
-                # normals (0): k & margin asc; abnormals (1): k & margin desc
+            if self.group in {"A", "D", "E"}:
+                # normals (0): k and margin asc. abnormals (1): k and margin desc.
                 if not {"k", "margin"}.issubset(class_subset.columns):
                     raise ValueError("k or margin missing from df.columns")
                 asc_k = int(class_subset["class_label"].iloc[0]) == 0
@@ -2091,8 +2215,8 @@ class TeachIterator:
 
         normals_curriculum = order_within_class(normals_arr)
         abnormals_curriculum = order_within_class(abnormals_arr)
-        if self.group == "A" and not self.exam_mode:
-            # A: Interleave normal/abnormal (starts with normals). If one class runs out, append the rest.
+        if self.group in {"A", "D", "E"} and not self.exam_mode:
+            # Interleaves normal and abnormal examples and starts with normal.
             merged: list[int] = []
             i0 = i1 = 0
             while i0 < len(normals_curriculum) or i1 < len(abnormals_curriculum):
@@ -2104,7 +2228,7 @@ class TeachIterator:
                     i1 += 1
             merged_curriculum = np.asarray(merged, dtype=int)
         else:
-            # B and C: random global order (no alternation), still respecting any per-class caps
+            # B and C use random global order and still respect per-class caps.
             merged_curriculum = np.concatenate([normals_curriculum, abnormals_curriculum]).astype(int)
             rng = np.random.default_rng(self.random_seed)
             rng.shuffle(merged_curriculum)
@@ -2125,100 +2249,219 @@ class TeachIterator:
         meta = self._serve_row(row)
         return meta
 
+    def _resolve_render_mode(self) -> Literal["raw", "overlay", "simplified_only"]:
+        """Resolves the active rendering mode for the iterator.
+
+        Returns:
+            Rendering mode chosen from raw, overlay or simplified_only.
+        """
+        if self.render_mode is not None:
+            if self.render_mode not in {"raw", "overlay", "simplified_only"}:
+                raise ValueError(f"unknown render_mode '{self.render_mode}'")
+            return self.render_mode
+
+        if self.show_simpl_overlays is not None:
+            return "overlay" if bool(self.show_simpl_overlays) else "raw"
+
+        defaults = {
+            "A": "overlay",
+            "B": "overlay",
+            "C": "raw",
+            "D": "simplified_only",
+            "E": "simplified_only",
+        }
+        return defaults[self.group]
+
+    def _build_simplification(
+        self,
+        *,
+        power: np.ndarray,
+        piv_path: str | Path | None,
+        sts_full_path: str | Path | None,
+        raw_soc_path: str | Path | None,
+        piv_soc_path: str | Path | None,
+        sts_soc_path: str | Path | None,
+    ) -> ChargingSessionSimplification | None:
+        """Builds power and SOC simplifications from row paths.
+
+        Args:
+            power: Raw dense power series used as fallback base for knot values.
+            piv_path: Path to power pivots.
+            sts_full_path: Path to dense simplified power.
+            raw_soc_path: Path to raw SOC.
+            piv_soc_path: Path to SOC pivots.
+            sts_soc_path: Path to dense simplified SOC.
+
+        Returns:
+            Simplification object when power simplification paths are valid.
+        """
+        simp: ChargingSessionSimplification | None = None
+
+        if piv_path is not None and Path(piv_path).exists():
+            idx, val = _load_knots(piv_path, base_series=power)
+            simp = ChargingSessionSimplification(
+                power_knot_idx=idx,
+                power_knot_val_kw=val,
+                k_power=int(idx.size - 1),
+                kind="ors",
+            )
+        elif sts_full_path is not None and Path(sts_full_path).exists():
+            dense = _safe_load(sts_full_path).astype(float)
+            idx, _ = _dense_to_knots(dense)
+            idx, val = _align_knots(idx, dense[idx], int(power.shape[0]))
+            simp = ChargingSessionSimplification(
+                power_knot_idx=idx,
+                power_knot_val_kw=val,
+                k_power=int(idx.size - 1),
+                kind="ors",
+            )
+
+        if simp is None:
+            return None
+
+        sidx, sval = None, None
+        soc_base: np.ndarray | None = None
+        if raw_soc_path is not None and Path(raw_soc_path).exists():
+            try:
+                soc_base = np.asarray(_safe_load(raw_soc_path), dtype=float).reshape(-1)
+            except Exception:
+                soc_base = None
+        if soc_base is None and sts_soc_path is not None and Path(sts_soc_path).exists():
+            try:
+                soc_base = np.asarray(_safe_load(sts_soc_path), dtype=float).reshape(-1)
+            except Exception:
+                soc_base = None
+
+        if piv_soc_path is not None and Path(piv_soc_path).exists():
+            sidx, sval = _load_knots(piv_soc_path, base_series=soc_base)
+        elif sts_soc_path is not None and Path(sts_soc_path).exists():
+            sidx, sval = _dense_to_knots(_safe_load(sts_soc_path))
+
+        if (sidx is not None) and (sval is not None):
+            simp.soc_knot_idx = np.asarray(sidx, dtype=int)
+            simp.soc_knot_val_pct = np.asarray(sval, dtype=float)
+
+        return simp
+
+    @staticmethod
+    def _label_from_row(row: pd.Series) -> str:
+        """Builds human-readable label text from a dataframe row.
+
+        Args:
+            row: Row containing either label or class_label.
+
+        Returns:
+            Label text as normal, abnormal or unknown.
+        """
+        if "label" in row and pd.notna(row["label"]):
+            return str(row["label"])
+        if "class_label" in row and pd.notna(row["class_label"]):
+            return "normal" if int(row["class_label"]) == 0 else "abnormal"
+        return "unknown"
+
     def _serve_row(self, row: pd.Series) -> dict:
         """Builds a plot for a single row and returns a small log dict (incl. fig)."""
         sid = int(row.get("session_id", row.get("charging_id", -1)))
 
-        # locate files
+        # Locate files.
         sts_full_path = row.get("sts_full_path", None)
         piv_path = row.get("piv_path", None)
-        raw_power_path = row.get("raw_power_path", None) or (_derive_raw_power_path(sts_full_path) if sts_full_path else None)
+        raw_power_path = row.get("raw_power_path", None) or (
+            _derive_raw_power_path(sts_full_path) if sts_full_path else None
+        )
         if raw_power_path is None:
             raise ValueError("cannot locate raw_power_path for session")
 
-        # classify label text
-        if "label" in row and pd.notna(row["label"]):
-            label_str = str(row["label"])
-        elif "class_label" in row and pd.notna(row["class_label"]):
-            label_str = "normal" if int(row["class_label"]) == 0 else "abnormal"
-        else:
-            label_str = "unknown"
+        label_str = self._label_from_row(row)
 
-        # SOC paths (raw or simplified)
-        raw_soc_path = row.get("raw_soc_path", None) or (str(_derive_raw_soc_path(sts_full_path)) if sts_full_path else None)
+        # SOC paths (raw or simplified).
+        raw_soc_path = row.get("raw_soc_path", None) or (
+            str(_derive_raw_soc_path(sts_full_path)) if sts_full_path else None
+        )
         piv_soc_path = row.get("piv_soc_path", None)
         sts_soc_path = row.get("sts_soc_path", None)
+        asset_group = str(row.get("asset_group", self.group)).upper()
+        render_mode = self._resolve_render_mode()
 
-        # Decide overlay behaviour: override > default-by-group
-        overlay_enabled = (
-            bool(self.show_simpl_overlays)
-            if self.show_simpl_overlays is not None
-            else (self.group in ("A", "B"))
-        )
-
-        # Load power for plotting limits/knots
+        # Loads power for plotting limits and knots.
         power = _load_power(raw_power_path)
+        k_val: int | None = None
 
-        if not overlay_enabled:
-            # RAW ONLY: power + raw SOC (used for group C and A/B pre-teaching exam)
-            soc_raw = _safe_load(raw_soc_path) if raw_soc_path else _safe_load(_derive_raw_soc_path(sts_full_path))
+        if render_mode == "raw":
+            # Raw mode draws raw power and raw SOC.
+            soc_raw = (
+                _safe_load(raw_soc_path)
+                if raw_soc_path
+                else _safe_load(_derive_raw_soc_path(sts_full_path))
+            )
             sess_raw = ChargingSession(session_id=sid, power_kw=power, soc_pct=np.asarray(soc_raw, dtype=float))
             fig, _ = sess_raw.plot_raw(soc_mode="raw", title=None, y_lim=self.y_lim)
-            k_val = None
-            piv_soc_used = None
         else:
-            # OVERLAY: raw+simplified power + simplified SOC (A/B teaching & A/B post-teaching exam)
-            # power simplification
-            simp = None
-            if piv_path is not None and Path(piv_path).exists():
-                idx, val = _load_knots(piv_path, base_series=power)
-                simp = ChargingSessionSimplification(
-                    power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
-                )
-            elif sts_full_path is not None and Path(sts_full_path).exists():
-                dense = _safe_load(sts_full_path).astype(float)
-                idx, _ = _dense_to_knots(dense)
-                idx, val = _align_knots(idx, dense[idx], int(power.shape[0]))
-                simp = ChargingSessionSimplification(
-                    power_knot_idx=idx, power_knot_val_kw=val, k_power=int(idx.size - 1), kind="ors"
-                )
-
-            # SOC simplified (prefer pivots; fallback: dense -> knots)
-            sidx, sval = None, None
-            soc_base: np.ndarray | None = None
-            if raw_soc_path is not None:
-                try:
-                    soc_base = np.asarray(_safe_load(raw_soc_path), dtype=float).reshape(-1)
-                except Exception:
-                    soc_base = None
-            if soc_base is None and sts_soc_path is not None:
-                try:
-                    soc_base = np.asarray(_safe_load(sts_soc_path), dtype=float).reshape(-1)
-                except Exception:
-                    soc_base = None
-
-            if piv_soc_path is not None:
-                sidx, sval = _load_knots(piv_soc_path, base_series=soc_base)
-            elif sts_soc_path is not None:
-                sidx, sval = _dense_to_knots(_safe_load(sts_soc_path))
-
-            if (sidx is not None) and (sval is not None) and (simp is not None):
-                simp.soc_knot_idx = np.asarray(sidx, dtype=int)
-                simp.soc_knot_val_pct = np.asarray(sval, dtype=float)
-
-            sess_simpl = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
-            fig, _ = sess_simpl.plot_raw(
-                soc_mode="simpl",
-                title=None,
-                y_lim=self.y_lim,
-                anchor_endpoints=self.parent.ors_params.anchor_endpoints,
-                t_min_eval=int(self.parent.ors_params.t_min_eval),
+            simp = self._build_simplification(
+                power=power,
+                piv_path=piv_path,
+                sts_full_path=sts_full_path,
+                raw_soc_path=raw_soc_path,
+                piv_soc_path=piv_soc_path,
+                sts_soc_path=sts_soc_path,
             )
+            if simp is None:
+                raise ValueError(f"cannot build simplification for session {sid}")
             k_val = int(simp.k_power) if (simp and simp.k_power is not None) else None
+
+            if render_mode == "overlay":
+                # Overlay mode draws raw and simplified power and simplified SOC.
+                sess_simpl = ChargingSession(session_id=sid, power_kw=power, simplification=simp)
+                fig, _ = sess_simpl.plot_raw(
+                    soc_mode="simpl",
+                    title=None,
+                    y_lim=self.y_lim,
+                    anchor_endpoints=self.parent.ors_params.anchor_endpoints,
+                    t_min_eval=int(self.parent.ors_params.t_min_eval),
+                )
+            elif render_mode == "simplified_only":
+                # Simplified-only mode draws simplified power and simplified SOC only.
+                from .plot import plot_simpl_session
+
+                power_simpl = simp.densify_power(
+                    T=int(power.shape[0]),
+                    anchor_endpoints=self.parent.ors_params.anchor_endpoints,
+                    t_min_eval=int(self.parent.ors_params.t_min_eval),
+                )
+                if power_simpl is None:
+                    raise ValueError(f"simplified-only mode cannot densify power for session {sid}")
+
+                soc_simpl = simp.densify_soc(int(power.shape[0]))
+                if soc_simpl is None:
+                    print(
+                        f"[teach][warn] sid={sid} has no simplified SOC. "
+                        "Simplified-only plot omits SOC."
+                    )
+
+                if self.y_lim is not None:
+                    power_y_lim = self.y_lim
+                else:
+                    upper = float(np.max(power_simpl)) if len(power_simpl) > 0 else 1.0
+                    power_y_lim = (0.0, max(upper * 1.05, 1.0))
+
+                fig, _ = plot_simpl_session(
+                    power_simpl_kw=np.asarray(power_simpl, dtype=float),
+                    soc_simpl_pct=(
+                        np.asarray(soc_simpl, dtype=float)
+                        if soc_simpl is not None
+                        else None
+                    ),
+                    title=None,
+                    power_y_lim=power_y_lim,
+                )
+            else:
+                raise ValueError(f"unknown render_mode '{render_mode}'")
 
         result = {
             "session_id": sid,
             "group": self.group,
+            "asset_group": asset_group,
+            "render_mode": render_mode,
             "k": k_val,
             "label": label_str,
             "sts_full_path": sts_full_path,

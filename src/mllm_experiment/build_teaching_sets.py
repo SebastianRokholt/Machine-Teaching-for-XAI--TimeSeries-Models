@@ -9,7 +9,7 @@ from uuid import uuid4
 
 PROJECT_ROOT_DIR = Path(__file__).resolve().parents[2]
 FIG_DIR = PROJECT_ROOT_DIR / "Figures"
-TEACHING_SET_DIR = FIG_DIR / "teaching_sets" / "--archive"
+TEACHING_SOURCE_DIR = FIG_DIR / "teaching_sets"
 TRIAL_TEACHING_SET_DIR = FIG_DIR / "teaching_sets" / "mllm_experiment_sets"
 METADATA_DIR = PROJECT_ROOT_DIR / "Data" / "mllm_experiment_metadata"
 METADATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -25,11 +25,13 @@ for directory in [TRIAL_TEACHING_SET_DIR, METADATA_DIR]:
             f"another location."
         ) from e
 
-for directory in [FIG_DIR, TEACHING_SET_DIR]: 
+for directory in [FIG_DIR, TEACHING_SOURCE_DIR]:
     if not Path(directory).exists():
-        raise ValueError(f"Cannot find directory {directory}."
-                         f"This should be set in the teaching set construction pipeline (see `06__MT4XAI.ipynb`)."
-                         f"You can set the location of required directories/files in `build_teaching_sets.py`")
+        raise ValueError(
+            f"Cannot find directory {directory}."
+            " This directory is expected to be created by the MT4XAI "
+            "notebook pipeline."
+        )
 
 @dataclass(slots=True)
 class TeachingExample:
@@ -52,10 +54,10 @@ class TeachingExample:
 
 
 def find_labelled_examples(group: str) -> list[TeachingExample]:
-    """Collect labelled examples for one group from the archive.
+    """Collect labelled examples for one group from canonical exports.
 
-    This function scans the "--archive/<group> labelled" directory for
-    png files and parses label and simplicity_k from the filename.
+    This function scans Figures/teaching_sets/<group> for png files and
+    parses label and simplicity_k from the filename.
 
     Expected patterns:
 
@@ -66,9 +68,7 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
              e.g. C_ex_1_normal__6823722.png
 
     For group C, filenames do not contain k, so this function sets
-    simplicity_k = 0 as a placeholder. You can later overwrite these
-    values in metadata/teaching_items.csv if you have the true k values
-    in a separate table.
+    simplicity_k = 0 as a placeholder.
 
     Args:
         group: Group identifier, such as "A", "B", "C" or "D".
@@ -76,9 +76,9 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
     Returns:
         List of TeachingExample instances for the group.
     """
-    labelled_dir = TEACHING_SET_DIR / f"{group} labelled"
-    if not labelled_dir.is_dir():
-        msg = f"labelled directory not found for group {group}: {labelled_dir}"
+    source_dir = TEACHING_SOURCE_DIR / group
+    if not source_dir.is_dir():
+        msg = f"source directory not found for group {group}: {source_dir}"
         raise FileNotFoundError(msg)
 
     if group in {"A", "B", "D"}:
@@ -99,7 +99,7 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
 
     examples: list[TeachingExample] = []
 
-    for path in sorted(labelled_dir.glob("*.png")):
+    for path in sorted(source_dir.glob("*.png")):
         match = pattern.match(path.name)
         if not match:
             raise ValueError(
@@ -111,7 +111,6 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
             simplicity_k = int(k_str)
         else:  # group C
             idx_str, label, _random_tail = match.groups()
-            # placeholder: update later from your own metadata if needed
             simplicity_k = 0
 
         examples.append(
@@ -130,9 +129,10 @@ def find_labelled_examples(group: str) -> list[TeachingExample]:
 def anonymise_group_examples(examples: Iterable[TeachingExample]) -> list[dict]:
     """Copy labelled examples into anonymised teaching sets and build metadata.
 
-    This function creates a clean directory Figures/teaching_sets/<group>
-    for each group and copies the original images using filenames that
-    do not contain class labels or k values:
+    This function creates a clean directory
+    Figures/teaching_sets/mllm_experiment_sets/<group> for each group
+    and copies the source images using filenames that do not contain
+    class labels or k values:
 
         <GROUP>_ex_<seq:03d>_<rand>.png
 
@@ -150,6 +150,8 @@ def anonymise_group_examples(examples: Iterable[TeachingExample]) -> list[dict]:
     group = examples[0].group
     dst_dir = TRIAL_TEACHING_SET_DIR / group
     dst_dir.mkdir(parents=True, exist_ok=True)
+    for existing in dst_dir.glob("*.png"):
+        existing.unlink()
 
     rows: list[dict] = []
 
@@ -162,11 +164,10 @@ def anonymise_group_examples(examples: Iterable[TeachingExample]) -> list[dict]:
 
         item_id = f"{group}_{seq:03d}"
 
-        # margin is unknown here; you can later overwrite this column if needed
+        # Margin is unknown at this stage and remains a placeholder.
         margin = 0.0
 
-        # order_index is set to seq by default. for group A you can later
-        # replace this with curriculum order based on k and margin.
+        # order_index follows source ordering from the group export.
         order_index = seq
 
         rows.append(
@@ -188,7 +189,7 @@ def build_teaching_metadata(groups: list[str]) -> None:
     """Create anonymised teaching sets and a metadata CSV.
 
     Args:
-        groups: List of group identifiers to process, typically ["A","B","C"].
+        groups: List of group identifiers to process, typically ["A","B","C","D"].
     """
     all_rows: list[dict] = []
 

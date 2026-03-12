@@ -4,7 +4,7 @@
 ---
 
 **Summary**  
-This notebook operationalises Machine Teaching for Explainable AI (MT4XAI) on EV-charging time series. The goal of our simplified-example-based approach to MT4XAI is to help participants efficiently form an accurate mental model of the time series classifier from a *small* set of automatically selected and simplified examples. In this notebook, we load the trained classifier and session data, compute an **ORS** pool of robust piece-wise linear simplifications (k-segment curves that preserve the model’s label), bin the pool by class and k to control curriculum difficulty, select a compact, diverse **teaching set** $S$ using a facility-location objective with fidelity/robustness terms, and serve grouped teaching sessions with the original power curve + the simplified power curve and simplified SOC overlays for the upcoming study (two experimental groups + control group). We also construct exam sets for the study. 
+This notebook operationalises Machine Teaching for Explainable AI (MT4XAI) on EV-charging time series. The goal of our simplified-example-based approach to MT4XAI is to help participants efficiently form an accurate mental model of the time series classifier from a *small* set of automatically selected and simplified examples. In this notebook, we load the trained classifier and session data, compute an **ORS** pool of robust piece-wise linear simplifications (k-segment curves that preserve the model’s label), bin the pool by class and k to control curriculum difficulty, select a compact, diverse **teaching set** $S$ using a facility-location objective with fidelity/robustness terms, and serve grouped teaching sessions for trial groups A/B/C/D while group E reuses D assets. We also construct exam sets for the study. 
 
 ---
 
@@ -30,10 +30,12 @@ Traditional post-hoc XAI for time series often struggles with human comprehensib
 
 In this project, example complexity is controlled by **Optimal Robust Simplifications (ORS)**: for each session we compute a piece-wise linear simplification with k segments that (i) stays close to the original curve, (ii) keeps the model's decision, and (iii) is robust to local perturbations. ORS admits a principled balance between error, simplicity (k), and robustness, with a polynomial-time algorithm under mild conditions. These simplifications intend to make the salient shape cues apparent to non-experts while preserving decision-relevant shapes/structure. 
 
-We then assemble a teaching set S from a class-balanced "pool" of pre-computed simplifications using machine teaching principles. Rather than showing arbitrary cases, we optimise for a compact subset that best "covers" the model’s behaviours, enabling simulate-the-model tasks in the user study. Prior MT4XAI studies show that machine-selected witness sets can teach target behaviours more effectively than random sampling, and that accounting for human priors and representation choices matters. This notebook instantiates those ideas for multivariate charging sessions (power + SOC overlays) and prepares trial groups A/B/C for the study: 
+We then assemble a teaching set S from a class-balanced "pool" of pre-computed simplifications using machine teaching principles. Rather than showing arbitrary cases, we optimise for a compact subset that best "covers" the model’s behaviours, enabling simulate-the-model tasks in the user study. Prior MT4XAI studies show that machine-selected witness sets can teach target behaviours more effectively than random sampling, and that accounting for human priors and representation choices matters. This notebook instantiates those ideas for multivariate charging sessions and prepares trial groups A/B/C/D (with E reusing D assets) for the study: 
  - Group A receives original `power`, simplified `power` and simplified `soc` ordered by simplicity/difficulty
  - Group B receives the same teaching set as group A but in random order
  - Group C receives the same teaching set as B but without simplifications (original `power` and `soc`).
+ - Group D receives simplified `power` and simplified `soc` only, with the same order/curriculum as group A.
+ - Group E reuses group D teaching and exam assets.
 
 **References & Background Literature:**
 - [Optimal Robust Simplifications for Explaining Time Series Classifications](https://xai.w.uib.no/files/2024/07/ORS.pdf) (2024) by Telle, Ferri & Håvardstun.
@@ -47,7 +49,7 @@ This notebook uses a class-based API defined in the project's custom Python pack
 - `ChargingSession` contains the original, dense, unscaled arrays for the `power` series (and optionally for other channels/features as well). 
 - `ChargingSessionSimplification` with knots\* only (indices + values). We cnvert these to dense simplifications and fetch original raw series on demand.
 - `TeachingPool` owns the pool (`pool.parquet`), binning, and paths.
-- `TeachingSet` performs selection with greedy facility-location (+ lazy pruning), then exposes A/B/C samplers.
+- `TeachingSet` performs selection with greedy facility-location (+ lazy pruning), then exposes A/B/C/D/E samplers.
 
 Note: 
 A *knot* is an endpoint of a straight line segment in the simplification. We define **k = number of straight line segments = knots − 1**.
@@ -109,8 +111,6 @@ EXAM_SET_EX_PER_CLS = 20  # 40 examples spread across two exams (pre-teach + pos
 
     CONFIG FILE LOADED: 
     {'project': {'random_seed': 42, 'root_dir': None}, 'paths': {'data_dir': 'Data', 'dataset': 'Data/etron55-charging-sessions.parquet', 'teaching_pool': 'Data/teaching_pool', 'models': 'Models', 'final_model': 'Models/final/final_model.pth', 'figures': 'Figures', 'logs': 'Logs'}, 'inference': {'horizon': 5, 'final_model_name': 'final_model.pth', 'hidden_dim': 256, 'num_layers': 4, 'dropout': 0.0027575414563, 'alpha_h': 0.5187590357622, 'batch_size': 32, 'grad_clip_norm': 5.0, 'lr': 0.000501551534, 'weight_decay': 1.1078448e-06, 'horizon_decay_lambda': 0.4, 't_min_eval': 1, 'ad_rmse_threshold': 13.3423, 'ad_pct_threshold': 95, 'metric': 'macro_rmse'}, 'ors': {'soc_stage1_mode': 'rdp', 'soc_rdp_epsilon': 0.75, 'soc_rdp_candidates': 5, 'soc_rdp_eps_min': 1e-06, 'soc_rdp_eps_max': 100.0, 'stage2_err_metric': 'l2', 'epsilon_mode': 'fraction'}, 'teaching': {'teaching_pool_dir': '../Data/teaching_pool', 'teaching_set_size': 60}}
-    The autoreload extension is already loaded. To reload it, use:
-      %reload_ext autoreload
     Device:  cuda
 
 
@@ -275,15 +275,17 @@ if construct_pool:
 ```
 
     Loaded previously computed teaching pool from disk
-    Current pool counts: 277 abn, 275 norm
+    Current pool counts: 277 abn, 283 norm
     Target counts: 283 abn, 283 norm
     Building / updating teaching pool …
     [teaching_pool] computing base labels...
     [teaching_pool] targets: 283 abnormals, 283 normals (base candidates: 283 abn, 5809 norm)
-    [teaching_pool] cached counts: 277 abn, 275 norm. remaining targets: 6 abn, 8 norm.
-    [teaching_pool] processing queue size: 14
-    [teaching_pool] build complete. processed 8/14 sessions. artefacts under: /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/teaching_pool
+    [teaching_pool] cached counts: 277 abn, 283 norm. remaining targets: 6 abn, 0 norm.
+    [teaching_pool] processing queue size: 6
+    [teaching_pool] build complete. processed 0/6 sessions. artefacts under: /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/teaching_pool
 
+
+Note: The sessions that don't get processed and don't raise any errors/warnings are outside of the specified length range. 
 
 #### 2.2 - Teaching pool summary statistics
 
@@ -1315,22 +1317,24 @@ display(rep["extremes_summary"])
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_21_6.png)
+![png](06__MT4XAI_files/06__MT4XAI_22_6.png)
     
 
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_21_7.png)
+![png](06__MT4XAI_files/06__MT4XAI_22_7.png)
     
 
 
 ### 4 - The Teaching Session: Serving examples from the teaching set <a id="teaching"></a>
-The user study has three trial groups. All groups sample from the same teaching set, i.e. the same charging session IDs. The nature and ordering of examples differ:
+The user study uses groups A/B/C/D for exported assets, while group E reuses group D assets. All groups sample from the same teaching set, i.e. the same charging session IDs. The nature and ordering of examples differ:
 
 - **Group A** (explanations with curriculum): order by `k_power↑` then `margin_power↓`, overlay raw power with simplification and show simplified SOC. 
 - **Group B** (explanations, no curriculum): random order, overlay raw power with simplification and show simplified SOC. 
 - **Group C** (control, no explanations): random order, raw power and SOC only (no simplifications).
+- **Group D** (simplifications only): same order and curriculum as A, but simplified power and simplified SOC only.
+- **Group E**: same modality and order as D and reuses D files.
 
 Constructing the teaching set is computationally expensive and the optimal teaching set for explaining the time series classifier (TSC) is large. 
 We therefore cap the teaching set at most 100 per class by default to limit the computational effort required to build it. 
@@ -1340,7 +1344,7 @@ We therefore cap the teaching set at most 100 per class by default to limit the 
 # serves without pre-capping and applies post-order cap when exporting
 s.build_group_iterators()  # no cap here anymore
 
-# Create the Teaching Set and examples for trial groups A, B, C
+# Create the Teaching Set and examples for trial groups A, B, C and D
 examples = s.serve_examples(
     group="All",
     plot_examples=False,
@@ -1348,15 +1352,19 @@ examples = s.serve_examples(
     save_dir=TEACHING_SET_DIR,
     show_meta=False,
 )
-# The teaching sessions alterate between normal and abnormal examples. 
-print(f"{len(examples["A"])} examples saved in {TEACHING_SET_DIR}/A")
-print(f"{len(examples["B"])} examples saved in {TEACHING_SET_DIR}/B")
-print(f"{len(examples["C"])} examples saved in {TEACHING_SET_DIR}/C")
+# The teaching sessions alternate between normal and abnormal examples. 
+print(f"{len(examples['A'])} examples saved in {TEACHING_SET_DIR}/A")
+print(f"{len(examples['B'])} examples saved in {TEACHING_SET_DIR}/B")
+print(f"{len(examples['C'])} examples saved in {TEACHING_SET_DIR}/C")
+print(f"{len(examples['D'])} examples saved in {TEACHING_SET_DIR}/D")
+print("Group E reuses group D teaching assets in Figures/teaching_sets/D")
 ```
 
     40 examples saved in /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Figures/teaching_sets/A
     40 examples saved in /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Figures/teaching_sets/B
     40 examples saved in /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Figures/teaching_sets/C
+    40 examples saved in /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Figures/teaching_sets/D
+    Group E reuses group D teaching assets in Figures/teaching_sets/D
 
 
 
@@ -1378,7 +1386,7 @@ _ = s.serve_examples(
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_24_1.png)
+![png](06__MT4XAI_files/06__MT4XAI_25_1.png)
     
 
 
@@ -1387,7 +1395,7 @@ _ = s.serve_examples(
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_24_3.png)
+![png](06__MT4XAI_files/06__MT4XAI_25_3.png)
     
 
 
@@ -1396,7 +1404,7 @@ _ = s.serve_examples(
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_24_5.png)
+![png](06__MT4XAI_files/06__MT4XAI_25_5.png)
     
 
 
@@ -1405,7 +1413,7 @@ _ = s.serve_examples(
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_24_7.png)
+![png](06__MT4XAI_files/06__MT4XAI_25_7.png)
     
 
 
@@ -1414,7 +1422,7 @@ _ = s.serve_examples(
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_24_9.png)
+![png](06__MT4XAI_files/06__MT4XAI_25_9.png)
     
 
 
@@ -1423,11 +1431,13 @@ _ = s.serve_examples(
 
 
     
-![png](06__MT4XAI_files/06__MT4XAI_24_11.png)
+![png](06__MT4XAI_files/06__MT4XAI_25_11.png)
     
 
 
 ### 5- Constructing Exam Sets $E_1$, $E_2$ for Experiments
+Pre-teaching exam uses raw-only examples for all groups.  
+Post-teaching exam uses overlay for A/B, raw-only for C, simplified-only for D, while E reuses D assets.
 
 
 ```python
@@ -1504,128 +1514,29 @@ exam_pool.describe()
 ```
 
     Loaded previously computed teaching exam_pool from disk
-    Current pool counts: 73 abn, 79 norm
+    Current pool counts: 538 abn, 529 norm
     Target counts: 551 abn, 551 norm
     Building / updating teaching pool for exam set construction...
-
-
     [teaching_pool] computing base labels...
     [teaching_pool] targets: 551 abnormals, 551 normals (base candidates: 551 abn, 11632 norm)
-    [teaching_pool] cached counts: 73 abn, 79 norm. remaining targets: 478 abn, 472 norm.
-    [teaching_pool] processing queue size: 950
-    [teaching_pool] processed 10/950 sessions in 1.0 min
-    [teaching_pool] processed 20/950 sessions in 2.0 min
-    [teaching_pool] processed 30/950 sessions in 3.4 min
-    [teaching_pool] processed 40/950 sessions in 4.4 min
-    [teaching_pool] processed 50/950 sessions in 5.5 min
-    [teaching_pool] processed 60/950 sessions in 6.6 min
-    [teaching_pool] processed 70/950 sessions in 7.7 min
-    [teaching_pool] processed 80/950 sessions in 8.9 min
-    [teaching_pool] processed 90/950 sessions in 9.9 min
-    [teaching_pool] processed 100/950 sessions in 11.4 min
-    [teaching_pool] processed 110/950 sessions in 12.4 min
-    [teaching_pool] processed 120/950 sessions in 13.9 min
-    [teaching_pool] processed 130/950 sessions in 15.3 min
-    [teaching_pool] processed 140/950 sessions in 16.8 min
-    [teaching_pool] processed 150/950 sessions in 18.1 min
-    [teaching_pool] processed 160/950 sessions in 19.2 min
-    [teaching_pool] processed 170/950 sessions in 20.3 min
-    [teaching_pool] processed 180/950 sessions in 21.4 min
-    [teaching_pool] processed 190/950 sessions in 22.4 min
-    [teaching_pool] processed 200/950 sessions in 23.3 min
-    [teaching_pool] processed 210/950 sessions in 24.4 min
-    [teaching_pool] processed 220/950 sessions in 25.3 min
-    [teaching_pool] processed 230/950 sessions in 26.8 min
-    [teaching_pool] processed 240/950 sessions in 27.7 min
-    [teaching_pool] processed 250/950 sessions in 28.9 min
-    [teaching_pool] processed 260/950 sessions in 30.6 min
-    [teaching_pool] processed 270/950 sessions in 32.2 min
-    [ORS][warn] sid=4482078 no valid candidates after constraints (mode=dp_prefix, k_span=4..5, dp_q=25, beta=4.0). Trying fallback #1.
-    [teaching_pool] processed 280/950 sessions in 33.3 min
-    [teaching_pool] processed 290/950 sessions in 34.5 min
-    [teaching_pool] processed 300/950 sessions in 36.0 min
-    [teaching_pool] processed 310/950 sessions in 37.1 min
-    [teaching_pool] processed 320/950 sessions in 38.3 min
-    [teaching_pool] processed 330/950 sessions in 39.2 min
-    [teaching_pool] processed 340/950 sessions in 39.9 min
-    [teaching_pool] processed 350/950 sessions in 40.9 min
+    [teaching_pool] cached counts: 538 abn, 529 norm. remaining targets: 13 abn, 22 norm.
+    [teaching_pool] processing queue size: 35
     [ORS][warn] sid=5080852 no valid candidates after constraints (mode=dp_prefix, k_span=1..3, dp_q=11, beta=4.0). Trying fallback #1.
     [ORS][warn] sid=5080852 still no valid candidates (fb#1 k_span=1..3, dp_q=22, beta=16.0). Trying fallback #2 (rdp).
     [ORS][warn] sid=5080852 fallbacks exhausted (rdp k_span=1..9); skipping session.
     [teaching_pool][warn] skipping sid=5080852: res_not_dict
-    [teaching_pool] processed 360/950 sessions in 41.8 min
-    [teaching_pool] processed 370/950 sessions in 42.7 min
-    [teaching_pool] processed 380/950 sessions in 43.9 min
-    [teaching_pool] processed 390/950 sessions in 44.8 min
-    [ORS][warn] sid=5649864 no valid candidates after constraints (mode=dp_prefix, k_span=13..15, dp_q=44, beta=4.0). Trying fallback #1.
-    [teaching_pool] processed 400/950 sessions in 46.2 min
-    [teaching_pool] processed 410/950 sessions in 47.3 min
-    [teaching_pool] processed 420/950 sessions in 48.6 min
-    [teaching_pool] processed 430/950 sessions in 49.8 min
-    [teaching_pool] processed 440/950 sessions in 51.0 min
-    [teaching_pool] processed 450/950 sessions in 52.1 min
-    [teaching_pool] processed 460/950 sessions in 53.2 min
-    [teaching_pool] processed 470/950 sessions in 54.2 min
-    [teaching_pool] processed 480/950 sessions in 55.2 min
-    [teaching_pool] processed 490/950 sessions in 56.2 min
-    [ORS][warn] sid=7369631 no valid candidates after constraints (mode=dp_prefix, k_span=6..7, dp_q=54, beta=4.0). Trying fallback #1.
-    [ORS][warn] sid=7369631 still no valid candidates (fb#1 k_span=4..4, dp_q=108, beta=16.0). Trying fallback #2 (rdp).
-    [teaching_pool] processed 500/950 sessions in 57.0 min
-    [teaching_pool] processed 510/950 sessions in 58.1 min
-    [teaching_pool] processed 520/950 sessions in 59.1 min
-    [teaching_pool] processed 530/950 sessions in 60.2 min
-    [teaching_pool] processed 540/950 sessions in 61.1 min
-    [teaching_pool] processed 550/950 sessions in 62.0 min
-    [teaching_pool] processed 560/950 sessions in 62.9 min
-    [teaching_pool] processed 570/950 sessions in 64.1 min
-    [teaching_pool] processed 580/950 sessions in 65.1 min
-    [teaching_pool] processed 590/950 sessions in 66.0 min
-    [teaching_pool] processed 600/950 sessions in 67.1 min
-    [teaching_pool] processed 610/950 sessions in 68.4 min
-    [teaching_pool] processed 620/950 sessions in 69.5 min
-    [teaching_pool] processed 630/950 sessions in 70.8 min
-    [teaching_pool] processed 640/950 sessions in 71.9 min
-    [teaching_pool] processed 650/950 sessions in 73.0 min
-    [teaching_pool] processed 660/950 sessions in 74.0 min
-    [teaching_pool] processed 670/950 sessions in 75.5 min
-    [teaching_pool] processed 680/950 sessions in 77.1 min
-    [teaching_pool] processed 690/950 sessions in 78.2 min
-    [ORS][warn] sid=10244968 no valid candidates after constraints (mode=dp_prefix, k_span=4..5, dp_q=33, beta=4.0). Trying fallback #1.
-    [teaching_pool] processed 700/950 sessions in 79.3 min
-    [teaching_pool] processed 710/950 sessions in 80.3 min
-    [teaching_pool] processed 720/950 sessions in 81.4 min
-    [teaching_pool] processed 730/950 sessions in 82.5 min
-    [teaching_pool] processed 740/950 sessions in 83.7 min
-    [ORS][warn] sid=10794496 no valid candidates after constraints (mode=dp_prefix, k_span=3..4, dp_q=18, beta=4.0). Trying fallback #1.
-    [teaching_pool] processed 750/950 sessions in 84.9 min
-    [teaching_pool] processed 760/950 sessions in 85.8 min
-    [teaching_pool] processed 770/950 sessions in 86.8 min
-    [teaching_pool] processed 780/950 sessions in 87.7 min
-    [teaching_pool] processed 790/950 sessions in 88.9 min
-    [teaching_pool] processed 800/950 sessions in 89.7 min
-    [teaching_pool] processed 810/950 sessions in 90.9 min
-    [teaching_pool] processed 820/950 sessions in 91.8 min
-    [teaching_pool] processed 830/950 sessions in 92.8 min
-    [teaching_pool] processed 840/950 sessions in 94.0 min
-    [teaching_pool] processed 850/950 sessions in 95.2 min
-    [ORS][warn] sid=11885295 no valid candidates after constraints (mode=dp_prefix, k_span=2..4, dp_q=13, beta=4.0). Trying fallback #1.
-    [teaching_pool] processed 860/950 sessions in 96.4 min
-    [teaching_pool] processed 870/950 sessions in 97.3 min
-    [teaching_pool] processed 880/950 sessions in 98.4 min
-    [teaching_pool] processed 890/950 sessions in 99.4 min
-    [teaching_pool] processed 900/950 sessions in 100.6 min
-    [ORS][warn] sid=12566123 no valid candidates after constraints (mode=dp_prefix, k_span=2..3, dp_q=23, beta=4.0). Trying fallback #1.
-    [teaching_pool] processed 910/950 sessions in 101.9 min
-    [teaching_pool] build complete. processed 915/950 sessions. artefacts under: /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool
-    [teaching pool] rows=1067, classes:
+    [teaching_pool] processed 10/35 sessions in 1.2 min
+    [teaching_pool] processed 20/35 sessions in 2.3 min
+    [teaching_pool] build complete. processed 22/35 sessions. artefacts under: /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool
+    [teaching pool] rows=1089, classes:
     label_int
-    0    529
+    0    551
     1    538
     
     [k] stats:
-     count    1067.000000
-    mean        3.144330
-    std         1.528888
+     count    1089.000000
+    mean        3.124885
+    std         1.521602
     min         1.000000
     25%         2.000000
     50%         3.000000
@@ -1636,9 +1547,6 @@ exam_pool.describe()
 
 ```python
 # derive per-bin budgets from the exam pool. Total examples in S = 2 x TEACHING_SET_EX_PER_CLASS
-per_bin_budget = exam_pool.derive_per_bin_budget(per_class_target=EXAM_SET_EX_PER_CLS+14, bin_allocation="even")
-print(per_bin_budget)
-
 bins_df_exam, bins_meta_exam = exam_pool.bin_pool(
     label_source="base",
     binning="fixed",
@@ -1647,19 +1555,23 @@ bins_df_exam, bins_meta_exam = exam_pool.bin_pool(
     ensure_extrema=True, save_outputs=True, verbose=True
 )
 
+per_bin_budget = exam_pool.derive_per_bin_budget(per_class_target=EXAM_SET_EX_PER_CLS+14, bin_allocation="even")
+print(per_bin_budget)
+
+
 print(bins_df_exam.head(20))
 ```
 
-    {'0': {'[1, 2]': 9, '[2, 3]': 9, '[3, 4]': 8, '[4, 5]': 8}, '1': {'[1, 4]': 7, '[4, 6]': 7, '[6, 8]': 7, '[8, 10]': 7, '[10, 12]': 6}}
-    rows in pool: 1067
+    rows in pool: 1089
     class 0:
       unique k: 5  range: [1,5]
-      k counts: {1: 24, 2: 396, 3: 87, 4: 21, 5: 1}
-      bins (4): labels=[1, 2, 3, 4, 5]  counts=[420, 87, 21, 1]
+      k counts: {1: 25, 2: 413, 3: 90, 4: 22, 5: 1}
+      bins (4): labels=[1, 2, 3, 4, 5]  counts=[438, 90, 22, 1]
     class 1:
       unique k: 12  range: [1,12]
       k counts: {1: 6, 2: 45, 3: 196, 4: 105, 5: 103, 6: 51, 7: 13, 8: 9, 9: 5, 10: 1, 11: 2, 12: 2}
       bins (5): labels=[1, 4, 6, 8, 10, 12]  counts=[247, 208, 64, 14, 5]
+    {'0': {'[1, 2]': 9, '[2, 3]': 9, '[3, 4]': 8, '[4, 5]': 8}, '1': {'[1, 4]': 7, '[4, 6]': 7, '[6, 8]': 7, '[8, 10]': 7, '[10, 12]': 6}}
         session_id  class_label  k  k_bin_idx k_bin_label  label_int label_text  \
     0       104847            0  2          0      [1, 2]          0     normal   
     1       119168            0  2          0      [1, 2]          0     normal   
@@ -1892,15 +1804,15 @@ print("Frequencies of k for abnormal sessions in the exam pool:")
 print(exam_pool.pool_df[exam_pool.pool_df["label_text"] == "abnormal"]["k"].value_counts())
 ```
 
-    [teaching pool] rows=1067, classes:
+    [teaching pool] rows=1089, classes:
     label_int
-    0    529
+    0    551
     1    538
     
     [k] stats:
-     count    1067.000000
-    mean        3.144330
-    std         1.528888
+     count    1089.000000
+    mean        3.124885
+    std         1.521602
     min         1.000000
     25%         2.000000
     50%         3.000000
@@ -1910,11 +1822,11 @@ print(exam_pool.pool_df[exam_pool.pool_df["label_text"] == "abnormal"]["k"].valu
     [bins] counts per (class, k_bin_label):
     label_int      0    1
     k_bin_label          
-    [1, 2]       420    0
+    [1, 2]       438    0
     [1, 4]         0  247
     [10, 12]       0    5
-    [2, 3]        87    0
-    [3, 4]        21    0
+    [2, 3]        90    0
+    [3, 4]        22    0
     [4, 5]         1    0
     [4, 6]         0  208
     [6, 8]         0   64
@@ -2079,10 +1991,10 @@ print(exam_pool.pool_df[exam_pool.pool_df["label_text"] == "abnormal"]["k"].valu
 
     Frequencies of k for normal sessions in the exam pool:
     k
-    2.0    396
-    3.0     87
-    1.0     24
-    4.0     21
+    2.0    413
+    3.0     90
+    1.0     25
+    4.0     22
     5.0      1
     Name: count, dtype: int64
     Frequencies of k for abnormal sessions in the exam pool:
@@ -2122,7 +2034,7 @@ e.save(output_dir=EXAM_POOL_DIR)
 ```
 
     [teach] selection complete.
-      class 0: selected=20 | F(S)=512.9138
+      class 0: selected=20 | F(S)=534.5221
       class 1: selected=20 | F(S)=314.8785
       wrote → /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/selection.parquet
       wrote → /home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/selection_config.json
@@ -2140,7 +2052,7 @@ display(e.teaching_set_df.head())
     1    20
     
     [coverage] facility-location by class:
-      class 0: 512.9138
+      class 0: 534.5221
       class 1: 314.8785
     
     [per-bin selected] counts by class:
@@ -2208,8 +2120,8 @@ display(e.teaching_set_df.head())
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_sts...</td>
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_piv...</td>
       <td>final_model.pth</td>
-      <td>204.435928</td>
-      <td>205.789245</td>
+      <td>213.043869</td>
+      <td>214.397186</td>
       <td>1</td>
       <td>1</td>
       <td>[1, 2]</td>
@@ -2232,8 +2144,8 @@ display(e.teaching_set_df.head())
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_sts...</td>
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_piv...</td>
       <td>final_model.pth</td>
-      <td>0.357866</td>
-      <td>1.000175</td>
+      <td>0.367786</td>
+      <td>1.010094</td>
       <td>2</td>
       <td>2</td>
       <td>[1, 2]</td>
@@ -2256,12 +2168,12 @@ display(e.teaching_set_df.head())
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_sts...</td>
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_piv...</td>
       <td>final_model.pth</td>
-      <td>8.429260</td>
-      <td>9.760797</td>
+      <td>8.717889</td>
+      <td>10.049426</td>
       <td>3</td>
       <td>3</td>
       <td>[1, 2]</td>
-      <td>[11969665, 11153931, 10174238, 3085027, 7334636]</td>
+      <td>[11969665, 11153931, 3085027, 10174238, 7723270]</td>
     </tr>
     <tr>
       <th>3</th>
@@ -2285,7 +2197,7 @@ display(e.teaching_set_df.head())
       <td>4</td>
       <td>4</td>
       <td>[1, 2]</td>
-      <td>[11969665, 11153931, 10174238, 3085027, 7334636]</td>
+      <td>[11969665, 11153931, 3085027, 10174238, 7723270]</td>
     </tr>
     <tr>
       <th>4</th>
@@ -2304,12 +2216,12 @@ display(e.teaching_set_df.head())
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_sts...</td>
       <td>/home/srokholt/Masters_Project_Linux_Env/Machine-Teaching-for-XAI--TimeSeries-Models/Data/exam_teaching_pool/soc_piv...</td>
       <td>final_model.pth</td>
-      <td>158.526688</td>
-      <td>159.840382</td>
+      <td>166.129669</td>
+      <td>167.443364</td>
       <td>5</td>
       <td>5</td>
       <td>[1, 2]</td>
-      <td>[9288579, 2212724, 9601958, 9434752, 10170008]</td>
+      <td>[9288579, 2212724, 7555225, 9601958, 9434752]</td>
     </tr>
   </tbody>
 </table>
@@ -2329,6 +2241,8 @@ exam_meta = e.construct_exam_sets(
 
 print("Exam sets written:")
 print(exam_meta["paths"])
+print("Group aliases:")
+print(exam_meta["aliases"])
 ```
 
     Exam sets written:
