@@ -96,6 +96,23 @@ TEACHING_INTRO_SIMPLIFIED_ONLY = (
     "otherwise not understandable, respond with {'acknowledged': false} instead."
 )
 
+TEACHING_INTRO_RULE_UPDATE = (
+    "We will now show you labelled examples that reveal how the AI behaved on "
+    "specific charging sessions. For each example you will see one charging-chart "
+    "image together with the AI's classification ('normal' or 'abnormal'). The chart "
+    "shows only simplified power and SOC. After each example, respond with a single "
+    "JSON object that includes exactly three keys: "
+    "{'description_sentence': '<one sentence>', 'rule_action': '<write|retain|rephrase>', "
+    "'rule_of_thumb': '<current rule>'}. The first example must use "
+    "'rule_action': 'write' to establish an initial rule."
+)
+
+POST_EXAM_RULE_CARRYOVER_TEMPLATE = (
+    "You finished the teaching phase with this rule-of-thumb: \"{rule}\". "
+    "Do not update, rewrite, or refine this rule during the exam. "
+    "Use this fixed rule-of-thumb to label every example in the batch."
+)
+
 # Should we include the 'decision rule' hint here?
 POST_EXAM_INTRO = (
     "Let us test what you have learned about this AI. You will now see new, "
@@ -131,6 +148,7 @@ def build_exam_user_content(
     group: Group,
     phase: Phase,
     exam_items: list[tuple[ExampleItem, Path]],
+    fixed_rule_of_thumb: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build multimodal user content for a pre- or post-teaching exam.
 
@@ -139,9 +157,11 @@ def build_exam_user_content(
     the exam images.
 
     Args:
-        group: Participant group (A, B, C or D).
+        group: Participant group (A, B, C, D, E or F).
         phase: Experimental phase (PRE or POST).
         exam_items: List of (ExampleItem, image_path) pairs.
+        fixed_rule_of_thumb: Optional fixed rule-of-thumb for group E
+            in the post-exam phase.
 
     Returns:
         Tuple containing:
@@ -154,10 +174,10 @@ def build_exam_user_content(
     elif phase is Phase.POST and group in (Group.A, Group.B):
         intro = INTRO_OVERLAY
         modality_shown = "overlay"
-    elif phase is Phase.POST and group is Group.D:
+    elif phase is Phase.POST and group in (Group.D, Group.E):
         intro = INTRO_SIMPLIFIED_ONLY
         modality_shown = "simplified_only"
-    elif phase is Phase.POST and group is Group.C:
+    elif phase is Phase.POST and group in (Group.C, Group.F):
         intro = INTRO_RAW_ONLY
         modality_shown = "raw_only"
     else: 
@@ -167,8 +187,19 @@ def build_exam_user_content(
     if phase is Phase.POST:
         intro = POST_EXAM_INTRO + " " + intro
 
-    content: list[dict[str, Any]] = [
-        {"type": "text", "text": intro},
+    content: list[dict[str, Any]] = [{"type": "text", "text": intro}]
+
+    if phase is Phase.POST and group is Group.E:
+        rule_text = (fixed_rule_of_thumb or "").strip()
+        if not rule_text:
+            msg = (
+                "Group E post-exam prompts require a non-empty fixed_rule_of_thumb."
+            )
+            raise ValueError(msg)
+        carryover_text = POST_EXAM_RULE_CARRYOVER_TEMPLATE.format(rule=rule_text)
+        content.append({"type": "text", "text": carryover_text})
+
+    content.append(
         {
             "type": "text",
             "text": (
@@ -190,7 +221,7 @@ def build_exam_user_content(
                 "'guess' must be either 'normal' or 'abnormal' in lower case. Do not use any other labels."
             ),
         },
-    ]
+    )
 
     for idx, (item, image_path) in enumerate(exam_items, start=1):
         data_url = encode_image_to_base64(image_path)
@@ -216,21 +247,25 @@ def build_teaching_user_content(
     image_path: Path,
     index: int,
     total: int,
+    current_rule_of_thumb: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build multimodal user content for a single teaching example.
 
     Args:
-        group: Participant group (A, B, C or D).
+        group: Participant group (A, B, C, D, E or F).
         item: ExampleItem describing the teaching example.
         image_path: Path to the teaching image.
         index: Position of this example in the teaching sequence (1-based).
         total: Total number of teaching examples in the sequence.
+        current_rule_of_thumb: Current rule-of-thumb state for group E.
 
     Returns:
         List of content parts for the user message.
     """
     if index == 1:
-        if group is Group.D:
+        if group is Group.E:
+            header = TEACHING_INTRO_RULE_UPDATE + " "
+        elif group is Group.D:
             header = TEACHING_INTRO_SIMPLIFIED_ONLY + " "
         else:
             header = TEACHING_INTRO + " "
@@ -251,14 +286,38 @@ def build_teaching_user_content(
 
     content.append({"type": "text", "text": label_text})
     content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
-    content.append(
-        {
-            "type": "text",
-            "text": (
-                'Once you have studied this example, respond with {"acknowledged": true} '
-                "and nothing else."
-            ),
-        }
-    )
+    if group is Group.E:
+        if index == 1:
+            instruction = (
+                "Respond with exactly one JSON object and no other text: "
+                "{"
+                "'description_sentence': '<one sentence description of this example>', "
+                "'rule_action': 'write', "
+                "'rule_of_thumb': '<your initial rule>'"
+                "}."
+            )
+        else:
+            prior_rule = (current_rule_of_thumb or "").strip()
+            instruction = (
+                "Your current rule-of-thumb before this example is: "
+                f"\"{prior_rule}\". "
+                "Respond with exactly one JSON object and no other text: "
+                "{"
+                "'description_sentence': '<one sentence description of this example>', "
+                "'rule_action': '<write|retain|rephrase>', "
+                "'rule_of_thumb': '<your updated or retained rule>'"
+                "}."
+            )
+        content.append({"type": "text", "text": instruction})
+    else:
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    'Once you have studied this example, respond with {"acknowledged": true} '
+                    "and nothing else."
+                ),
+            }
+        )
 
     return content

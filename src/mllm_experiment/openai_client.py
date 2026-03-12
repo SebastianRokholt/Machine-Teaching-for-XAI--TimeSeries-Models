@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from collections import deque
@@ -585,8 +586,36 @@ class OpenAIChatClient:
             raw_text = json.dumps({"answers": answers})
             parsed = {"answers": answers}
         else:
-            raw_text = '{"acknowledged": true}'
-            parsed = {"acknowledged": True}
+            group_value = str((call_context or {}).get("group", "")).strip().upper()
+            if call_type == "teaching" and group_value == "E":
+                example_index = self._teaching_example_index(text_parts=text_parts)
+                if example_index is None:
+                    example_index = 1
+
+                if example_index == 1:
+                    rule_action = "write"
+                    rule_of_thumb = (
+                        "The AI labels a charging session as abnormal when simplified "
+                        "power or SOC shows clear abrupt deviations from smooth behaviour."
+                    )
+                else:
+                    rule_action = "rephrase"
+                    rule_of_thumb = (
+                        "The AI tends to classify as abnormal when simplified power or "
+                        "SOC departs sharply from a smooth charging profile."
+                    )
+                description_sentence = (
+                    "The simplified power and SOC curves show one clear charging behaviour pattern."
+                )
+                parsed = {
+                    "description_sentence": description_sentence,
+                    "rule_action": rule_action,
+                    "rule_of_thumb": rule_of_thumb,
+                }
+                raw_text = json.dumps(parsed)
+            else:
+                raw_text = '{"acknowledged": true}'
+                parsed = {"acknowledged": True}
 
         if exam_prompt:
             logger.debug("[openai_client] dummy exam response with %d answers", len(item_ids))
@@ -634,6 +663,21 @@ class OpenAIChatClient:
             if text:
                 item_ids.append(text)
         return item_ids
+
+    def _teaching_example_index(self, text_parts: list[str]) -> int | None:
+        """Extract teaching example index from prompt text when available."""
+        text = " ".join(text_parts)
+        match = re.search(
+            r"teaching example\s+(\d+)\s+of\s+\d+",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
 
     def _is_exam_prompt(self, text_parts: list[str]) -> bool:
         """Detect whether the current prompt is an exam prompt.

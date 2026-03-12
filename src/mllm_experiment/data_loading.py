@@ -24,10 +24,8 @@ class Group(str, Enum):
     B = "B"  # As A but no curriculum (unordered)
     C = "C"  # As B (unordered) but raw-only, no simplifications
     D = "D"  # As A (curriculum) but simplifications only
-    # TODO: Add group E
-    # E = "E"  # As D but with enforced rule-of-thumb updating in teaching session
-    # TODO: Add group F
-    # F = "F"  # No teaching at all, just pre and post exam (for baseline)
+    E = "E"  # As D but with enforced rule-of-thumb updating in teaching session
+    F = "F"  # No teaching at all, just pre and post exam (for baseline)
 
 
 class Phase(str, Enum):
@@ -104,7 +102,7 @@ def load_teaching_metadata(config: ExperimentConfig) -> dict[Group, list[Example
     """Load teaching metadata and validate the image files.
 
     This function reads teaching_items.csv, constructs ExampleItem
-    instances and groups them by teaching condition (A, B, C, D). It
+    instances and groups them by teaching condition (A-F). It
     validates that the referenced image file exists under the expected
     teaching subdirectory.
 
@@ -198,7 +196,7 @@ def load_exam_metadata(
     required_modalities = {"raw"}
     if Group.A in selected_groups or Group.B in selected_groups:
         required_modalities.add("overlay")
-    if Group.D in selected_groups:
+    if Group.D in selected_groups or Group.E in selected_groups:
         required_modalities.add("simplified")
 
     items_by_set: dict[str, list[ExampleItem]] = {}
@@ -247,14 +245,14 @@ def resolve_exam_image_path(
 
     In the pre-teaching exam (Phase.PRE), all groups see the raw-only
     modality under 'raw'. In the post-teaching exam (Phase.POST), groups
-    A and B see the overlay modality under 'overlay', group D sees the
-    simplified modality under 'simplified', and group C still sees the
+    A and B see the overlay modality under 'overlay'. D and E see the
+    simplified modality under 'simplified'. C and F still see the
     raw-only modality.
 
     Args:
         exam_root: Root directory for exam sets.
         item: ExampleItem instance describing the exam example.
-        group: Participant group (A, B, C or D).
+        group: Participant group (A, B, C, D, E or F).
         phase: Experimental phase (PRE or POST).
 
     Returns:
@@ -269,7 +267,7 @@ def resolve_exam_image_path(
     elif phase is Phase.POST:
         if group in (Group.A, Group.B):
             subdir = "overlay"
-        elif group is Group.D:
+        elif group in (Group.D, Group.E):
             subdir = "simplified"
         else:
             subdir = "raw"

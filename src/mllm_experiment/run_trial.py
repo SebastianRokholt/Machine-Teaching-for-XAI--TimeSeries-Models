@@ -28,7 +28,7 @@ def parse_conditions_selector(raw_selector: str) -> tuple[str, list[Group]]:
     Returns:
         Tuple of:
             - canonical requested conditions string (letters A-F),
-            - enabled groups list for this stage.
+            - enabled groups list for this run.
     """
     selector = raw_selector.strip().lower()
     if selector == "all":
@@ -51,15 +51,6 @@ def parse_conditions_selector(raw_selector: str) -> tuple[str, list[Group]]:
     requested_conditions = "".join(selected_letters).upper()
     if not requested_conditions:
         msg = "Group selector does not contain any valid group letters."
-        raise ValueError(msg)
-
-    deferred_groups = [letter.upper() for letter in selected_letters if letter in {"e", "f"}]
-    if deferred_groups:
-        msg = (
-            "Group(s) "
-            f"{', '.join(deferred_groups)} are not implemented yet in stage 1. "
-            "Use combinations of A, B, C and D."
-        )
         raise ValueError(msg)
 
     enabled_groups = [Group(letter.upper()) for letter in selected_letters]
@@ -85,7 +76,10 @@ def parse_args() -> argparse.Namespace:
         "--teaching_set_dir",
         type=Path,
         required=True,
-        help="Root directory containing teaching sets A, B, C and D.",
+        help=(
+            "Root directory containing teaching set images "
+            "(A, B, C, D folders where E reuses D and F has no teaching images)."
+        ),
     )
     parser.add_argument(
         "--exam_sets_dir",
@@ -105,8 +99,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Group selection string. Use 'all' or a non-empty combination "
-            "of letters a-f (e.g. abc, bcd, abcdef). "
-            "Stage 1 supports A, B, C and D only."
+            "of letters a-f (e.g. abc, bcd, abcdef)."
         ),
     )
     parser.add_argument(

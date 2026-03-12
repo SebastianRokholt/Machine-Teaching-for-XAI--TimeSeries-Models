@@ -19,7 +19,8 @@ class ExperimentConfig:
 
     Attributes:
         teaching_root: Root directory that contains the teaching set
-            subdirectories A, B, C and D.
+            subdirectories A, B, C and D. Group E reuses D and
+            group F has no teaching images.
         exam_root: Root directory that contains the exam sets (set1, set2).
         metadata_root: Directory that contains the CSV metadata files.
         output_root: Directory where logs and raw responses are written.

@@ -46,7 +46,7 @@ class ParticipantConfig:
 
     Attributes:
         participant_id: Unique identifier for this participant.
-        group: Assigned teaching group (A, B, C or D).
+        group: Assigned teaching group (A, B, C, D, E or F).
         exam_set_pre: Exam set used in the pre-teaching phase.
         exam_set_post: Exam set used in the post-teaching phase.
     """
@@ -55,6 +55,14 @@ class ParticipantConfig:
     group: Group
     exam_set_pre: str
     exam_set_post: str
+
+
+class GroupEProtocolError(RuntimeError):
+    """Signal that group E protocol constraints are violated."""
+
+    def __init__(self, error_type: str, message: str) -> None:
+        self.error_type = error_type
+        super().__init__(message)
 
 
 class TrialRunner:
@@ -99,14 +107,24 @@ class TrialRunner:
             config=config,
             enabled_groups=self.enabled_groups,
         )
-        missing_teaching = [
-            group.value
-            for group in self.enabled_groups
-            if not self.teaching_by_group.get(group)
-        ]
+        required_teaching_sources: list[tuple[Group, Group]] = []
+        for group in self.enabled_groups:
+            if group is Group.F:
+                continue
+            source_group = Group.D if group is Group.E else group
+            required_teaching_sources.append((group, source_group))
+
+        missing_teaching = []
+        for group, source_group in required_teaching_sources:
+            if self.teaching_by_group.get(source_group):
+                continue
+            if group is source_group:
+                missing_teaching.append(group.value)
+            else:
+                missing_teaching.append(f"{group.value} (source {source_group.value})")
         if missing_teaching:
             msg = (
-                "No teaching metadata rows found for selected group(s): "
+                "No teaching metadata rows found for selected teaching source(s): "
                 f"{', '.join(missing_teaching)}"
             )
             logger.error(msg)
@@ -121,7 +139,7 @@ class TrialRunner:
 
         Returns:
             True when the participant completes all phases. False when
-            API retries are exhausted and the participant fails safely.
+            retries are exhausted or protocol validation fails safely.
         """
         participant = self._sample_participant_config(rng, index)
         self._log_event(
@@ -150,7 +168,7 @@ class TrialRunner:
             # phase 2: teaching phase
             # re-initialises chat history with only the system message
             messages = [exam_system_message()]
-            teaching_rows, messages = self._run_teaching_phase(
+            teaching_rows, messages, final_rule_of_thumb = self._run_teaching_phase(
                 participant=participant,
                 rng=rng,
                 messages=messages,
@@ -163,6 +181,7 @@ class TrialRunner:
                 rng=rng,
                 phase=Phase.POST,
                 messages=messages,
+                fixed_rule_of_thumb=final_rule_of_thumb,
             )
             log_exam_results(post_rows, self.config.output_root)
 
@@ -226,6 +245,38 @@ class TrialRunner:
                 str(exc),
             )
             return False
+        except GroupEProtocolError as exc:
+            summary_row = {
+                "participant_id": participant.participant_id,
+                "group": participant.group.value,
+                "exam_set_pre": participant.exam_set_pre,
+                "exam_set_post": participant.exam_set_post,
+                "accuracy_pre": None,
+                "accuracy_post": None,
+                "delta_accuracy": None,
+                "status": "failed",
+                "error_type": exc.error_type,
+                "error_message": str(exc),
+            }
+            log_participant_summaries([summary_row], self.config.output_root)
+            self._log_event(
+                event="participant.failed",
+                level=logging.ERROR,
+                participant_id=participant.participant_id,
+                group=participant.group.value,
+                exam_set_pre=participant.exam_set_pre,
+                exam_set_post=participant.exam_set_post,
+                status="failed",
+                error_type=exc.error_type,
+                error_message=str(exc),
+            )
+            logger.error(
+                "[trial] participant failed participant_id=%s group=%s reason=%s",
+                participant.participant_id,
+                participant.group.value,
+                str(exc),
+            )
+            return False
 
     def _sample_participant_config(self, rng: random.Random, index: int) -> ParticipantConfig:
         """Sample group and exam sets for one participant."""
@@ -255,6 +306,7 @@ class TrialRunner:
         rng: random.Random,
         phase: Phase,
         messages: list[dict[str, Any]],
+        fixed_rule_of_thumb: str | None = None,
     ) -> tuple[list[dict[str, Any]], float, list[dict[str, Any]]]:
         """Run either the pre- or post-teaching exam phase.
 
@@ -263,6 +315,8 @@ class TrialRunner:
             rng: Random number generator instance.
             phase: Phase.PRE or Phase.POST.
             messages: Current chat message history.
+            fixed_rule_of_thumb: Optional fixed rule-of-thumb string
+                used for group E post-exam prompts.
 
         Returns:
             Tuple containing:
@@ -294,6 +348,7 @@ class TrialRunner:
             group=participant.group,
             phase=phase,
             exam_items=item_paths,
+            fixed_rule_of_thumb=fixed_rule_of_thumb,
         )
         messages.append({"role": "user", "content": user_content})
         self._log_event(
@@ -425,26 +480,17 @@ class TrialRunner:
         """
         answers: dict[str, str] = {}
 
-        obj: Any | None = model_response.parsed_json
+        obj = self._extract_json_payload(model_response=model_response)
         if obj is None:
-            # try to be robust to small wrappers like ```json ...```
-            text = model_response.raw_text.strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lower().startswith("json"):
-                    text = text[4:].strip()
-            try:
-                obj = json.loads(text)
-            except Exception:
-                self._log_exam_parse_failure(
-                    event_context=event_context,
-                    expected_count=expected_count,
-                    parsed_count=0,
-                    error_type="json_decode_error",
-                    error_message="Model response is not valid JSON.",
-                    raw_text=model_response.raw_text,
-                )
-                return answers
+            self._log_exam_parse_failure(
+                event_context=event_context,
+                expected_count=expected_count,
+                parsed_count=0,
+                error_type="json_decode_error",
+                error_message="Model response is not valid JSON.",
+                raw_text=model_response.raw_text,
+            )
+            return answers
 
         if not isinstance(obj, dict):
             self._log_exam_parse_failure(
@@ -504,7 +550,7 @@ class TrialRunner:
         participant: ParticipantConfig,
         rng: random.Random,
         messages: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
         """Run the teaching phase with sequential labelled examples.
 
         Args:
@@ -516,9 +562,34 @@ class TrialRunner:
             Tuple containing:
                 - list of teaching result rows,
                 - updated message history including all teaching replies.
+                - final rule-of-thumb for group E, otherwise None.
         """
-        teaching_items = list(self.teaching_by_group[participant.group])
-        # limit to configured number of teaching items
+        if participant.group is Group.F:
+            modality_shown = "none"
+            self._log_event(
+                event="phase.teaching.start",
+                level=logging.INFO,
+                participant_id=participant.participant_id,
+                phase=Phase.TEACHING.value,
+                group=participant.group.value,
+                items_count=0,
+                modality=modality_shown,
+                status="started",
+            )
+            self._log_event(
+                event="phase.teaching.complete",
+                level=logging.INFO,
+                participant_id=participant.participant_id,
+                phase=Phase.TEACHING.value,
+                group=participant.group.value,
+                items_count=0,
+                modality=modality_shown,
+                status="completed",
+            )
+            return [], messages, None
+
+        teaching_source_group = Group.D if participant.group is Group.E else participant.group
+        teaching_items = list(self.teaching_by_group[teaching_source_group])
         teaching_items = teaching_items[: self.config.teaching_items]
 
         # group A keeps curriculum order as specified by metadata
@@ -528,7 +599,7 @@ class TrialRunner:
 
         if participant.group in (Group.A, Group.B):
             modality_shown = "overlay"
-        elif participant.group is Group.D:
+        elif participant.group in (Group.D, Group.E):
             modality_shown = "simplified_only"
         else:
             modality_shown = "raw_only"
@@ -551,6 +622,7 @@ class TrialRunner:
         )
 
         rows: list[dict[str, Any]] = []
+        current_rule_of_thumb: str | None = None
 
         iterator = enumerate(teaching_items, start=1)
         progress = tqdm(
@@ -568,6 +640,7 @@ class TrialRunner:
                 image_path=image_path,
                 index=idx,
                 total=len(teaching_items),
+                current_rule_of_thumb=current_rule_of_thumb,
             )
             messages.append({"role": "user", "content": user_content})
 
@@ -587,6 +660,17 @@ class TrialRunner:
 
             # append assistant reply to history
             messages.append({"role": "assistant", "content": model_response.raw_text})
+
+            if participant.group is Group.E:
+                current_rule_of_thumb = self._parse_group_e_rule_update(
+                    participant=participant,
+                    item=item,
+                    index=idx,
+                    total=len(teaching_items),
+                    current_rule_of_thumb=current_rule_of_thumb,
+                    model_response=model_response,
+                    modality_shown=modality_shown,
+                )
 
             row = {
                 "participant_id": participant.participant_id,
@@ -615,7 +699,168 @@ class TrialRunner:
             status="completed",
         )
 
-        return rows, messages
+        if participant.group is Group.E and not current_rule_of_thumb:
+            msg = "Group E teaching session completes without a valid final rule-of-thumb."
+            raise GroupEProtocolError(
+                error_type="missing_final_rule",
+                message=msg,
+            )
+
+        return rows, messages, current_rule_of_thumb
+
+    def _parse_group_e_rule_update(
+        self,
+        participant: ParticipantConfig,
+        item: ExampleItem,
+        index: int,
+        total: int,
+        current_rule_of_thumb: str | None,
+        model_response: ModelResponse,
+        modality_shown: str,
+    ) -> str:
+        """Parse and validate one group E rule-update response."""
+        event_context = {
+            "participant_id": participant.participant_id,
+            "phase": Phase.TEACHING.value,
+            "group": participant.group.value,
+            "item_id": item.item_id,
+            "call_type": "teaching",
+            "modality": modality_shown,
+            "example_index": index,
+            "examples_total": total,
+        }
+
+        obj = self._extract_json_payload(model_response=model_response)
+        if not isinstance(obj, dict):
+            msg = (
+                "Group E teaching response is not a valid JSON object."
+            )
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_json",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_json", msg)
+
+        description_sentence = str(obj.get("description_sentence", "")).strip()
+        rule_action = str(obj.get("rule_action", "")).strip().lower()
+        rule_of_thumb = str(obj.get("rule_of_thumb", "")).strip()
+
+        if not description_sentence:
+            msg = "Group E response is missing a non-empty description_sentence."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="missing_description_sentence",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("missing_description_sentence", msg)
+        if not self._is_single_sentence(text=description_sentence):
+            msg = "Group E description_sentence must contain exactly one sentence."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_description_sentence",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_description_sentence", msg)
+
+        allowed_actions = {"write", "retain", "rephrase"}
+        if rule_action not in allowed_actions:
+            msg = (
+                "Group E rule_action must be one of write, retain or rephrase."
+            )
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_rule_action",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_rule_action", msg)
+
+        if not rule_of_thumb:
+            msg = "Group E response is missing a non-empty rule_of_thumb."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="missing_rule_of_thumb",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("missing_rule_of_thumb", msg)
+
+        if index == 1 and rule_action != "write":
+            msg = (
+                "Group E first teaching example must use rule_action 'write'."
+            )
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_first_rule_action",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_first_rule_action", msg)
+
+        if rule_action == "retain":
+            prior_rule = (current_rule_of_thumb or "").strip()
+            if not prior_rule:
+                msg = (
+                    "Group E uses 'retain' before a prior rule-of-thumb exists."
+                )
+                self._log_teaching_parse_failure(
+                    event_context=event_context,
+                    error_type="retain_without_prior_rule",
+                    error_message=msg,
+                    raw_text=model_response.raw_text,
+                )
+                raise GroupEProtocolError("retain_without_prior_rule", msg)
+            if rule_of_thumb != prior_rule:
+                msg = (
+                    "Group E 'retain' action must keep rule_of_thumb unchanged."
+                )
+                self._log_teaching_parse_failure(
+                    event_context=event_context,
+                    error_type="retain_rule_changed",
+                    error_message=msg,
+                    raw_text=model_response.raw_text,
+                )
+                raise GroupEProtocolError("retain_rule_changed", msg)
+
+        self._log_event(
+            event="phase.teaching.rule_update",
+            level=logging.INFO,
+            **event_context,
+            status="completed",
+            rule_action=rule_action,
+            rule_of_thumb=rule_of_thumb,
+            description_sentence=description_sentence,
+        )
+        return rule_of_thumb
+
+    def _extract_json_payload(self, model_response: ModelResponse) -> Any | None:
+        """Extract JSON payload from a model response."""
+        if model_response.parsed_json is not None:
+            return model_response.parsed_json
+
+        text = model_response.raw_text.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
+
+    def _is_single_sentence(self, text: str) -> bool:
+        """Check whether text appears to contain a single sentence."""
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if "\n" in stripped or "\r" in stripped:
+            return False
+        sentence_endings = sum(stripped.count(ch) for ch in (".", "!", "?"))
+        return sentence_endings <= 1
 
     def _log_event(self, event: str, level: int = logging.INFO, **fields: Any) -> None:
         """Write one structured event if the event logger is available.
@@ -670,6 +915,32 @@ class TrialRunner:
             "[trial] exam parse failure participant_id=%s phase=%s reason=%s",
             event_context.get("participant_id"),
             event_context.get("phase"),
+            error_message,
+        )
+
+    def _log_teaching_parse_failure(
+        self,
+        event_context: dict[str, Any],
+        error_type: str,
+        error_message: str,
+        raw_text: str,
+    ) -> None:
+        """Record one structured teaching parse failure event."""
+        preview = self._response_preview(raw_text=raw_text)
+        self._log_event(
+            event="teaching.parse_failed",
+            level=logging.ERROR,
+            **event_context,
+            status="failed",
+            error_type=error_type,
+            error_message=error_message,
+            response_preview=preview,
+            response_length=len(raw_text),
+        )
+        logger.error(
+            "[trial] teaching parse failure participant_id=%s item_id=%s reason=%s",
+            event_context.get("participant_id"),
+            event_context.get("item_id"),
             error_message,
         )
 

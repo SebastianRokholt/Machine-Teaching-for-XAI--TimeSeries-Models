@@ -84,11 +84,13 @@ Script-based MLLM trial pipeline:
 - `build_exam_sets.py`: anonymise exam images + build exam metadata CSV.
 - `config.py`, `utils.py`: experiment settings and structured logging helpers.
 
-Current code supports experiments on different MLLM participant groups with one of conditions `A`, `B`, `C`, `D`: 
- - A: Participant sees both original (raw) and simplified examples with a easy-->hard curriculum.
- - B: Participant sees same as A but with no curriculum (random order)
- - C: Participant sees only original examples with no curriculum
- - D: Same as A but simplification-only
+Current code supports experiments on different MLLM participant groups with one of conditions `A`, `B`, `C`, `D`, `E`, `F`:
+ - A: Participant sees both original (raw) and simplified examples with an easy-to-hard curriculum.
+ - B: Participant sees the same modality as A but with no curriculum (random order).
+ - C: Participant sees only original examples with no curriculum.
+ - D: Participant sees simplification-only teaching and post-exam examples, with curriculum.
+ - E: Participant sees simplification-only teaching and post-exam examples with sequential rule-of-thumb updates during teaching, then fixed-rule application in post-exam.
+ - F: Baseline condition with no teaching phase, only pre and post exam in raw modality.
 
 
 ## Setup
@@ -174,7 +176,7 @@ PYTHONPATH=src ./.venv/bin/python -m mllm_experiment.run_trial \
   --random_seed 42 \
   --dry_run
 ```
-For reproducible baseline comparisons, start with `--conditions abc`. Include `d` only when you explicitly want the simplified-only condition.
+For reproducible baseline comparisons, start with `--conditions abc`. Include `d` or `e` for simplified-only conditions, and include `f` for the no-teaching baseline.
 
 ### 4) Run MLLM experiment (real API)
 ```bash
