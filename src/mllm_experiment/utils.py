@@ -4,11 +4,16 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Mapping
+
+
+_csv_locks_guard = threading.Lock()
+_csv_locks: dict[Path, threading.Lock] = {}
 
 
 def setup_logging(
@@ -242,16 +247,62 @@ def write_dicts_to_csv(rows: list[dict[str, Any]], path: Path) -> None:
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    file_exists = path.is_file()
     fieldnames = list(rows[0].keys())
+    lock = _get_csv_lock(path)
 
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    with lock:
+        file_exists = path.is_file()
+        if file_exists:
+            existing_header = _read_csv_header(path)
+            if existing_header:
+                if existing_header != fieldnames:
+                    msg = (
+                        f"CSV header mismatch for {path}. Existing header is "
+                        f"{existing_header} but new rows use {fieldnames}. "
+                        "Use a fresh output directory or align the schema."
+                    )
+                    raise ValueError(msg)
+            else:
+                file_exists = False
+
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+
+def _get_csv_lock(path: Path) -> threading.Lock:
+    """Return a shared lock for one CSV path.
+
+    Args:
+        path: Path to the CSV file.
+
+    Returns:
+        Lock instance used to serialise writes.
+    """
+    resolved_path = path.resolve()
+    with _csv_locks_guard:
+        lock = _csv_locks.get(resolved_path)
+        if lock is None:
+            lock = threading.Lock()
+            _csv_locks[resolved_path] = lock
+        return lock
+
+
+def _read_csv_header(path: Path) -> list[str]:
+    """Read the header row from a CSV file if available.
+
+    Args:
+        path: Path to the CSV file.
+
+    Returns:
+        Header field names. Returns an empty list for empty files.
+    """
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        return next(reader, [])
 
 
 def log_exam_results(rows: list[dict[str, Any]], output_root: Path) -> None:

@@ -27,11 +27,20 @@ class ExperimentConfig:
         pre_exam_items: Number of pre-teaching exam items per trial.
         post_exam_items: Number of post-teaching exam items per trial.
         teaching_items: Number of teaching items per trial.
-        random_seed: Base random seed used for reproducibility. Default in None, 
-        so that if the program is run multiple times with the same parameters, 
-        results from one set of trials can be appended to the previous results. 
-        Set to a fixed integer if running one large batch of trials at once, 
-        which will also make the experiment reproducible.
+        random_seed: Base random seed used for reproducibility. Default is
+            None so that repeated runs can append additional participants.
+            Set a fixed integer when running one large batch to keep
+            the assignment reproducible.
+        parallel_participants: Number of participants to run in parallel.
+        max_requests_per_minute: Maximum API requests per minute.
+        max_tokens_per_minute: Maximum API tokens per minute.
+        max_inflight_api_calls: Maximum number of concurrent API calls.
+            If None, this resolves to parallel_participants.
+        api_timeout_seconds: Timeout per API request in seconds.
+        api_retry_attempts: Number of retries after the first failed attempt.
+        api_retry_base_delay_seconds: Base delay for exponential backoff.
+        api_retry_max_delay_seconds: Maximum delay for exponential backoff.
+        api_retry_jitter_fraction: Fractional jitter added to backoff.
     """
     teaching_root: Path
     exam_root: Path
@@ -41,12 +50,56 @@ class ExperimentConfig:
     pre_exam_items: int = 20
     post_exam_items: int = 20
     teaching_items: int = 50
-    random_seed: int = None
-    logfile_path: Path = None
+    random_seed: int | None = None
+    parallel_participants: int = 2
+    max_requests_per_minute: int = 500
+    max_tokens_per_minute: int = 500_000
+    max_inflight_api_calls: int | None = None
+    api_timeout_seconds: float = 600.0
+    api_retry_attempts: int = 12
+    api_retry_base_delay_seconds: float = 2.0
+    api_retry_max_delay_seconds: float = 120.0
+    api_retry_jitter_fraction: float = 0.2
+    logfile_path: Path | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
+        """Validate config values and resolve derived defaults."""
         if self.logfile_path is None:
             self.logfile_path = self.output_root / "experiment.log"
-        # Ensure the output directory
+
+        if self.parallel_participants <= 0:
+            msg = "parallel_participants must be greater than 0."
+            raise ValueError(msg)
+        if self.max_requests_per_minute <= 0:
+            msg = "max_requests_per_minute must be greater than 0."
+            raise ValueError(msg)
+        if self.max_tokens_per_minute <= 0:
+            msg = "max_tokens_per_minute must be greater than 0."
+            raise ValueError(msg)
+        if self.max_inflight_api_calls is None:
+            self.max_inflight_api_calls = self.parallel_participants
+        elif self.max_inflight_api_calls <= 0:
+            msg = "max_inflight_api_calls must be greater than 0."
+            raise ValueError(msg)
+        if self.api_timeout_seconds <= 0:
+            msg = "api_timeout_seconds must be greater than 0."
+            raise ValueError(msg)
+        if self.api_retry_attempts < 0:
+            msg = "api_retry_attempts must be 0 or greater."
+            raise ValueError(msg)
+        if self.api_retry_base_delay_seconds <= 0:
+            msg = "api_retry_base_delay_seconds must be greater than 0."
+            raise ValueError(msg)
+        if self.api_retry_max_delay_seconds <= 0:
+            msg = "api_retry_max_delay_seconds must be greater than 0."
+            raise ValueError(msg)
+        if self.api_retry_max_delay_seconds < self.api_retry_base_delay_seconds:
+            msg = "api_retry_max_delay_seconds must be >= api_retry_base_delay_seconds."
+            raise ValueError(msg)
+        if self.api_retry_jitter_fraction < 0:
+            msg = "api_retry_jitter_fraction must be 0 or greater."
+            raise ValueError(msg)
+
+        # Ensures the output directory exists.
         self.output_root.mkdir(parents=True, exist_ok=True)

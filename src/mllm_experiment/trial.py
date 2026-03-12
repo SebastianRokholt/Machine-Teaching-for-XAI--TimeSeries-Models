@@ -25,7 +25,11 @@ from .utils import (
     log_participant_summaries,
     log_teaching_results,
 )
-from .openai_client import OpenAIChatClient, ModelResponse
+from .openai_client import (
+    ModelCallRetriesExhaustedError,
+    OpenAIChatClient,
+    ModelResponse,
+)
 from .prompts import (
     build_exam_user_content,
     build_teaching_user_content,
@@ -75,12 +79,14 @@ class TrialRunner:
         enabled_groups: list[Group],
         verbose: bool,
         event_logger: ExperimentEventLogger | None = None,
+        show_progress_bars: bool = True,
     ) -> None:
         self.config = config
         self.client = client
         self.enabled_groups = tuple(enabled_groups)
         self.verbose = verbose
         self.event_logger = event_logger
+        self.show_progress_bars = show_progress_bars
 
         if not self.enabled_groups:
             msg = "At least one enabled group is required."
@@ -106,12 +112,16 @@ class TrialRunner:
             logger.error(msg)
             raise ValueError(msg)
 
-    def run_participant(self, rng: random.Random, index: int) -> None:
+    def run_participant(self, rng: random.Random, index: int) -> bool:
         """Run a full trial for a single participant.
 
         Args:
             rng: Random number generator instance.
             index: Index of the participant within this run.
+
+        Returns:
+            True when the participant completes all phases. False when
+            API retries are exhausted and the participant fails safely.
         """
         participant = self._sample_participant_config(rng, index)
         self._log_event(
@@ -124,61 +134,98 @@ class TrialRunner:
             status="started",
         )
 
-        # initialise chat history with a system message
-        messages: list[dict[str, Any]] = [exam_system_message()]
+        try:
+            # initialises chat history with a system message
+            messages: list[dict[str, Any]] = [exam_system_message()]
 
-        # phase 1: pre-teaching exam
-        pre_rows, pre_accuracy, messages = self._run_exam_phase(
-            participant=participant,
-            rng=rng,
-            phase=Phase.PRE,
-            messages=messages,
-        )
-        log_exam_results(pre_rows, self.config.output_root)
+            # phase 1: pre-teaching exam
+            pre_rows, pre_accuracy, messages = self._run_exam_phase(
+                participant=participant,
+                rng=rng,
+                phase=Phase.PRE,
+                messages=messages,
+            )
+            log_exam_results(pre_rows, self.config.output_root)
 
-        # phase 2: teaching phase
-        # re-initialises the chat history with only the system message
-        messages: list[dict[str, Any]] = [exam_system_message()]
-        teaching_rows, messages = self._run_teaching_phase(
-            participant=participant,
-            rng=rng,
-            messages=messages,
-        )
-        log_teaching_results(teaching_rows, self.config.output_root)
+            # phase 2: teaching phase
+            # re-initialises chat history with only the system message
+            messages = [exam_system_message()]
+            teaching_rows, messages = self._run_teaching_phase(
+                participant=participant,
+                rng=rng,
+                messages=messages,
+            )
+            log_teaching_results(teaching_rows, self.config.output_root)
 
-        # phase 3: post-teaching exam
-        post_rows, post_accuracy, messages = self._run_exam_phase(
-            participant=participant,
-            rng=rng,
-            phase=Phase.POST,
-            messages=messages,
-        )
-        log_exam_results(post_rows, self.config.output_root)
+            # phase 3: post-teaching exam
+            post_rows, post_accuracy, messages = self._run_exam_phase(
+                participant=participant,
+                rng=rng,
+                phase=Phase.POST,
+                messages=messages,
+            )
+            log_exam_results(post_rows, self.config.output_root)
 
-        # participant summary
-        summary_row = {
-            "participant_id": participant.participant_id,
-            "group": participant.group.value,
-            "exam_set_pre": participant.exam_set_pre,
-            "exam_set_post": participant.exam_set_post,
-            "accuracy_pre": pre_accuracy,
-            "accuracy_post": post_accuracy,
-            "delta_accuracy": post_accuracy - pre_accuracy,
-        }
-        log_participant_summaries([summary_row], self.config.output_root)
+            summary_row = {
+                "participant_id": participant.participant_id,
+                "group": participant.group.value,
+                "exam_set_pre": participant.exam_set_pre,
+                "exam_set_post": participant.exam_set_post,
+                "accuracy_pre": pre_accuracy,
+                "accuracy_post": post_accuracy,
+                "delta_accuracy": post_accuracy - pre_accuracy,
+                "status": "completed",
+                "error_type": "",
+                "error_message": "",
+            }
+            log_participant_summaries([summary_row], self.config.output_root)
 
-        self._log_event(
-            event="participant.complete",
-            level=logging.INFO,
-            participant_id=participant.participant_id,
-            group=participant.group.value,
-            exam_set_pre=participant.exam_set_pre,
-            exam_set_post=participant.exam_set_post,
-            accuracy_pre=round(pre_accuracy, 6),
-            accuracy_post=round(post_accuracy, 6),
-            delta_accuracy=round(post_accuracy - pre_accuracy, 6),
-            status="completed",
-        )
+            self._log_event(
+                event="participant.complete",
+                level=logging.INFO,
+                participant_id=participant.participant_id,
+                group=participant.group.value,
+                exam_set_pre=participant.exam_set_pre,
+                exam_set_post=participant.exam_set_post,
+                accuracy_pre=round(pre_accuracy, 6),
+                accuracy_post=round(post_accuracy, 6),
+                delta_accuracy=round(post_accuracy - pre_accuracy, 6),
+                status="completed",
+            )
+            return True
+        except ModelCallRetriesExhaustedError as exc:
+            summary_row = {
+                "participant_id": participant.participant_id,
+                "group": participant.group.value,
+                "exam_set_pre": participant.exam_set_pre,
+                "exam_set_post": participant.exam_set_post,
+                "accuracy_pre": None,
+                "accuracy_post": None,
+                "delta_accuracy": None,
+                "status": "failed",
+                "error_type": exc.last_error_type,
+                "error_message": str(exc),
+            }
+            log_participant_summaries([summary_row], self.config.output_root)
+            self._log_event(
+                event="participant.failed",
+                level=logging.ERROR,
+                participant_id=participant.participant_id,
+                group=participant.group.value,
+                exam_set_pre=participant.exam_set_pre,
+                exam_set_post=participant.exam_set_post,
+                status="failed",
+                error_type=exc.last_error_type,
+                error_message=str(exc),
+                attempts=exc.attempts,
+            )
+            logger.error(
+                "[trial] participant failed participant_id=%s group=%s reason=%s",
+                participant.participant_id,
+                participant.group.value,
+                str(exc),
+            )
+            return False
 
     def _sample_participant_config(self, rng: random.Random, index: int) -> ParticipantConfig:
         """Sample group and exam sets for one participant."""
@@ -505,7 +552,15 @@ class TrialRunner:
 
         rows: list[dict[str, Any]] = []
 
-        for idx, item in tqdm(enumerate(teaching_items, start=1), desc="Teaching examples", unit="example"):
+        iterator = enumerate(teaching_items, start=1)
+        progress = tqdm(
+            iterator,
+            desc="Teaching examples",
+            unit="example",
+            total=len(teaching_items),
+            disable=not self.show_progress_bars,
+        )
+        for idx, item in progress:
             image_path = resolve_teaching_image_path(self.config.teaching_root, item)
             user_content = build_teaching_user_content(
                 group=participant.group,

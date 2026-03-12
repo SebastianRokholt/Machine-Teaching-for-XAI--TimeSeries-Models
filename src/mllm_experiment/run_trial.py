@@ -3,6 +3,7 @@
 # run_trial.py
 from __future__ import annotations
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import random
 import uuid
@@ -121,6 +122,63 @@ def parse_args() -> argparse.Namespace:
         help="OpenAI model name to use.",
     )
     parser.add_argument(
+        "--parallel_participants",
+        type=int,
+        default=2,
+        help="Number of participants to run in parallel.",
+    )
+    parser.add_argument(
+        "--max_requests_per_minute",
+        type=int,
+        default=500,
+        help="Maximum number of OpenAI API requests per minute.",
+    )
+    parser.add_argument(
+        "--max_tokens_per_minute",
+        type=int,
+        default=500_000,
+        help="Maximum number of OpenAI API tokens per minute.",
+    )
+    parser.add_argument(
+        "--max_inflight_api_calls",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of concurrent OpenAI API calls. "
+            "Defaults to --parallel_participants."
+        ),
+    )
+    parser.add_argument(
+        "--api_timeout_seconds",
+        type=float,
+        default=600.0,
+        help="Timeout per OpenAI API request in seconds.",
+    )
+    parser.add_argument(
+        "--api_retry_attempts",
+        type=int,
+        default=12,
+        help="Number of retries after the initial failed API request.",
+    )
+    parser.add_argument(
+        "--api_retry_base_delay_seconds",
+        type=float,
+        default=2.0,
+        help="Base retry delay in seconds for exponential backoff.",
+    )
+    parser.add_argument(
+        "--api_retry_max_delay_seconds",
+        type=float,
+        default=120.0,
+        help="Maximum retry delay in seconds for exponential backoff.",
+    )
+    parser.add_argument(
+        "--api_retry_jitter_fraction",
+        type=float,
+        default=0.2,
+        help="Fractional jitter applied to retry delay.",
+    )
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=None,
@@ -184,6 +242,15 @@ def main() -> None:
         output_root=args.output_dir,
         model_name=args.model_name,
         random_seed=args.random_seed,
+        parallel_participants=args.parallel_participants,
+        max_requests_per_minute=args.max_requests_per_minute,
+        max_tokens_per_minute=args.max_tokens_per_minute,
+        max_inflight_api_calls=args.max_inflight_api_calls,
+        api_timeout_seconds=args.api_timeout_seconds,
+        api_retry_attempts=args.api_retry_attempts,
+        api_retry_base_delay_seconds=args.api_retry_base_delay_seconds,
+        api_retry_max_delay_seconds=args.api_retry_max_delay_seconds,
+        api_retry_jitter_fraction=args.api_retry_jitter_fraction,
     )
     events_log_file = args.events_log_file or (config.output_root / "experiment_events.jsonl")
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -219,6 +286,14 @@ def main() -> None:
         model=config.model_name,
         use_dummy=args.dry_run,
         event_logger=event_logger,
+        max_requests_per_minute=config.max_requests_per_minute,
+        max_tokens_per_minute=config.max_tokens_per_minute,
+        max_inflight_api_calls=config.max_inflight_api_calls,
+        timeout_seconds=config.api_timeout_seconds,
+        retry_attempts=config.api_retry_attempts,
+        retry_base_delay_seconds=config.api_retry_base_delay_seconds,
+        retry_max_delay_seconds=config.api_retry_max_delay_seconds,
+        retry_jitter_fraction=config.api_retry_jitter_fraction,
     )
     runner = TrialRunner(
         config=config,
@@ -226,6 +301,7 @@ def main() -> None:
         enabled_groups=enabled_groups,
         verbose=args.verbose,
         event_logger=event_logger,
+        show_progress_bars=config.parallel_participants <= 1,
     )
 
     if args.verbose:
@@ -246,22 +322,62 @@ def main() -> None:
         output_root=config.output_root,
         log_file=config.logfile_path,
         events_log_file=events_log_file,
+        parallel_participants=config.parallel_participants,
+        max_requests_per_minute=config.max_requests_per_minute,
+        max_tokens_per_minute=config.max_tokens_per_minute,
+        max_inflight_api_calls=config.max_inflight_api_calls,
+        api_timeout_seconds=config.api_timeout_seconds,
+        api_retry_attempts=config.api_retry_attempts,
+        api_retry_base_delay_seconds=config.api_retry_base_delay_seconds,
+        api_retry_max_delay_seconds=config.api_retry_max_delay_seconds,
+        api_retry_jitter_fraction=config.api_retry_jitter_fraction,
     )
 
     # This sets up the base RNG. If config.random_seed is None, the
     # sequence changes between runs, but each participant seed is logged.
     base_rng = random.Random(config.random_seed)
+    participant_jobs = [
+        (idx, base_rng.randint(0, 2**31 - 1))
+        for idx in range(args.participants)
+    ]
     participants_completed = 0
+    participants_failed = 0
     run_status = "completed"
 
+    def run_one_participant(index: int, seed: int) -> bool:
+        rng = random.Random(seed)
+        if args.verbose:
+            logger.debug("[run_trial] participant index=%d seed=%d", index, seed)
+        return runner.run_participant(rng=rng, index=index)
+
     try:
-        for idx in tqdm(range(args.participants), desc="Participants", unit="participant"):
-            seed = base_rng.randint(0, 2**31 - 1)
-            rng = random.Random(seed)
-            if args.verbose:
-                logger.debug("[run_trial] participant index=%d seed=%d", idx, seed)
-            runner.run_participant(rng=rng, index=idx)
-            participants_completed += 1
+        if config.parallel_participants <= 1:
+            for idx, seed in tqdm(
+                participant_jobs,
+                total=len(participant_jobs),
+                desc="Participants",
+                unit="participant",
+            ):
+                if run_one_participant(index=idx, seed=seed):
+                    participants_completed += 1
+                else:
+                    participants_failed += 1
+        else:
+            with ThreadPoolExecutor(max_workers=config.parallel_participants) as executor:
+                futures = [
+                    executor.submit(run_one_participant, index=idx, seed=seed)
+                    for idx, seed in participant_jobs
+                ]
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="Participants",
+                    unit="participant",
+                ):
+                    if future.result():
+                        participants_completed += 1
+                    else:
+                        participants_failed += 1
     except Exception:
         run_status = "failed"
         raise
@@ -274,6 +390,7 @@ def main() -> None:
             mode="dummy" if args.dry_run else "api",
             participants_total=args.participants,
             participants_completed=participants_completed,
+            participants_failed=participants_failed,
         )
 
 

@@ -2,6 +2,7 @@
 # loads images + metadata for exam sets and teaching sets
 from __future__ import annotations
 import csv
+import logging
 from collections.abc import Collection
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +13,8 @@ from .config import (
     TEACHING_METADATA_FILENAME,
     EXAM_METADATA_FILENAME,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Group(str, Enum):
@@ -59,6 +62,44 @@ class ExampleItem:
     order_index: int | None = None
 
 
+def _resolve_teaching_path_with_suffix_fallback(
+    teaching_root: Path,
+    group: Group,
+    filename: str,
+) -> tuple[Path | None, str | None]:
+    """Resolve a teaching image path with fallback on hash-suffix drift.
+
+    This function first checks the exact filename from metadata. When the
+    exact file is missing, it attempts a fallback using the stable example
+    prefix (for example `D_ex_001`) and accepts the file only when exactly
+    one matching candidate exists.
+
+    Args:
+        teaching_root: Root directory for teaching sets.
+        group: Teaching group for the item.
+        filename: Filename stored in metadata.
+
+    Returns:
+        Tuple of resolved path and resolved filename when successful.
+        Returns `(None, None)` when no unambiguous match exists.
+    """
+    expected_path = teaching_root / group.value / filename
+    if expected_path.is_file():
+        return expected_path, filename
+
+    stem = Path(filename).stem
+    if "_" not in stem:
+        return None, None
+
+    prefix = stem.rsplit("_", 1)[0]
+    candidates = sorted((teaching_root / group.value).glob(f"{prefix}_*.png"))
+    if len(candidates) != 1:
+        return None, None
+
+    resolved_path = candidates[0]
+    return resolved_path, resolved_path.name
+
+
 def load_teaching_metadata(config: ExperimentConfig) -> dict[Group, list[ExampleItem]]:
     """Load teaching metadata and validate the image files.
 
@@ -86,11 +127,28 @@ def load_teaching_metadata(config: ExperimentConfig) -> dict[Group, list[Example
             group_value = row["group"].strip()
             group = Group(group_value)
 
-            filename = row["filename"].strip()
-            image_path = config.teaching_root / group.value / filename
-            if not image_path.is_file():
-                msg = f"Teaching image not found for group {group.value}: {image_path}"
+            original_filename = row["filename"].strip()
+            image_path, resolved_filename = _resolve_teaching_path_with_suffix_fallback(
+                teaching_root=config.teaching_root,
+                group=group,
+                filename=original_filename,
+            )
+            if image_path is None or resolved_filename is None:
+                expected = config.teaching_root / group.value / original_filename
+                msg = f"Teaching image not found for group {group.value}: {expected}"
                 raise FileNotFoundError(msg)
+            filename = resolved_filename
+            if filename != original_filename:
+                logger.warning(
+                    (
+                        "Teaching filename suffix mismatch for group %s item_id=%s: "
+                        "metadata=%s resolved=%s"
+                    ),
+                    group.value,
+                    row["item_id"].strip(),
+                    original_filename,
+                    filename,
+                )
 
             item = ExampleItem(
                 item_id=row["item_id"].strip(),
@@ -243,8 +301,24 @@ def resolve_teaching_image_path(
         msg = f"Teaching item {item.item_id} has no group assigned."
         raise ValueError(msg)
 
-    path = teaching_root / item.group.value / item.filename
-    if not path.is_file():
-        msg = f"Expected teaching image not found: {path}"
+    path, resolved_filename = _resolve_teaching_path_with_suffix_fallback(
+        teaching_root=teaching_root,
+        group=item.group,
+        filename=item.filename,
+    )
+    if path is None:
+        expected = teaching_root / item.group.value / item.filename
+        msg = f"Expected teaching image not found: {expected}"
         raise FileNotFoundError(msg)
+    if resolved_filename is not None and resolved_filename != item.filename:
+        logger.warning(
+            (
+                "Teaching filename suffix mismatch during run for group %s item_id=%s: "
+                "metadata=%s resolved=%s"
+            ),
+            item.group.value,
+            item.item_id,
+            item.filename,
+            resolved_filename,
+        )
     return path
