@@ -143,10 +143,14 @@ Then run:
 5. `05__Curve_Simplification.ipynb`
 6. `06__MT4XAI.ipynb`
 
-This pipeline produces the model and teaching/exam artifacts consumed by the MLLM scripts.
+This pipeline produces the model and teaching/exam artefacts consumed by the MLLM scripts.
+At the end of `06__MT4XAI.ipynb`, run the final build cell to generate anonymised
+MLLM experiment assets and metadata.
 
 ### 2) Build anonymised MLLM teaching/exam metadata
-Run from repository root:
+Preferred path: run the final build cell in `06__MT4XAI.ipynb`.
+
+Standalone fallback: run from repository root:
 
 ```bash
 ./.venv/bin/python src/mllm_experiment/build_teaching_sets.py
@@ -197,4 +201,3 @@ PYTHONPATH=src ./.venv/bin/python -m mllm_experiment.run_trial \
   - `Models/final/final_model.pth`
 
 ## Results
-
