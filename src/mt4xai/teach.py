@@ -1352,6 +1352,7 @@ class TeachingSet:
 
                 # remaining budget via lazy-greedy with bounds
                 remaining_budget = max(0, budget - len(selected_local))
+                max_greedy_steps = min(remaining_budget, n_avail - len(selected_local))
                 bounds = []
                 for idx in range(E.shape[0]):
                     if idx in selected_local:
@@ -1365,7 +1366,7 @@ class TeachingSet:
                     heapq.heappush(bounds, (-ub, tie, idx))
 
                 step = 0
-                while step < min(remaining_budget, n_avail - len(selected_local)) and bounds:
+                while step < max_greedy_steps and bounds:
                     ub_neg, tie, idx = heapq.heappop(bounds)
 
                     sim_vec = E @ E[idx]
@@ -1457,7 +1458,7 @@ class TeachingSet:
     # ---------------- spillover helpers (moved from top-level) ---------------- #
 
     def spillover_by_counts(self, df: pd.DataFrame, per_bin_budget: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
-        """Redistributes shortfalls to nearest k-bins (within class) proportional to availability.
+        """Redistributes infeasible per-bin demand to nearby bins with spare capacity.
 
         Args:
             df: Stratified pool with columns `class_label` and `k_bin_label` (or `k_bin_idx`).
@@ -1487,28 +1488,44 @@ class TeachingSet:
                 continue
 
             counts = {b: int((sub["k_bin_label"].astype(str) == b).sum()) for b in order}
-            want = {b: int(out.get(str(c), {}).get(b, 0)) for b in order}
-            short = {b: max(0, want[b] - counts[b]) for b in order}
-            extra = {b: max(0, counts[b] - want[b]) for b in order}
+            want = {b: max(0, int(out.get(str(c), {}).get(b, 0))) for b in order}
+
+            # clamp each bin to availability and keep track of overflow that must spill
+            overflow = {b: max(0, want[b] - counts[b]) for b in order}
+            for b in order:
+                if want[b] > counts[b]:
+                    want[b] = counts[b]
+
+            # remaining headroom after clamping
+            spare = {b: max(0, counts[b] - want[b]) for b in order}
 
             for j, b in enumerate(order):
-                need = short[b]
-                if need <= 0:
+                rem = overflow[b]
+                if rem <= 0:
                     continue
-                left = list(range(j - 1, -1, -1))
-                right = list(range(j + 1, len(order)))
-                for idx in left + right:
-                    donor = order[idx]
-                    can = extra[donor]
-                    if can <= 0:
+
+                # nearest-bin search by increasing distance, alternating left and right
+                neighbor_indices: list[int] = []
+                for d in range(1, len(order)):
+                    li = j - d
+                    ri = j + d
+                    if li >= 0:
+                        neighbor_indices.append(li)
+                    if ri < len(order):
+                        neighbor_indices.append(ri)
+
+                for idx in neighbor_indices:
+                    recipient = order[idx]
+                    can_take = spare[recipient]
+                    if can_take <= 0:
                         continue
-                    take = min(need, can)
-                    want[donor] -= take
-                    extra[donor] -= take
-                    want[b] += take
-                    need -= take
-                    if need <= 0:
+                    take = min(rem, can_take)
+                    want[recipient] += take
+                    spare[recipient] -= take
+                    rem -= take
+                    if rem <= 0:
                         break
+
             out[str(c)] = {b: int(max(0, want[b])) for b in order}
         return out
 
@@ -1807,33 +1824,35 @@ class TeachingSet:
         per_set_total: int,
         output_dir: Path,
         random_seed: int | None = None,
+        max_class_diff: int = 2,
+        balance_on: Literal["k", "k_bin_label"] = "k",
         save_images: bool = True,
         image_format: Literal["png", "jpg"] = "png",
     ) -> dict:
         """Builds two exam sets (set1, set2) from the *existing* teaching_set_df.
 
-        This method does not (re)construct the teaching set. It takes whatever is
-        already in `self.teaching_set_df`, splits it into up to two sets of size
-        `per_set_total` each (allowing shortfalls), randomises order for exams, and
-        optionally writes exam images for groups A, B, C and D.
+        This method does not (re)construct the teaching set. It takes the already
+        selected rows in `self.teaching_set_df`, applies a strict, class-balanced
+        split with complexity stratification, and optionally writes exam images for
+        groups A, B, C and D.
 
         Args:
-            per_set_total: Target number of examples per exam set (upper bound).
+            per_set_total: Exact number of examples per exam set.
             output_dir: Root directory where exam sets are written (set1/, set2/…).
-            random_seed: RNG seed for deterministic shuffling.
-            bin_allocation: Present for backward compatibility; not enforced here.
-            enforce_even_class_dist: Present for backward compatibility; not enforced here.
+            random_seed: RNG seed for deterministic splitting.
+            max_class_diff: Maximum allowed absolute class-count gap per set.
+            balance_on: Complexity column used for stratification. Use "k" for exact
+                complexity values or "k_bin_label" for binned complexity.
             save_images: If True, renders images for A/B (RAW + OVERLAY), C (RAW) and D (simplified-only).
             image_format: 'png' or 'jpg'.
 
         Returns:
-            A small metadata dictionary with written paths and counts.
+            A metadata dictionary with written paths, counts and class diagnostics.
         """
-        rng = np.random.default_rng(random_seed)
         out_root = Path(output_dir)
         out_root.mkdir(parents=True, exist_ok=True)
 
-        # 0) fetch the *already selected* teaching set; fail clearly if missing
+        # 0) fetch the already selected teaching set and fail clearly if missing
         if getattr(self, "teaching_set_df", None) is None or len(self.teaching_set_df) == 0:
             raise ValueError(
                 "teaching_set_df is empty or not set. Build the teaching set first "
@@ -1841,61 +1860,15 @@ class TeachingSet:
             )
 
         df = self.teaching_set_df.copy().reset_index(drop=True)
+        df_e1, df_e2, split_meta = _split_balanced_two_sets_core(
+            df,
+            per_set_total=int(per_set_total),
+            random_seed=random_seed,
+            max_class_diff=int(max_class_diff),
+            balance_on=balance_on,
+        )
 
-        # 1) shuffle once; we will then take alternating chunks into set1 / set2
-        #    this preserves the overall class/k distribution in expectation
-        idx = np.arange(len(df), dtype=int)
-        rng.shuffle(idx)
-        df = df.loc[idx].reset_index(drop=True)
-
-        # 2) split flexibly: we do *not* enforce exact per-class totals.
-        #    just fill set1 up to per_set_total, then set2 up to per_set_total.
-        n_target_total = int(per_set_total)
-        n_avail = len(df)
-
-        if n_avail == 0:
-            # nothing to do
-            return {
-                "paths": {},
-                "counts": {"set1": 0, "set2": 0},
-                "note": "no rows in teaching_set_df; nothing written",
-            }
-
-        take1 = min(n_target_total, n_avail)
-        take2 = min(n_target_total, max(0, n_avail - take1))
-
-        df_e1 = df.iloc[:take1].copy().reset_index(drop=True).assign(set_id=1)
-        df_e2 = df.iloc[take1 : take1 + take2].copy().reset_index(drop=True).assign(set_id=2)
-
-        # as a light touch towards balance without being strict: if one set is short and
-        # there is still slack in the other half, try to interleave by class quickly.
-        # this is optional and keeps behaviour robust when one class is scarce.
-        def _interleave_flex(sub: pd.DataFrame, cap: int) -> pd.DataFrame:
-            if len(sub) <= cap:
-                # already fits
-                return sub.sample(frac=1.0, random_state=int(rng.integers(0, 1 << 31))).reset_index(drop=True)
-
-            # two buckets by class; round-robin while we have space
-            a = sub[sub["class_label"].astype(int) == 0].index.to_list()
-            b = sub[sub["class_label"].astype(int) == 1].index.to_list()
-            rng.shuffle(a)
-            rng.shuffle(b)
-            pick = []
-            ia = ib = 0
-            # alternate while space remains; if one bucket empties, keep taking from the other
-            while len(pick) < cap and (ia < len(a) or ib < len(b)):
-                if ia < len(a):
-                    pick.append(a[ia]); ia += 1
-                    if len(pick) >= cap:
-                        break
-                if ib < len(b):
-                    pick.append(b[ib]); ib += 1
-            return sub.loc[pick].sample(frac=1.0, random_state=int(rng.integers(0, 1 << 31))).reset_index(drop=True)
-
-        df_e1 = _interleave_flex(df_e1, cap=n_target_total)
-        df_e2 = _interleave_flex(df_e2, cap=n_target_total)
-
-        # 3) write images (random order is handled by TeachIterator with exam_mode=True)
+        # 1) write images (random order is handled by TeachIterator with exam_mode=True)
         paths = {
             "set1": {
                 "A_raw": str(out_root / "set1" / "A" / "raw"),
@@ -1935,95 +1908,49 @@ class TeachingSet:
                     image_format=image_format,
                 )
 
-        # 4) return minimal meta so the notebook cell can print paths and counts
+        # 2) return metadata so the notebook can print paths and balance diagnostics
         return {
             "paths": paths,
             "counts": {"set1": int(len(df_e1)), "set2": int(len(df_e2))},
             "aliases": {"E": "D"},
+            "class_counts": split_meta["class_counts"],
+            "class_gap": split_meta["class_gap"],
+            "balance_on": split_meta["balance_on"],
+            "target_class_counts": split_meta["target_class_counts"],
             "note": (
-                "flexible split: no strict per-class enforcement; counts may be below targets "
-                "if the selected teaching set lacks supply. Group E reuses group D assets."
+                "strict split by class and complexity. The method raises ValueError if "
+                "class-gap constraints are infeasible. Group E reuses group D assets."
             ),
         }
-
-    @staticmethod
-    def _check_required_cols(df: pd.DataFrame, cols: list[str]) -> None:
-        missing = [c for c in cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"required columns missing: {missing}")
-
-    @staticmethod
-    def _round_robin_two_way(
-        items_by_bin: dict[str, list[int]],
-        target_per_set: int,
-        rng: np.random.Generator,
-    ) -> tuple[list[int], list[int]]:
-        """Splits indices into two buckets by round-robin over bins (balanced coverage)."""
-        e1, e2 = [], []
-        bin_keys = list(items_by_bin.keys())
-        cursor = {b: 0 for b in bin_keys}
-        total_needed = 2 * target_per_set
-        while len(e1) + len(e2) < total_needed:
-            for b in bin_keys:
-                arr = items_by_bin[b]
-                if cursor[b] == 0 and len(arr) > 1:
-                    rng.shuffle(arr)
-                if cursor[b] < len(arr):
-                    choose_e1 = (len(e1) <= len(e2))
-                    if choose_e1 and len(e1) < target_per_set:
-                        e1.append(arr[cursor[b]])
-                    elif len(e2) < target_per_set:
-                        e2.append(arr[cursor[b]])
-                    else:
-                        return e1, e2
-                    cursor[b] += 1
-        return e1, e2
 
     def split_balanced_two_sets(
         self,
         selected_df: pd.DataFrame,
         *,
         per_set_total: int,
-        random_seed: int | None = None
+        random_seed: int | None = None,
+        max_class_diff: int = 2,
+        balance_on: Literal["k", "k_bin_label"] = "k",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Splits a balanced 2·per_set_total selection into E1/E2 with strict per-class totals & even bin spread."""
-        self._check_required_cols(selected_df, ["session_id", "class_label", "k_bin_label"])
-        rng = np.random.default_rng(random_seed)
+        """Splits selected exam rows into two balanced sets.
 
-        per_class_target_per_set = per_set_total // 2
-        total_expected = 2 * per_set_total
-        df = selected_df.copy().reset_index(drop=True)
+        Args:
+            selected_df: DataFrame containing exam candidates with class labels and complexity metadata.
+            per_set_total: Exact number of examples per exam set.
+            random_seed: RNG seed for deterministic splitting.
+            max_class_diff: Maximum allowed absolute class-count gap per set.
+            balance_on: Complexity column used for stratification.
 
-        # Strict global balance across both sets
-        counts = df["class_label"].value_counts().to_dict()
-        for c in (0, 1):
-            need = 2 * per_class_target_per_set
-            have = int(counts.get(c, 0))
-            if have != need:
-                raise ValueError(
-                    f"selected_df must have exactly {need} rows for class {c}, found {have}. "
-                    "Re-run selection to enforce strict per-class targets for exams."
-                )
-        if len(df) != total_expected:
-            raise ValueError(f"selected_df must have exactly {total_expected} rows, found {len(df)}.")
-
-        # Split per class with round-robin over k-bins
-        parts = []
-        for cls in (0, 1):
-            sub = df[df["class_label"].astype(int) == cls].copy().reset_index(drop=True)
-            by_bin = {str(b): g.index.to_list() for b, g in sub.groupby("k_bin_label")}
-            idx_e1, idx_e2 = self._round_robin_two_way(by_bin, target_per_set=per_class_target_per_set, rng=rng)
-            parts.append((sub.loc[idx_e1].index, sub.loc[idx_e2].index))
-
-        # Map back to global indices
-        e1_rows, e2_rows = [], []
-        for cls, (i1, i2) in zip((0, 1), parts):
-            global_idx = df.index[df["class_label"].astype(int) == cls]
-            e1_rows.extend(global_idx[i1].to_list())
-            e2_rows.extend(global_idx[i2].to_list())
-
-        df_e1 = df.loc[sorted(e1_rows)].reset_index(drop=True).assign(set_id=1)
-        df_e2 = df.loc[sorted(e2_rows)].reset_index(drop=True).assign(set_id=2)
+        Returns:
+            Two DataFrames with `set_id` values 1 and 2.
+        """
+        df_e1, df_e2, _ = _split_balanced_two_sets_core(
+            selected_df,
+            per_set_total=int(per_set_total),
+            random_seed=random_seed,
+            max_class_diff=int(max_class_diff),
+            balance_on=balance_on,
+        )
         return df_e1, df_e2
 
     def _render_exam_images(
@@ -3233,96 +3160,266 @@ def _verify_columns(df: pd.DataFrame) -> pd.DataFrame:
 # constructed from the test set instead of the validation set. Used for MT4XAI experiment with human/LLM participants. 
 
 def _check_required_cols(df: pd.DataFrame, cols: list[str]) -> None:
-    """raises if required columns are missing."""
+    """Raises if required columns are missing."""
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise ValueError(f"required columns missing: {missing}")
 
-def _round_robin_two_way(items_by_bin: dict[str, list[int]], target_per_set: int, rng: np.random.Generator
-                         ) -> tuple[list[int], list[int]]:
-    """splits indices into two balanced buckets by round-robin over bins."""
-    e1, e2 = [], []
-    # interleave across bins to keep distribution similar
-    bin_keys = list(items_by_bin.keys())
-    cursor = {b: 0 for b in bin_keys}
-    # flatten counts for a quick stop condition
-    total_needed = 2 * target_per_set
-    while len(e1) + len(e2) < total_needed:
-        for b in bin_keys:
-            arr = items_by_bin[b]
-            # randomise once up front
-            if cursor[b] == 0 and len(arr) > 1:
-                rng.shuffle(arr)
-            if cursor[b] < len(arr):
-                # choose the set with fewer so far (keeps them equal)
-                choose_e1 = (len(e1) <= len(e2))
-                if choose_e1 and len(e1) < target_per_set:
-                    e1.append(arr[cursor[b]])
-                elif len(e2) < target_per_set:
-                    e2.append(arr[cursor[b]])
-                else:
-                    # both sets full
-                    return e1, e2
-                cursor[b] += 1
-        # fallthrough continues cycling bins
-    return e1, e2
-
-def split_balanced_two_sets(selected_df: pd.DataFrame, *, per_set_total: int, random_seed: int | None = None
-                            ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Splits a balanced 2·per_set_total selection into E1/E2 with strict per-class totals and even bin spread.
+def _normalise_exam_split_df(selected_df: pd.DataFrame, *, balance_col: str) -> pd.DataFrame:
+    """Normalises and validates the exam split input DataFrame.
 
     Args:
-        selected_df: DataFrame containing selected exam candidates. Must be balanced across classes
-            and include columns 'session_id', 'class_label', 'k_bin_label'.
-        per_set_total: total rows desired in each exam set (e.g. 20).
-        random_seed: optional RNG seed for deterministic splits.
+        selected_df: Candidate rows selected for exam construction.
+        balance_col: Complexity column used for stratification.
 
     Returns:
-        (df_e1, df_e2): two DataFrames with exactly `per_set_total` rows each,
-        holding 50/50 class balance and similar k-bin coverage.
+        A copy of the input with normalised class labels.
     """
-    _check_required_cols(selected_df, ["session_id", "class_label", "k_bin_label"])
-    rng = np.random.default_rng(random_seed)
-
-    # enforces a strict 50/50 class balance. Each set must have per_set_total/2 per class
-    per_class_target_per_set = per_set_total // 2
-    total_expected = 2 * per_set_total
     df = selected_df.copy().reset_index(drop=True)
+    if "class_label" not in df.columns and "label_int" in df.columns:
+        df = df.rename(columns={"label_int": "class_label"})
 
-    # sanity: global balance across both sets
-    counts = df["class_label"].value_counts().to_dict()
-    for c in (0, 1):
-        need = 2 * per_class_target_per_set
-        have = int(counts.get(c, 0))
-        if have != need:
-            raise ValueError(
-                f"selected_df must have exactly {need} rows for class {c}, found {have}."
-                " Re-run selection to enforce strict per-class targets for exams."
-            )
-    if len(df) != total_expected:
-        raise ValueError(f"selected_df must have exactly {total_expected} rows, found {len(df)}.")
+    _check_required_cols(df, ["session_id", "class_label", balance_col])
+    df["class_label"] = pd.to_numeric(df["class_label"], errors="coerce").astype("Int64")
+    if df["class_label"].isna().any():
+        raise ValueError("class_label contains non-numeric or missing values")
+    present_classes = sorted(int(c) for c in df["class_label"].dropna().unique().tolist())
+    if present_classes != [0, 1]:
+        raise ValueError(f"class_label must contain exactly classes [0, 1], found {present_classes}")
+    if df[balance_col].isna().any():
+        raise ValueError(f"column '{balance_col}' contains missing values")
+    return df
 
-    # split per class with round-robin over k-bins
-    parts = []
-    for cls in (0, 1):
-        sub = df[df["class_label"].astype(int) == cls].copy().reset_index(drop=True)
-        by_bin = {}
-        for b, g in sub.groupby("k_bin_label"):
-            by_bin[str(b)] = g.index.to_list()
-        idx_e1, idx_e2 = _round_robin_two_way(by_bin, target_per_set=per_class_target_per_set, rng=rng)
-        parts.append((
-            sub.loc[idx_e1].index,  # original row indices in df for class subset
-            sub.loc[idx_e2].index
-        ))
 
-    # stitch class-wise selections back into df rows
-    e1_rows, e2_rows = [], []
-    for cls, (i1, i2) in zip((0, 1), parts):
-        # map class-subset idx back to global df indices
-        global_idx = df.index[df["class_label"].astype(int) == cls]
-        e1_rows.extend(global_idx[i1].to_list())
-        e2_rows.extend(global_idx[i2].to_list())
+def _choose_class0_target_for_set1(
+    *,
+    class0_total: int,
+    per_set_total: int,
+    max_class_diff: int,
+) -> int:
+    """Selects a feasible class-0 count for set1 under class-gap constraints."""
+    feasible: list[int] = []
+    low = max(0, class0_total - per_set_total)
+    high = min(per_set_total, class0_total)
+    for class0_set1 in range(low, high + 1):
+        class1_set1 = per_set_total - class0_set1
+        class0_set2 = class0_total - class0_set1
+        class1_set2 = per_set_total - class0_set2
+        if class1_set2 < 0 or class1_set2 > per_set_total:
+            continue
+        diff_set1 = abs(class0_set1 - class1_set1)
+        diff_set2 = abs(class0_set2 - class1_set2)
+        if diff_set1 <= max_class_diff and diff_set2 <= max_class_diff:
+            feasible.append(class0_set1)
 
-    df_e1 = df.loc[sorted(e1_rows)].reset_index(drop=True).assign(set_id=1)
-    df_e2 = df.loc[sorted(e2_rows)].reset_index(drop=True).assign(set_id=2)
+    if not feasible:
+        raise ValueError(
+            "cannot satisfy class-gap constraints for exam splitting. "
+            f"class0_total={class0_total}, class1_total={2 * per_set_total - class0_total}, "
+            f"per_set_total={per_set_total}, max_class_diff={max_class_diff}"
+        )
+
+    return min(
+        feasible,
+        key=lambda x: (
+            max(abs(2 * x - per_set_total), abs(2 * (class0_total - x) - per_set_total)),
+            abs(x - (per_set_total / 2.0)),
+            abs((class0_total - x) - (per_set_total / 2.0)),
+            abs(x - (class0_total / 2.0)),
+            x,
+        ),
+    )
+
+
+def _split_class_stratified(
+    sub_df: pd.DataFrame,
+    *,
+    target_set1: int,
+    balance_col: str,
+    rng: np.random.Generator,
+) -> tuple[list[int], list[int]]:
+    """Splits one class into two sets while preserving stratified complexity.
+
+    The split keeps each stratum as even as possible between sets. For odd strata,
+    tie assignments alternate between set1 and set2 while remaining class quotas
+    permit.
+    """
+    total = len(sub_df)
+    target_set2 = total - target_set1
+    if target_set1 < 0 or target_set1 > total:
+        raise ValueError(
+            f"target_set1 must be within [0, {total}] for class split, got {target_set1}"
+        )
+
+    set1_idx: list[int] = []
+    set2_idx: list[int] = []
+    prefer_set1 = True
+
+    for _, group in sub_df.groupby(balance_col, sort=True, dropna=False):
+        stratum_idx = group.index.to_list()
+        if len(stratum_idx) > 1:
+            rng.shuffle(stratum_idx)
+
+        stratum_set1 = 0
+        stratum_set2 = 0
+        for row_idx in stratum_idx:
+            rem_set1 = target_set1 - len(set1_idx)
+            rem_set2 = target_set2 - len(set2_idx)
+
+            if rem_set1 <= 0 and rem_set2 <= 0:
+                raise RuntimeError("internal split state overfills both exam sets")
+            if rem_set1 <= 0:
+                choose_set1 = False
+            elif rem_set2 <= 0:
+                choose_set1 = True
+            elif stratum_set1 < stratum_set2:
+                choose_set1 = True
+            elif stratum_set2 < stratum_set1:
+                choose_set1 = False
+            else:
+                choose_set1 = prefer_set1
+                prefer_set1 = not prefer_set1
+
+            if choose_set1:
+                set1_idx.append(row_idx)
+                stratum_set1 += 1
+            else:
+                set2_idx.append(row_idx)
+                stratum_set2 += 1
+
+    if len(set1_idx) != target_set1 or len(set2_idx) != target_set2:
+        raise RuntimeError(
+            "internal split mismatch after stratified allocation. "
+            f"expected ({target_set1}, {target_set2}) got ({len(set1_idx)}, {len(set2_idx)})"
+        )
+    return set1_idx, set2_idx
+
+
+def _summarise_exam_class_balance(df_set: pd.DataFrame) -> tuple[dict[str, int], int]:
+    """Summarises class counts and class gap for one exam set."""
+    normals = int((df_set["class_label"].astype(int) == 0).sum())
+    abnormals = int((df_set["class_label"].astype(int) == 1).sum())
+    gap = abs(normals - abnormals)
+    return {"normal": normals, "abnormal": abnormals}, gap
+
+
+def _split_balanced_two_sets_core(
+    selected_df: pd.DataFrame,
+    *,
+    per_set_total: int,
+    random_seed: int | None = None,
+    max_class_diff: int = 2,
+    balance_on: Literal["k", "k_bin_label"] = "k",
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Splits exam candidates into two balanced sets with strict validation.
+
+    Args:
+        selected_df: DataFrame containing exam candidates.
+        per_set_total: Exact number of rows per exam set.
+        random_seed: RNG seed for deterministic split behaviour.
+        max_class_diff: Maximum allowed class-count gap per set.
+        balance_on: Complexity column used for stratification.
+
+    Returns:
+        Tuple of (set1_df, set2_df, metadata).
+    """
+    if per_set_total <= 0:
+        raise ValueError("per_set_total must be a positive integer")
+    if max_class_diff < 0:
+        raise ValueError("max_class_diff must be >= 0")
+    if balance_on not in {"k", "k_bin_label"}:
+        raise ValueError("balance_on must be either 'k' or 'k_bin_label'")
+
+    df = _normalise_exam_split_df(selected_df, balance_col=balance_on)
+    expected_rows = 2 * int(per_set_total)
+    if len(df) != expected_rows:
+        raise ValueError(
+            "strict exam splitting expects exactly 2 * per_set_total rows. "
+            f"found {len(df)} rows for per_set_total={per_set_total} (expected {expected_rows})."
+        )
+
+    class0_total = int((df["class_label"].astype(int) == 0).sum())
+    class1_total = int((df["class_label"].astype(int) == 1).sum())
+    class0_set1 = _choose_class0_target_for_set1(
+        class0_total=class0_total,
+        per_set_total=int(per_set_total),
+        max_class_diff=int(max_class_diff),
+    )
+    class1_set1 = int(per_set_total) - class0_set1
+    class0_set2 = class0_total - class0_set1
+    class1_set2 = class1_total - class1_set1
+
+    rng = np.random.default_rng(random_seed)
+    set1_idx: list[int] = []
+    set2_idx: list[int] = []
+
+    class_targets = {
+        "set1": {"normal": int(class0_set1), "abnormal": int(class1_set1)},
+        "set2": {"normal": int(class0_set2), "abnormal": int(class1_set2)},
+    }
+
+    for cls, target_set1 in ((0, class0_set1), (1, class1_set1)):
+        sub = df[df["class_label"].astype(int) == cls]
+        idx1, idx2 = _split_class_stratified(
+            sub,
+            target_set1=int(target_set1),
+            balance_col=balance_on,
+            rng=rng,
+        )
+        set1_idx.extend(idx1)
+        set2_idx.extend(idx2)
+
+    df_e1 = df.loc[sorted(set1_idx)].reset_index(drop=True).assign(set_id=1)
+    df_e2 = df.loc[sorted(set2_idx)].reset_index(drop=True).assign(set_id=2)
+
+    if len(df_e1) != int(per_set_total) or len(df_e2) != int(per_set_total):
+        raise RuntimeError(
+            "internal split produced unexpected set sizes. "
+            f"set1={len(df_e1)}, set2={len(df_e2)}, expected={per_set_total}"
+        )
+
+    class_counts_set1, gap_set1 = _summarise_exam_class_balance(df_e1)
+    class_counts_set2, gap_set2 = _summarise_exam_class_balance(df_e2)
+    if gap_set1 > int(max_class_diff) or gap_set2 > int(max_class_diff):
+        raise ValueError(
+            "constructed exam sets violate class-gap constraints. "
+            f"set1_gap={gap_set1}, set2_gap={gap_set2}, max_class_diff={max_class_diff}"
+        )
+
+    split_meta = {
+        "class_counts": {"set1": class_counts_set1, "set2": class_counts_set2},
+        "class_gap": {"set1": int(gap_set1), "set2": int(gap_set2)},
+        "balance_on": balance_on,
+        "target_class_counts": class_targets,
+    }
+    return df_e1, df_e2, split_meta
+
+
+def split_balanced_two_sets(
+    selected_df: pd.DataFrame,
+    *,
+    per_set_total: int,
+    random_seed: int | None = None,
+    max_class_diff: int = 2,
+    balance_on: Literal["k", "k_bin_label"] = "k",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Splits exam candidates into two balanced sets.
+
+    Args:
+        selected_df: DataFrame containing exam candidates.
+        per_set_total: Exact number of rows per set.
+        random_seed: RNG seed for deterministic split behaviour.
+        max_class_diff: Maximum allowed class-count gap per set.
+        balance_on: Complexity column used for stratification.
+
+    Returns:
+        Tuple of (set1_df, set2_df).
+    """
+    df_e1, df_e2, _ = _split_balanced_two_sets_core(
+        selected_df,
+        per_set_total=int(per_set_total),
+        random_seed=random_seed,
+        max_class_diff=int(max_class_diff),
+        balance_on=balance_on,
+    )
     return df_e1, df_e2
