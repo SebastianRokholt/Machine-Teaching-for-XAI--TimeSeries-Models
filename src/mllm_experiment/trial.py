@@ -68,8 +68,8 @@ class GroupEProtocolError(RuntimeError):
 class TrialRunner:
     """Coordinate the full trial lifecycle for one or more participants.
 
-    The trial runner loads metadata, assigns groups and exam sets, and
-    manages the three-phase protocol (pre-teaching exam, teaching phase,
+    The trial runner loads metadata, applies preplanned groups, and assigns exam sets.
+    It manages the three-phase protocol (pre-teaching exam, teaching phase,
     post-teaching exam) for each participant. It maintains a separate
     chat history per participant so that the MLLM can reuse context
     within the trial.
@@ -130,18 +130,28 @@ class TrialRunner:
             logger.error(msg)
             raise ValueError(msg)
 
-    def run_participant(self, rng: random.Random, index: int) -> bool:
+    def run_participant(
+        self,
+        rng: random.Random,
+        index: int,
+        assigned_group: Group,
+    ) -> bool:
         """Run a full trial for a single participant.
 
         Args:
             rng: Random number generator instance.
             index: Index of the participant within this run.
+            assigned_group: Preassigned teaching group for this participant.
 
         Returns:
             True when the participant completes all phases. False when
             retries are exhausted or protocol validation fails safely.
         """
-        participant = self._sample_participant_config(rng, index)
+        participant = self._sample_participant_config(
+            rng=rng,
+            index=index,
+            assigned_group=assigned_group,
+        )
         self._log_event(
             event="participant.start",
             level=logging.INFO,
@@ -278,11 +288,23 @@ class TrialRunner:
             )
             return False
 
-    def _sample_participant_config(self, rng: random.Random, index: int) -> ParticipantConfig:
-        """Sample group and exam sets for one participant."""
-        participant_id = f"p_{index:04d}_{uuid.uuid4().hex[:8]}"
+    def _sample_participant_config(
+        self,
+        rng: random.Random,
+        index: int,
+        assigned_group: Group,
+    ) -> ParticipantConfig:
+        """Sample exam sets for one participant with a preassigned group.
 
-        group = rng.choice(self.enabled_groups)
+        Args:
+            rng: Random number generator instance.
+            index: Participant index within the run.
+            assigned_group: Preassigned teaching group for this participant.
+
+        Returns:
+            Participant configuration object.
+        """
+        participant_id = f"p_{index:04d}_{uuid.uuid4().hex[:8]}"
 
         exam_sets = list(self.exam_by_set.keys())
         if len(exam_sets) != 2:
@@ -295,7 +317,7 @@ class TrialRunner:
 
         return ParticipantConfig(
             participant_id=participant_id,
-            group=group,
+            group=assigned_group,
             exam_set_pre=exam_set_pre,
             exam_set_post=exam_set_post,
         )

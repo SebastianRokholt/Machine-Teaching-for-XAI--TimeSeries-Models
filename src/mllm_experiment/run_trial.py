@@ -3,9 +3,14 @@
 # run_trial.py
 from __future__ import annotations
 import argparse
+import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import json
 import logging
 import random
+import subprocess
+from typing import Any
 import uuid
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -17,6 +22,314 @@ from .trial import TrialRunner
 from .config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
+
+COMPATIBILITY_MANIFEST_FILENAME = "run_compatibility_manifest.json"
+RUN_METADATA_DIRNAME = "run_metadata"
+_COMPLETED_STATUS = "completed"
+_FAILED_STATUS = "failed"
+
+
+def _utc_timestamp_iso() -> str:
+    """Return the current UTC timestamp in ISO-8601 format."""
+    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_git_commit_hash() -> str:
+    """Resolve the repository HEAD commit hash.
+
+    Returns:
+        Full commit hash string for HEAD.
+
+    Raises:
+        RuntimeError: Raised when Git metadata is unavailable.
+    """
+    repository_root = Path(__file__).resolve().parents[2]
+    command = ["git", "rev-parse", "HEAD"]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        msg = (
+            "Failed to resolve git commit hash with 'git rev-parse HEAD'. "
+            "Ensure the repository has Git metadata and retry."
+        )
+        raise RuntimeError(msg) from exc
+
+    commit_hash = result.stdout.strip()
+    if not commit_hash:
+        msg = "Git commit hash resolution returned an empty value."
+        raise RuntimeError(msg)
+    return commit_hash
+
+
+def _materialise_effective_seed(configured_seed: int | None) -> int:
+    """Materialise one seed value used for the full run.
+
+    Args:
+        configured_seed: Optional CLI seed.
+
+    Returns:
+        Integer seed used for deterministic planning and participant RNG streams.
+    """
+    if configured_seed is not None:
+        return configured_seed
+    return random.SystemRandom().randint(0, 2**31 - 1)
+
+
+def _group_counts_to_serialisable(
+    counts: dict[Group, int],
+    enabled_groups: list[Group],
+) -> dict[str, int]:
+    """Convert group-count mappings to serialisable string-key dictionaries.
+
+    Args:
+        counts: Mapping from Group enum to integer counts.
+        enabled_groups: Ordered list of groups enabled for the run.
+
+    Returns:
+        Dictionary keyed by group letters in enabled-group order.
+    """
+    return {group.value: counts[group] for group in enabled_groups}
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
+    """Read a JSON file and validate that it contains an object.
+
+    Args:
+        path: Path to the JSON file.
+
+    Returns:
+        Parsed JSON object.
+
+    Raises:
+        ValueError: Raised when parsing fails or payload is not an object.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        msg = f"Invalid JSON content in {path}: {exc}"
+        raise ValueError(msg) from exc
+
+    if not isinstance(payload, dict):
+        msg = f"Expected JSON object in {path}, found {type(payload).__name__}."
+        raise ValueError(msg)
+    return payload
+
+
+def _ensure_output_compatibility_manifest(
+    output_root: Path,
+    protected_fields: dict[str, str],
+    manifest_created_at: str,
+) -> Path:
+    """Ensure one compatibility manifest exists and matches protected fields.
+
+    Args:
+        output_root: Output directory for the experiment run.
+        protected_fields: Fields that must remain stable across appended runs.
+        manifest_created_at: UTC timestamp used when creating a new manifest.
+
+    Returns:
+        Path to the compatibility manifest.
+
+    Raises:
+        ValueError: Raised when existing manifest fields mismatch current inputs.
+    """
+    manifest_path = output_root / COMPATIBILITY_MANIFEST_FILENAME
+    if manifest_path.is_file():
+        manifest_payload = _read_json_dict(manifest_path)
+        missing_fields = [
+            field_name for field_name in protected_fields if field_name not in manifest_payload
+        ]
+        if missing_fields:
+            msg = (
+                "Compatibility manifest is missing required field(s): "
+                f"{', '.join(missing_fields)} in {manifest_path}. "
+                "Use a new output directory for this run."
+            )
+            raise ValueError(msg)
+
+        mismatches: list[str] = []
+        for field_name, expected_value in protected_fields.items():
+            actual_value = str(manifest_payload.get(field_name, ""))
+            if actual_value != expected_value:
+                mismatches.append(
+                    f"{field_name}: existing={actual_value!r} current={expected_value!r}"
+                )
+        if mismatches:
+            mismatch_text = ", ".join(mismatches)
+            msg = (
+                "Output directory compatibility check failed. "
+                f"Manifest path: {manifest_path}. Mismatch details: {mismatch_text}. "
+                "Use a new output directory for this run."
+            )
+            raise ValueError(msg)
+        return manifest_path
+
+    payload = {
+        **protected_fields,
+        "manifest_created_at": manifest_created_at,
+    }
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _load_completed_group_counts(
+    output_root: Path,
+    enabled_groups: list[Group],
+) -> dict[Group, int]:
+    """Load baseline completed-participant counts from participants.csv.
+
+    Args:
+        output_root: Output directory that may contain participants.csv.
+        enabled_groups: Groups enabled for the current run.
+
+    Returns:
+        Dictionary with completed counts for enabled groups only.
+    """
+    counts: dict[Group, int] = {group: 0 for group in enabled_groups}
+    participants_path = output_root / "participants.csv"
+    if not participants_path.is_file():
+        return counts
+
+    with participants_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            logger.warning(
+                "[run_trial] participants.csv is empty. Using zero baseline counts path=%s",
+                participants_path,
+            )
+            return counts
+
+        for row_number, row in enumerate(reader, start=2):
+            raw_status = str(row.get("status", "")).strip().lower()
+            if not raw_status:
+                logger.warning(
+                    "[run_trial] skipping row with missing status path=%s row=%d",
+                    participants_path,
+                    row_number,
+                )
+                continue
+            if raw_status not in {_COMPLETED_STATUS, _FAILED_STATUS}:
+                logger.warning(
+                    (
+                        "[run_trial] skipping row with invalid status path=%s row=%d "
+                        "status=%s"
+                    ),
+                    participants_path,
+                    row_number,
+                    raw_status,
+                )
+                continue
+            if raw_status != _COMPLETED_STATUS:
+                continue
+
+            raw_group = str(row.get("group", "")).strip().upper()
+            if not raw_group:
+                logger.warning(
+                    "[run_trial] skipping completed row with missing group path=%s row=%d",
+                    participants_path,
+                    row_number,
+                )
+                continue
+            try:
+                group = Group(raw_group)
+            except ValueError:
+                logger.warning(
+                    (
+                        "[run_trial] skipping completed row with invalid group path=%s "
+                        "row=%d group=%s"
+                    ),
+                    participants_path,
+                    row_number,
+                    raw_group,
+                )
+                continue
+            if group not in counts:
+                continue
+            counts[group] += 1
+
+    return counts
+
+
+def _plan_balanced_assignments(
+    assignment_rng: random.Random,
+    enabled_groups: list[Group],
+    baseline_counts: dict[Group, int],
+    participants_total: int,
+) -> tuple[list[Group], dict[Group, int]]:
+    """Plan balanced random group assignments for the current run.
+
+    Args:
+        assignment_rng: Random stream dedicated to assignment planning.
+        enabled_groups: Ordered list of enabled groups.
+        baseline_counts: Completed baseline counts from prior rows.
+        participants_total: Number of participants requested for this run.
+
+    Returns:
+        Tuple of:
+            - ordered list of planned groups by participant index,
+            - projected counts after applying this plan.
+    """
+    projected_counts = dict(baseline_counts)
+    planned_groups: list[Group] = []
+
+    for _ in range(participants_total):
+        min_count = min(projected_counts[group] for group in enabled_groups)
+        least_represented = [
+            group for group in enabled_groups if projected_counts[group] == min_count
+        ]
+        selected_group = assignment_rng.choice(least_represented)
+        planned_groups.append(selected_group)
+        projected_counts[selected_group] += 1
+
+    return planned_groups, projected_counts
+
+
+def _write_run_metadata_snapshot(
+    output_root: Path,
+    run_id: str,
+    snapshot_payload: dict[str, Any],
+) -> Path:
+    """Write one run metadata snapshot as JSON.
+
+    Args:
+        output_root: Output directory for the experiment.
+        run_id: Stable identifier for this run.
+        snapshot_payload: JSON-serialisable metadata payload.
+
+    Returns:
+        Path to the written snapshot.
+    """
+    metadata_root = output_root / RUN_METADATA_DIRNAME
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    snapshot_path = metadata_root / f"{run_id}.json"
+    snapshot_path.write_text(
+        json.dumps(snapshot_payload, ensure_ascii=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return snapshot_path
+
+
+def _initialise_rng_streams(effective_seed: int) -> tuple[random.Random, random.Random]:
+    """Initialise deterministic RNG streams for planning and participant seeds.
+
+    Args:
+        effective_seed: Materialised run seed.
+
+    Returns:
+        Tuple with assignment RNG and participant-seed RNG.
+    """
+    assignment_seed = (effective_seed << 1) ^ 0x9E3779B185EBCA87
+    participant_seed = (effective_seed << 1) ^ 0xC2B2AE3D27D4EB4F
+    return random.Random(assignment_seed), random.Random(participant_seed)
 
 
 def parse_conditions_selector(raw_selector: str) -> tuple[str, list[Group]]:
@@ -227,6 +540,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     effective_conditions = "".join(group.value for group in enabled_groups)
+    effective_seed = _materialise_effective_seed(args.random_seed)
     config = ExperimentConfig(
         log_level=args.log_level,
         teaching_root=args.teaching_set_dir,
@@ -234,7 +548,7 @@ def main() -> None:
         metadata_root=args.metadata_dir,
         output_root=args.output_dir,
         model_name=args.model_name,
-        random_seed=args.random_seed,
+        random_seed=effective_seed,
         parallel_participants=args.parallel_participants,
         max_requests_per_minute=args.max_requests_per_minute,
         max_tokens_per_minute=args.max_tokens_per_minute,
@@ -255,13 +569,95 @@ def main() -> None:
         http_debug=args.http_debug,
     )
     event_logger = ExperimentEventLogger(run_id=run_id)
+    run_started_at = _utc_timestamp_iso()
+    try:
+        git_commit_hash = _resolve_git_commit_hash()
+    except RuntimeError as exc:
+        logger.error("[run_trial] %s", str(exc))
+        raise SystemExit(str(exc)) from exc
+    protected_manifest_fields = {
+        "model_name": config.model_name,
+        "git_commit_hash": git_commit_hash,
+        "enabled_conditions": effective_conditions,
+    }
+    try:
+        manifest_path = _ensure_output_compatibility_manifest(
+            output_root=config.output_root,
+            protected_fields=protected_manifest_fields,
+            manifest_created_at=run_started_at,
+        )
+    except ValueError as exc:
+        logger.error("[run_trial] %s", str(exc))
+        raise SystemExit(str(exc)) from exc
+
+    baseline_completed_counts = _load_completed_group_counts(
+        output_root=config.output_root,
+        enabled_groups=enabled_groups,
+    )
+    assignment_rng, participant_seed_rng = _initialise_rng_streams(effective_seed)
+    planned_groups, projected_completed_counts = _plan_balanced_assignments(
+        assignment_rng=assignment_rng,
+        enabled_groups=enabled_groups,
+        baseline_counts=baseline_completed_counts,
+        participants_total=args.participants,
+    )
+    planned_assignment_sequence = [group.value for group in planned_groups]
+    participant_seed_sequence = [
+        participant_seed_rng.randint(0, 2**31 - 1)
+        for _ in range(args.participants)
+    ]
+    participant_jobs = [
+        (index, participant_seed_sequence[index], planned_groups[index])
+        for index in range(args.participants)
+    ]
+    snapshot_payload = {
+        "run_timestamp": run_started_at,
+        "run_id": run_id,
+        "effective_seed": effective_seed,
+        "enabled_conditions": effective_conditions,
+        "baseline_completed_counts": _group_counts_to_serialisable(
+            counts=baseline_completed_counts,
+            enabled_groups=enabled_groups,
+        ),
+        "planned_assignment_sequence": planned_assignment_sequence,
+        "projected_completed_counts": _group_counts_to_serialisable(
+            counts=projected_completed_counts,
+            enabled_groups=enabled_groups,
+        ),
+        "participant_seed_sequence": participant_seed_sequence,
+        "model_name": config.model_name,
+        "git_commit_hash": git_commit_hash,
+    }
+    snapshot_path = _write_run_metadata_snapshot(
+        output_root=config.output_root,
+        run_id=run_id,
+        snapshot_payload=snapshot_payload,
+    )
+    logger.info(
+        (
+            "[run_trial] assignment plan prepared effective_seed=%d baseline_completed=%s "
+            "planned_sequence=%s"
+        ),
+        effective_seed,
+        _group_counts_to_serialisable(
+            counts=baseline_completed_counts,
+            enabled_groups=enabled_groups,
+        ),
+        planned_assignment_sequence,
+    )
+    if args.random_seed is None:
+        logger.info(
+            "[run_trial] random_seed was not provided. Generated effective_seed=%d",
+            effective_seed,
+        )
 
     if args.verbose:
         logger.debug(
             "[run_trial] config run_id=%s participants=%d dry_run=%s "
             "log_level=%s model_name=%s random_seed=%s output_root=%s "
             "logfile_path=%s events_log_file=%s "
-            "conditions_requested=%s conditions_effective=%s",
+            "conditions_requested=%s conditions_effective=%s git_commit_hash=%s "
+            "manifest_path=%s snapshot_path=%s",
             run_id,
             args.participants,
             args.dry_run,
@@ -273,6 +669,9 @@ def main() -> None:
             events_log_file,
             requested_conditions,
             effective_conditions,
+            git_commit_hash,
+            manifest_path,
+            snapshot_path,
         )
 
     client = OpenAIChatClient(
@@ -306,11 +705,16 @@ def main() -> None:
         level=logging.INFO,
         status="started",
         mode="dummy" if args.dry_run else "api",
+        run_timestamp=run_started_at,
         participants_total=args.participants,
         model_name=config.model_name,
+        effective_seed=effective_seed,
         random_seed=config.random_seed,
+        git_commit_hash=git_commit_hash,
         conditions_requested=requested_conditions,
         conditions_effective=effective_conditions,
+        compatibility_manifest_file=manifest_path,
+        run_metadata_snapshot=snapshot_path,
         log_level=config.log_level,
         output_root=config.output_root,
         log_file=config.logfile_path,
@@ -325,41 +729,66 @@ def main() -> None:
         api_retry_max_delay_seconds=config.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=config.api_retry_jitter_fraction,
     )
+    event_logger.log(
+        logger=logger,
+        event="run.assignment_plan",
+        level=logging.INFO,
+        status="planned",
+        effective_seed=effective_seed,
+        participants_total=args.participants,
+        baseline_completed_counts=_group_counts_to_serialisable(
+            counts=baseline_completed_counts,
+            enabled_groups=enabled_groups,
+        ),
+        projected_completed_counts=_group_counts_to_serialisable(
+            counts=projected_completed_counts,
+            enabled_groups=enabled_groups,
+        ),
+        planned_assignment_sequence=planned_assignment_sequence,
+        participant_seed_sequence=participant_seed_sequence,
+    )
 
-    # This sets up the base RNG. If config.random_seed is None, the
-    # sequence changes between runs, but each participant seed is logged.
-    base_rng = random.Random(config.random_seed)
-    participant_jobs = [
-        (idx, base_rng.randint(0, 2**31 - 1))
-        for idx in range(args.participants)
-    ]
     participants_completed = 0
     participants_failed = 0
     run_status = "completed"
 
-    def run_one_participant(index: int, seed: int) -> bool:
+    def run_one_participant(index: int, seed: int, assigned_group: Group) -> bool:
         rng = random.Random(seed)
         if args.verbose:
-            logger.debug("[run_trial] participant index=%d seed=%d", index, seed)
-        return runner.run_participant(rng=rng, index=index)
+            logger.debug(
+                "[run_trial] participant index=%d seed=%d assigned_group=%s",
+                index,
+                seed,
+                assigned_group.value,
+            )
+        return runner.run_participant(
+            rng=rng,
+            index=index,
+            assigned_group=assigned_group,
+        )
 
     try:
         if config.parallel_participants <= 1:
-            for idx, seed in tqdm(
+            for idx, seed, assigned_group in tqdm(
                 participant_jobs,
                 total=len(participant_jobs),
                 desc="Participants",
                 unit="participant",
             ):
-                if run_one_participant(index=idx, seed=seed):
+                if run_one_participant(index=idx, seed=seed, assigned_group=assigned_group):
                     participants_completed += 1
                 else:
                     participants_failed += 1
         else:
             with ThreadPoolExecutor(max_workers=config.parallel_participants) as executor:
                 futures = [
-                    executor.submit(run_one_participant, index=idx, seed=seed)
-                    for idx, seed in participant_jobs
+                    executor.submit(
+                        run_one_participant,
+                        index=idx,
+                        seed=seed,
+                        assigned_group=assigned_group,
+                    )
+                    for idx, seed, assigned_group in participant_jobs
                 ]
                 for future in tqdm(
                     as_completed(futures),
