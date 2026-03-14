@@ -494,6 +494,42 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--group_e_teaching_context_window_examples",
+        type=int,
+        default=5,
+        help=(
+            "Number of latest committed teaching examples retained in "
+            "group E context."
+        ),
+    )
+    parser.add_argument(
+        "--group_e_post_exam_context_mode",
+        type=str,
+        default="rule_only",
+        help=(
+            "Group E post-exam context mode. "
+            "Supported values: rule_only."
+        ),
+    )
+    parser.add_argument(
+        "--group_e_post_exam_rule_max_chars",
+        type=int,
+        default=1000,
+        help=(
+            "Maximum number of characters retained from the final group E rule "
+            "(1-1000)."
+        ),
+    )
+    parser.add_argument(
+        "--group_e_post_exam_tie_breaker",
+        type=str,
+        default="teaching_majority_label",
+        help=(
+            "Group E tie-break strategy in the post-exam prompt. "
+            "Supported values: teaching_majority_label."
+        ),
+    )
+    parser.add_argument(
         "--post_exam_batch_size",
         type=int,
         default=5,
@@ -547,6 +583,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose third-party HTTP and OpenAI library logging.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose experiment logging and runner diagnostics.",
+    )
     return parser.parse_args()
 
 
@@ -578,6 +619,12 @@ def main() -> None:
         api_retry_max_delay_seconds=args.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=args.api_retry_jitter_fraction,
         group_e_retain_retry_attempts=args.group_e_retain_retry_attempts,
+        group_e_teaching_context_window_examples=(
+            args.group_e_teaching_context_window_examples
+        ),
+        group_e_post_exam_context_mode=args.group_e_post_exam_context_mode,
+        group_e_post_exam_rule_max_chars=args.group_e_post_exam_rule_max_chars,
+        group_e_post_exam_tie_breaker=args.group_e_post_exam_tie_breaker,
         post_exam_batch_size=args.post_exam_batch_size,
         post_exam_missing_repair_attempts=args.post_exam_missing_repair_attempts,
     )
@@ -650,6 +697,12 @@ def main() -> None:
         "model_name": config.model_name,
         "git_commit_hash": git_commit_hash,
         "group_e_retain_retry_attempts": config.group_e_retain_retry_attempts,
+        "group_e_teaching_context_window_examples": (
+            config.group_e_teaching_context_window_examples
+        ),
+        "group_e_post_exam_context_mode": config.group_e_post_exam_context_mode,
+        "group_e_post_exam_rule_max_chars": config.group_e_post_exam_rule_max_chars,
+        "group_e_post_exam_tie_breaker": config.group_e_post_exam_tie_breaker,
         "post_exam_batch_size": config.post_exam_batch_size,
         "post_exam_missing_repair_attempts": config.post_exam_missing_repair_attempts,
     }
@@ -683,6 +736,10 @@ def main() -> None:
             "logfile_path=%s events_log_file=%s "
             "conditions_requested=%s conditions_effective=%s git_commit_hash=%s "
             "manifest_path=%s snapshot_path=%s group_e_retain_retry_attempts=%d "
+            "group_e_teaching_context_window_examples=%d "
+            "group_e_post_exam_context_mode=%s "
+            "group_e_post_exam_rule_max_chars=%d "
+            "group_e_post_exam_tie_breaker=%s "
             "post_exam_batch_size=%d post_exam_missing_repair_attempts=%d",
             run_id,
             args.participants,
@@ -699,6 +756,10 @@ def main() -> None:
             manifest_path,
             snapshot_path,
             config.group_e_retain_retry_attempts,
+            config.group_e_teaching_context_window_examples,
+            config.group_e_post_exam_context_mode,
+            config.group_e_post_exam_rule_max_chars,
+            config.group_e_post_exam_tie_breaker,
             config.post_exam_batch_size,
             config.post_exam_missing_repair_attempts,
         )
@@ -758,6 +819,12 @@ def main() -> None:
         api_retry_max_delay_seconds=config.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=config.api_retry_jitter_fraction,
         group_e_retain_retry_attempts=config.group_e_retain_retry_attempts,
+        group_e_teaching_context_window_examples=(
+            config.group_e_teaching_context_window_examples
+        ),
+        group_e_post_exam_context_mode=config.group_e_post_exam_context_mode,
+        group_e_post_exam_rule_max_chars=config.group_e_post_exam_rule_max_chars,
+        group_e_post_exam_tie_breaker=config.group_e_post_exam_tie_breaker,
         post_exam_batch_size=config.post_exam_batch_size,
         post_exam_missing_repair_attempts=config.post_exam_missing_repair_attempts,
     )

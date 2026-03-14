@@ -4,6 +4,10 @@ from pathlib import Path
 from typing_extensions import Literal
 
 
+GroupEPostExamContextMode = Literal["rule_only"]
+GroupEPostExamTieBreaker = Literal["teaching_majority_label"]
+
+
 TEACHING_METADATA_FILENAME = "teaching_items.csv"
 EXAM_METADATA_FILENAME = "exam_items.csv"
 
@@ -48,6 +52,15 @@ class ExperimentConfig:
         group_e_retain_retry_attempts: Number of retries for one group E
             teaching example when the response uses retain but changes the
             rule-of-thumb.
+        group_e_teaching_context_window_examples: Number of latest
+            committed teaching examples retained in group E context.
+        group_e_post_exam_context_mode: Group E post-exam memory mode.
+            The current implementation supports "rule_only".
+        group_e_post_exam_rule_max_chars: Maximum number of characters
+            kept from the final group E rule-of-thumb. This value must
+            be between 1 and 1000.
+        group_e_post_exam_tie_breaker: Group E tie-break strategy used
+            in post-exam instructions.
     """
     teaching_root: Path
     exam_root: Path
@@ -70,6 +83,10 @@ class ExperimentConfig:
     api_retry_max_delay_seconds: float = 120.0
     api_retry_jitter_fraction: float = 0.2
     group_e_retain_retry_attempts: int = 4
+    group_e_teaching_context_window_examples: int = 5
+    group_e_post_exam_context_mode: GroupEPostExamContextMode = "rule_only"
+    group_e_post_exam_rule_max_chars: int = 1000
+    group_e_post_exam_tie_breaker: GroupEPostExamTieBreaker = "teaching_majority_label"
     logfile_path: Path | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
@@ -112,6 +129,27 @@ class ExperimentConfig:
             raise ValueError(msg)
         if self.group_e_retain_retry_attempts < 0:
             msg = "group_e_retain_retry_attempts must be 0 or greater."
+            raise ValueError(msg)
+        if self.group_e_teaching_context_window_examples < 0:
+            msg = "group_e_teaching_context_window_examples must be 0 or greater."
+            raise ValueError(msg)
+        if self.group_e_post_exam_context_mode not in ("rule_only",):
+            msg = (
+                "group_e_post_exam_context_mode must be one of: "
+                "rule_only."
+            )
+            raise ValueError(msg)
+        if self.group_e_post_exam_rule_max_chars <= 0:
+            msg = "group_e_post_exam_rule_max_chars must be greater than 0."
+            raise ValueError(msg)
+        if self.group_e_post_exam_rule_max_chars > 1000:
+            msg = "group_e_post_exam_rule_max_chars must be less than or equal to 1000."
+            raise ValueError(msg)
+        if self.group_e_post_exam_tie_breaker not in ("teaching_majority_label",):
+            msg = (
+                "group_e_post_exam_tie_breaker must be one of: "
+                "teaching_majority_label."
+            )
             raise ValueError(msg)
         if self.post_exam_batch_size <= 0:
             msg = "post_exam_batch_size must be greater than 0."

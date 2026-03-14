@@ -109,19 +109,24 @@ TEACHING_INTRO_RULE_UPDATE = (
 
 POST_EXAM_RULE_CARRYOVER_TEMPLATE = (
     "You finished the teaching phase with this rule-of-thumb: \"{rule}\". "
-    "Do not update, rewrite, or refine this rule during the exam. "
+    "Do not update, rewrite, refine, or shorten this rule during the exam. "
     "Use this fixed rule-of-thumb to label every example in the batch."
 )
 
-# Should we include the 'decision rule' hint here?
+GROUP_E_POST_EXAM_TIE_BREAKER_TEXT = {
+    "teaching_majority_label": (
+        "If the fixed rule is ambiguous for one item, use this tie-break rule. "
+        "Choose the label that appears most consistent with the dominant pattern in the "
+        "teaching examples that shaped your fixed rule. Keep this tie-break behaviour "
+        "consistent for all ambiguous items in the batch."
+    ),
+}
+
 POST_EXAM_INTRO = (
     "Let us test what you have learned about this AI. You will now see new, "
     "unlabelled charging session examples. For each example, you must guess how "
     "the AI would classify it ('normal' or 'abnormal') based on the patterns you "
-    "observed during the teaching examples." 
-    # "Try to apply a single, consistent "
-    # "decision rule across all examples in the batch, even if you feel uncertain "
-    # "about individual cases."
+    "observed during the teaching examples."
 )
 
 
@@ -149,6 +154,7 @@ def build_exam_user_content(
     phase: Phase,
     exam_items: list[tuple[ExampleItem, Path]],
     fixed_rule_of_thumb: str | None = None,
+    group_e_post_exam_tie_breaker: str = "teaching_majority_label",
 ) -> tuple[list[dict[str, Any]], str]:
     """Build multimodal user content for a pre- or post-teaching exam.
 
@@ -162,6 +168,8 @@ def build_exam_user_content(
         exam_items: List of (ExampleItem, image_path) pairs.
         fixed_rule_of_thumb: Optional fixed rule-of-thumb for group E
             in the post-exam phase.
+        group_e_post_exam_tie_breaker: Tie-break strategy for group E
+            post-exam prompts.
 
     Returns:
         Tuple containing:
@@ -197,7 +205,23 @@ def build_exam_user_content(
             )
             raise ValueError(msg)
         carryover_text = POST_EXAM_RULE_CARRYOVER_TEMPLATE.format(rule=rule_text)
+        tie_breaker_text = GROUP_E_POST_EXAM_TIE_BREAKER_TEXT.get(
+            group_e_post_exam_tie_breaker,
+        )
+        if tie_breaker_text is None:
+            msg = (
+                "Group E post-exam prompts require a supported "
+                "group_e_post_exam_tie_breaker value."
+            )
+            raise ValueError(msg)
+        decision_scaffolding_text = (
+            "Use this decision checklist for every item in the batch. "
+            "1. Do not rewrite, refine, or shorten the fixed rule. "
+            "2. Apply one consistent fixed rule across all examples in the batch. "
+            f"3. {tie_breaker_text}"
+        )
         content.append({"type": "text", "text": carryover_text})
+        content.append({"type": "text", "text": decision_scaffolding_text})
 
     content.append(
         {

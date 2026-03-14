@@ -2,6 +2,7 @@
 # core logic for running a trial for a single participant
 # trial.py
 from __future__ import annotations
+from collections import deque
 import json
 import logging
 import random
@@ -197,6 +198,7 @@ class TrialRunner:
                 phase=Phase.POST,
                 messages=messages,
                 fixed_rule_of_thumb=final_rule_of_thumb,
+                group_e_teaching_examples_seen=len(teaching_rows),
             )
             log_exam_results(post_rows, self.config.output_root)
 
@@ -345,6 +347,7 @@ class TrialRunner:
         phase: Phase,
         messages: list[dict[str, Any]],
         fixed_rule_of_thumb: str | None = None,
+        group_e_teaching_examples_seen: int = 0,
     ) -> tuple[list[dict[str, Any]], float, list[dict[str, Any]]]:
         """Run either the pre- or post-teaching exam phase.
 
@@ -355,6 +358,9 @@ class TrialRunner:
             messages: Current chat message history.
             fixed_rule_of_thumb: Optional fixed rule-of-thumb string
                 used for group E post-exam prompts.
+            group_e_teaching_examples_seen: Number of teaching examples
+                completed before the post exam. Used for context
+                compaction diagnostics in group E.
 
         Returns:
             Tuple containing:
@@ -389,6 +395,27 @@ class TrialRunner:
             group=participant.group,
             phase=phase,
         )
+        effective_fixed_rule_of_thumb = fixed_rule_of_thumb
+        context_policy: str | None = None
+        context_window_examples: int | None = None
+        context_examples_retained: int | None = None
+        context_examples_dropped: int | None = None
+        rule_chars: int | None = None
+
+        if phase is Phase.POST and participant.group is Group.E:
+            context_mode = self.config.group_e_post_exam_context_mode
+            effective_fixed_rule_of_thumb = self._compact_group_e_rule_of_thumb(
+                fixed_rule_of_thumb=fixed_rule_of_thumb,
+            )
+            rule_chars = len(effective_fixed_rule_of_thumb)
+            if context_mode == "rule_only":
+                context_policy = "group_e_post_exam_rule_only"
+                context_window_examples = 0
+                context_examples_retained = 0
+                context_examples_dropped = max(0, group_e_teaching_examples_seen)
+            else:
+                context_policy = f"group_e_post_exam_{context_mode}"
+
         self._log_event(
             event="phase.exam.start",
             level=logging.INFO,
@@ -398,6 +425,11 @@ class TrialRunner:
             exam_set_id=exam_set_id,
             items_count=len(item_paths),
             modality=modality_shown,
+            context_policy=context_policy,
+            context_window_examples=context_window_examples,
+            context_examples_retained=context_examples_retained,
+            context_examples_dropped=context_examples_dropped,
+            rule_chars=rule_chars,
             status="started",
         )
 
@@ -414,7 +446,8 @@ class TrialRunner:
                 group=participant.group,
                 phase=phase,
                 exam_items=item_paths,
-                fixed_rule_of_thumb=fixed_rule_of_thumb,
+                fixed_rule_of_thumb=effective_fixed_rule_of_thumb,
+                group_e_post_exam_tie_breaker=self.config.group_e_post_exam_tie_breaker,
             )
             if returned_modality != modality_shown:
                 logger.warning(
@@ -443,6 +476,11 @@ class TrialRunner:
                     "items_count": len(item_paths),
                     "item_ids": [item.item_id for item, _path in item_paths],
                     "modality": modality_shown,
+                    "context_policy": context_policy,
+                    "context_window_examples": context_window_examples,
+                    "context_examples_retained": context_examples_retained,
+                    "context_examples_dropped": context_examples_dropped,
+                    "rule_chars": rule_chars,
                 },
             )
             messages.append({"role": "assistant", "content": model_response.raw_text})
@@ -467,7 +505,10 @@ class TrialRunner:
             for item, _ in item_paths:
                 fallback_response_by_item[item.item_id] = model_response
         else:
-            frozen_messages = list(messages)
+            frozen_messages = self._resolve_post_exam_frozen_messages(
+                participant=participant,
+                prior_messages=messages,
+            )
             batches = self._chunk_exam_items(
                 item_paths=item_paths,
                 chunk_size=self.config.post_exam_batch_size,
@@ -479,7 +520,8 @@ class TrialRunner:
                     group=participant.group,
                     phase=phase,
                     exam_items=batch_item_paths,
-                    fixed_rule_of_thumb=fixed_rule_of_thumb,
+                    fixed_rule_of_thumb=effective_fixed_rule_of_thumb,
+                    group_e_post_exam_tie_breaker=self.config.group_e_post_exam_tie_breaker,
                 )
                 if returned_modality != modality_shown:
                     logger.warning(
@@ -508,6 +550,11 @@ class TrialRunner:
                     batches_total=batch_count,
                     items_count=len(batch_item_paths),
                     item_ids=batch_item_ids,
+                    context_policy=context_policy,
+                    context_window_examples=context_window_examples,
+                    context_examples_retained=context_examples_retained,
+                    context_examples_dropped=context_examples_dropped,
+                    rule_chars=rule_chars,
                     status="started",
                 )
 
@@ -527,6 +574,11 @@ class TrialRunner:
                         "batches_total": batch_count,
                         "items_count": len(batch_item_paths),
                         "item_ids": batch_item_ids,
+                        "context_policy": context_policy,
+                        "context_window_examples": context_window_examples,
+                        "context_examples_retained": context_examples_retained,
+                        "context_examples_dropped": context_examples_dropped,
+                        "rule_chars": rule_chars,
                     },
                 )
                 batch_messages.append({"role": "assistant", "content": batch_response.raw_text})
@@ -626,6 +678,11 @@ class TrialRunner:
                             ),
                             "items_count": len(missing_item_ids),
                             "item_ids": list(missing_item_ids),
+                            "context_policy": context_policy,
+                            "context_window_examples": context_window_examples,
+                            "context_examples_retained": context_examples_retained,
+                            "context_examples_dropped": context_examples_dropped,
+                            "rule_chars": rule_chars,
                         },
                     )
                     batch_messages.append(
@@ -786,6 +843,120 @@ class TrialRunner:
         for idx in range(0, len(item_paths), chunk_size):
             chunks.append(item_paths[idx : idx + chunk_size])
         return chunks
+
+    def _resolve_post_exam_frozen_messages(
+        self,
+        participant: ParticipantConfig,
+        prior_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Resolve the baseline messages used for each post-exam batch.
+
+        Args:
+            participant: Participant configuration.
+            prior_messages: Message history at the end of teaching.
+
+        Returns:
+            List of baseline messages reused for each post-exam batch.
+        """
+        if participant.group is not Group.E:
+            return list(prior_messages)
+
+        if self.config.group_e_post_exam_context_mode == "rule_only":
+            return [exam_system_message()]
+
+        return list(prior_messages)
+
+    def _compact_group_e_rule_of_thumb(
+        self,
+        fixed_rule_of_thumb: str | None,
+    ) -> str:
+        """Compact one group E rule-of-thumb to configured length.
+
+        Args:
+            fixed_rule_of_thumb: Final teaching rule-of-thumb.
+
+        Returns:
+            Compact rule-of-thumb text.
+        """
+        rule_text = (fixed_rule_of_thumb or "").strip()
+        if not rule_text:
+            return ""
+
+        max_chars = self.config.group_e_post_exam_rule_max_chars
+        if len(rule_text) <= max_chars:
+            return rule_text
+
+        compact_rule = rule_text[:max_chars].rstrip()
+        logger.debug(
+            "[trial] compacted group E rule-of-thumb original_chars=%d compact_chars=%d",
+            len(rule_text),
+            len(compact_rule),
+        )
+        return compact_rule
+
+    def _build_group_e_teaching_context_messages(
+        self,
+        base_messages: list[dict[str, Any]],
+        recent_examples: deque[tuple[list[dict[str, Any]], str]],
+        current_rule_of_thumb: str | None,
+        committed_examples_total: int,
+    ) -> tuple[list[dict[str, Any]], int, int]:
+        """Build compact group E teaching context for one example.
+
+        Args:
+            base_messages: Base participant message history.
+            recent_examples: Retained teaching examples with responses.
+            current_rule_of_thumb: Current group E rule-of-thumb.
+            committed_examples_total: Number of examples committed so far.
+
+        Returns:
+            Tuple containing:
+                - compact context messages,
+                - retained example count,
+                - dropped example count.
+        """
+        system_message = base_messages[0] if base_messages else exam_system_message()
+        context_messages: list[dict[str, Any]] = [system_message]
+
+        rule_memory_text = self._build_group_e_teaching_rule_memory_text(
+            current_rule_of_thumb=current_rule_of_thumb,
+        )
+        if rule_memory_text:
+            context_messages.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": rule_memory_text}],
+                },
+            )
+
+        for user_content, raw_response in recent_examples:
+            context_messages.append({"role": "user", "content": user_content})
+            context_messages.append({"role": "assistant", "content": raw_response})
+
+        retained_examples = len(recent_examples)
+        dropped_examples = max(0, committed_examples_total - retained_examples)
+        return context_messages, retained_examples, dropped_examples
+
+    def _build_group_e_teaching_rule_memory_text(
+        self,
+        current_rule_of_thumb: str | None,
+    ) -> str | None:
+        """Build one compact rule-memory message for group E teaching.
+
+        Args:
+            current_rule_of_thumb: Current group E rule-of-thumb.
+
+        Returns:
+            Memory text when a rule exists, otherwise None.
+        """
+        rule_text = (current_rule_of_thumb or "").strip()
+        if not rule_text:
+            return None
+        return (
+            "Memory from earlier teaching examples. "
+            f'Current rule-of-thumb: "{rule_text}". '
+            "Use this memory while processing this next teaching example."
+        )
 
     def _log_exam_prompt_summary(
         self,
@@ -1058,6 +1229,12 @@ class TrialRunner:
 
         rows: list[dict[str, Any]] = []
         current_rule_of_thumb: str | None = None
+        group_e_recent_examples: deque[tuple[list[dict[str, Any]], str]] | None = None
+        group_e_committed_examples_total = 0
+        if participant.group is Group.E:
+            group_e_recent_examples = deque(
+                maxlen=self.config.group_e_teaching_context_window_examples,
+            )
 
         iterator = enumerate(teaching_items, start=1)
         progress = tqdm(
@@ -1079,6 +1256,19 @@ class TrialRunner:
             )
 
             if participant.group is Group.E:
+                if group_e_recent_examples is None:
+                    msg = "Group E teaching context buffer is not initialised."
+                    raise RuntimeError(msg)
+                (
+                    context_messages,
+                    context_examples_retained,
+                    context_examples_dropped,
+                ) = self._build_group_e_teaching_context_messages(
+                    base_messages=messages,
+                    recent_examples=group_e_recent_examples,
+                    current_rule_of_thumb=current_rule_of_thumb,
+                    committed_examples_total=group_e_committed_examples_total,
+                )
                 (
                     model_response,
                     current_rule_of_thumb,
@@ -1088,13 +1278,17 @@ class TrialRunner:
                     item=item,
                     index=idx,
                     total=len(teaching_items),
-                    messages=messages,
+                    context_messages=context_messages,
                     base_user_content=base_user_content,
                     current_rule_of_thumb=current_rule_of_thumb,
                     modality_shown=modality_shown,
+                    context_examples_retained=context_examples_retained,
+                    context_examples_dropped=context_examples_dropped,
                 )
-                messages.append({"role": "user", "content": committed_user_content})
-                messages.append({"role": "assistant", "content": model_response.raw_text})
+                group_e_recent_examples.append(
+                    (committed_user_content, model_response.raw_text),
+                )
+                group_e_committed_examples_total += 1
             else:
                 messages.append({"role": "user", "content": base_user_content})
                 model_response = self.client.call(
@@ -1155,10 +1349,12 @@ class TrialRunner:
         item: ExampleItem,
         index: int,
         total: int,
-        messages: list[dict[str, Any]],
+        context_messages: list[dict[str, Any]],
         base_user_content: list[dict[str, Any]],
         current_rule_of_thumb: str | None,
         modality_shown: str,
+        context_examples_retained: int,
+        context_examples_dropped: int,
     ) -> tuple[ModelResponse, str, list[dict[str, Any]]]:
         """Run one group E teaching item with retain-action retries.
 
@@ -1167,10 +1363,12 @@ class TrialRunner:
             item: Current teaching item.
             index: Example index in the teaching sequence.
             total: Number of teaching examples.
-            messages: Persistent participant chat history.
+            context_messages: Compact context history for this example.
             base_user_content: Standard user content for this example.
             current_rule_of_thumb: Current group E rule-of-thumb before this item.
             modality_shown: Modality label used for logging.
+            context_examples_retained: Number of retained teaching examples.
+            context_examples_dropped: Number of dropped teaching examples.
 
         Returns:
             Tuple with model response, updated rule-of-thumb and committed user content.
@@ -1195,7 +1393,8 @@ class TrialRunner:
                 user_content = list(base_user_content)
                 user_content.append({"type": "text", "text": retry_instruction})
 
-            call_messages = list(messages)
+            rule_chars = len((current_rule_of_thumb or "").strip())
+            call_messages = list(context_messages)
             call_messages.append({"role": "user", "content": user_content})
             model_response = self.client.call(
                 call_messages,
@@ -1212,6 +1411,13 @@ class TrialRunner:
                     "examples_total": total,
                     "example_retry_attempt": attempt,
                     "example_retry_attempts_total": total_attempts,
+                    "context_policy": "group_e_teaching_window",
+                    "context_window_examples": (
+                        self.config.group_e_teaching_context_window_examples
+                    ),
+                    "context_examples_retained": context_examples_retained,
+                    "context_examples_dropped": context_examples_dropped,
+                    "rule_chars": rule_chars,
                 },
             )
             try:
