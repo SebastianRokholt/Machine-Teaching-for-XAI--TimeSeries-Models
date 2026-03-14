@@ -197,7 +197,7 @@ df.head()
 
 
 #### Explanation of variables in the dataset
-The raw dataset contains 1,643,654 measurements divided into 62,422 distinct charging sessions </br>for the Audi E-tron 55 EV. Each charging session was recorded at one of <a href="https://www.eviny.no/">Eviny</a>'s 286 charging stations. </br>
+The raw dataset contains 1,643,654 measurements divided into 62,422 distinct charging sessions </br>for the Audi E-tron 55 EV. </br>
  - **`charging_id`, categorical, static (per session):**  The identifier for the entire charging session. A charging session is a single car, charging once at a single charging station. </br>
   - **`timestamp`, DateTime, piecewise continuous:** The date and time of each measurement (YYYY-mm-dd HH:MM:SS). The time-dependent variables are measured at one minute intervals. </br>
    - **`power`, numerical, piecewise continuous, time-dependent:** The current power output in kW from the charging station to the car. </br>
