@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -320,6 +321,24 @@ class OpenAIChatClient:
         if self.max_completion_tokens is not None:
             kwargs["max_completion_tokens"] = self.max_completion_tokens
 
+        request_diagnostics = self._request_diagnostics(
+            messages=messages,
+            kwargs=kwargs,
+        )
+        try:
+            json.dumps(kwargs, ensure_ascii=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            self._log_model_call_failed(
+                call_context=call_context,
+                error=exc,
+                attempts=1,
+                extra_fields=request_diagnostics,
+            )
+            raise ModelCallRetriesExhaustedError(
+                attempts=1,
+                last_error=exc,
+            ) from exc
+
         estimated_tokens = self._estimate_call_tokens(messages=messages)
 
         for attempt_idx in range(self.retry_attempts + 1):
@@ -353,6 +372,7 @@ class OpenAIChatClient:
                             call_context=call_context,
                             error=exc,
                             attempts=attempt,
+                            extra_fields=request_diagnostics,
                         )
                         raise ModelCallRetriesExhaustedError(
                             attempts=attempt,
@@ -375,6 +395,7 @@ class OpenAIChatClient:
                     call_context=call_context,
                     error=exc,
                     attempts=attempt,
+                    extra_fields=request_diagnostics,
                 )
                 raise
             except (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError, ConflictError) as exc:
@@ -387,6 +408,7 @@ class OpenAIChatClient:
                         call_context=call_context,
                         error=exc,
                         attempts=attempt,
+                        extra_fields=request_diagnostics,
                     )
                     raise ModelCallRetriesExhaustedError(
                         attempts=attempt,
@@ -414,6 +436,7 @@ class OpenAIChatClient:
                     call_context=call_context,
                     error=exc,
                     attempts=attempt,
+                    extra_fields=request_diagnostics,
                 )
                 raise
 
@@ -698,6 +721,86 @@ class OpenAIChatClient:
         has_item_id = "item_id" in text
         return (has_batch_exam and has_guess) or (has_answers and has_guess and has_item_id)
 
+    def _request_diagnostics(
+        self,
+        messages: list[dict[str, Any]],
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build lightweight diagnostics for one request payload.
+
+        Args:
+            messages: Message history sent to the model.
+            kwargs: API call kwargs constructed for the request.
+
+        Returns:
+            Dictionary with request counts and non-finite numeric flag.
+        """
+        text_part_count, image_part_count = self._request_part_counts(messages=messages)
+        return {
+            "request_message_count": len(messages),
+            "request_text_part_count": text_part_count,
+            "request_image_part_count": image_part_count,
+            "request_has_non_finite_numeric": self._has_non_finite_numeric_value(kwargs),
+        }
+
+    def _request_part_counts(self, messages: list[dict[str, Any]]) -> tuple[int, int]:
+        """Count text and image content parts in one request."""
+        text_part_count = 0
+        image_part_count = 0
+        for message in messages:
+            content = message.get("content")
+            text_parts, image_parts = self._content_part_counts(content=content)
+            text_part_count += text_parts
+            image_part_count += image_parts
+        return text_part_count, image_part_count
+
+    def _content_part_counts(self, content: Any) -> tuple[int, int]:
+        """Count text and image parts in one message content payload."""
+        if isinstance(content, str):
+            return (1, 0) if content else (0, 0)
+
+        if isinstance(content, list):
+            text_part_count = 0
+            image_part_count = 0
+            for part in content:
+                if not isinstance(part, dict):
+                    if str(part).strip():
+                        text_part_count += 1
+                    continue
+
+                part_type = part.get("type")
+                if part_type == "text":
+                    text_part_count += 1
+                elif part_type == "image_url":
+                    image_part_count += 1
+                elif str(part).strip():
+                    text_part_count += 1
+            return text_part_count, image_part_count
+
+        if content is None:
+            return 0, 0
+        return 1, 0
+
+    def _has_non_finite_numeric_value(self, value: Any) -> bool:
+        """Check recursively whether payload values contain non-finite numbers."""
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, int):
+            return False
+        if isinstance(value, float):
+            return not math.isfinite(value)
+        if isinstance(value, dict):
+            for nested in value.values():
+                if self._has_non_finite_numeric_value(nested):
+                    return True
+            return False
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                if self._has_non_finite_numeric_value(nested):
+                    return True
+            return False
+        return False
+
     def _estimate_call_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Estimate total tokens for one call before dispatch.
 
@@ -909,12 +1012,15 @@ class OpenAIChatClient:
         call_context: dict[str, Any] | None,
         error: Exception,
         attempts: int,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         """Emit one structured call failure event."""
         if self.event_logger is None:
             return
 
         fields = dict(call_context or {})
+        if extra_fields is not None:
+            fields.update(extra_fields)
         fields.update(
             {
                 "status": "failed",

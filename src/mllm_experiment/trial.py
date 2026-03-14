@@ -8,6 +8,8 @@ import random
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+from openai import APIStatusError
 from tqdm.auto import tqdm
 
 from .data_loading import (
@@ -31,6 +33,7 @@ from .openai_client import (
     ModelResponse,
 )
 from .prompts import (
+    build_group_e_retry_correction_text,
     build_exam_user_content,
     build_teaching_user_content,
     exam_system_message,
@@ -145,7 +148,8 @@ class TrialRunner:
 
         Returns:
             True when the participant completes all phases. False when
-            retries are exhausted or protocol validation fails safely.
+            retries are exhausted, API status errors occur, or protocol
+            validation fails safely.
         """
         participant = self._sample_participant_config(
             rng=rng,
@@ -223,70 +227,81 @@ class TrialRunner:
             )
             return True
         except ModelCallRetriesExhaustedError as exc:
-            summary_row = {
-                "participant_id": participant.participant_id,
-                "group": participant.group.value,
-                "exam_set_pre": participant.exam_set_pre,
-                "exam_set_post": participant.exam_set_post,
-                "accuracy_pre": None,
-                "accuracy_post": None,
-                "delta_accuracy": None,
-                "status": "failed",
-                "error_type": exc.last_error_type,
-                "error_message": str(exc),
-            }
-            log_participant_summaries([summary_row], self.config.output_root)
-            self._log_event(
-                event="participant.failed",
-                level=logging.ERROR,
-                participant_id=participant.participant_id,
-                group=participant.group.value,
-                exam_set_pre=participant.exam_set_pre,
-                exam_set_post=participant.exam_set_post,
-                status="failed",
+            return self._record_participant_failure(
+                participant=participant,
                 error_type=exc.last_error_type,
                 error_message=str(exc),
                 attempts=exc.attempts,
             )
-            logger.error(
-                "[trial] participant failed participant_id=%s group=%s reason=%s",
-                participant.participant_id,
-                participant.group.value,
-                str(exc),
-            )
-            return False
         except GroupEProtocolError as exc:
-            summary_row = {
-                "participant_id": participant.participant_id,
-                "group": participant.group.value,
-                "exam_set_pre": participant.exam_set_pre,
-                "exam_set_post": participant.exam_set_post,
-                "accuracy_pre": None,
-                "accuracy_post": None,
-                "delta_accuracy": None,
-                "status": "failed",
-                "error_type": exc.error_type,
-                "error_message": str(exc),
-            }
-            log_participant_summaries([summary_row], self.config.output_root)
-            self._log_event(
-                event="participant.failed",
-                level=logging.ERROR,
-                participant_id=participant.participant_id,
-                group=participant.group.value,
-                exam_set_pre=participant.exam_set_pre,
-                exam_set_post=participant.exam_set_post,
-                status="failed",
+            return self._record_participant_failure(
+                participant=participant,
                 error_type=exc.error_type,
                 error_message=str(exc),
             )
-            logger.error(
-                "[trial] participant failed participant_id=%s group=%s reason=%s",
-                participant.participant_id,
-                participant.group.value,
-                str(exc),
+        except APIStatusError as exc:
+            return self._record_participant_failure(
+                participant=participant,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
             )
-            return False
+
+    def _record_participant_failure(
+        self,
+        participant: ParticipantConfig,
+        error_type: str,
+        error_message: str,
+        attempts: int | None = None,
+    ) -> bool:
+        """Record one participant failure summary and structured event.
+
+        Args:
+            participant: Participant configuration for the failed trial.
+            error_type: Stable failure type label.
+            error_message: Human-readable failure message.
+            attempts: Optional number of attempts made before failing.
+
+        Returns:
+            False, which indicates participant failure to the caller.
+        """
+        summary_row = {
+            "participant_id": participant.participant_id,
+            "group": participant.group.value,
+            "exam_set_pre": participant.exam_set_pre,
+            "exam_set_post": participant.exam_set_post,
+            "accuracy_pre": None,
+            "accuracy_post": None,
+            "delta_accuracy": None,
+            "status": "failed",
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+        log_participant_summaries([summary_row], self.config.output_root)
+
+        event_fields: dict[str, Any] = {
+            "participant_id": participant.participant_id,
+            "group": participant.group.value,
+            "exam_set_pre": participant.exam_set_pre,
+            "exam_set_post": participant.exam_set_post,
+            "status": "failed",
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+        if attempts is not None:
+            event_fields["attempts"] = attempts
+
+        self._log_event(
+            event="participant.failed",
+            level=logging.ERROR,
+            **event_fields,
+        )
+        logger.error(
+            "[trial] participant failed participant_id=%s group=%s reason=%s",
+            participant.participant_id,
+            participant.group.value,
+            error_message,
+        )
+        return False
 
     def _sample_participant_config(
         self,
@@ -656,7 +671,7 @@ class TrialRunner:
         )
         for idx, item in progress:
             image_path = resolve_teaching_image_path(self.config.teaching_root, item)
-            user_content = build_teaching_user_content(
+            base_user_content = build_teaching_user_content(
                 group=participant.group,
                 item=item,
                 image_path=image_path,
@@ -664,35 +679,41 @@ class TrialRunner:
                 total=len(teaching_items),
                 current_rule_of_thumb=current_rule_of_thumb,
             )
-            messages.append({"role": "user", "content": user_content})
-
-            model_response = self.client.call(
-                messages,
-                verbose=self.verbose,
-                call_context={
-                    "participant_id": participant.participant_id,
-                    "phase": Phase.TEACHING.value,
-                    "group": participant.group.value,
-                    "item_id": item.item_id,
-                    "call_type": "teaching",
-                    "items_count": 1,
-                    "modality": modality_shown,
-                },
-            )
-
-            # append assistant reply to history
-            messages.append({"role": "assistant", "content": model_response.raw_text})
 
             if participant.group is Group.E:
-                current_rule_of_thumb = self._parse_group_e_rule_update(
+                (
+                    model_response,
+                    current_rule_of_thumb,
+                    committed_user_content,
+                ) = self._run_group_e_teaching_item_with_retries(
                     participant=participant,
                     item=item,
                     index=idx,
                     total=len(teaching_items),
+                    messages=messages,
+                    base_user_content=base_user_content,
                     current_rule_of_thumb=current_rule_of_thumb,
-                    model_response=model_response,
                     modality_shown=modality_shown,
                 )
+                messages.append({"role": "user", "content": committed_user_content})
+                messages.append({"role": "assistant", "content": model_response.raw_text})
+            else:
+                messages.append({"role": "user", "content": base_user_content})
+                model_response = self.client.call(
+                    messages,
+                    verbose=self.verbose,
+                    call_context={
+                        "participant_id": participant.participant_id,
+                        "phase": Phase.TEACHING.value,
+                        "group": participant.group.value,
+                        "item_id": item.item_id,
+                        "call_type": "teaching",
+                        "items_count": 1,
+                        "modality": modality_shown,
+                    },
+                )
+                # append assistant reply to history
+                messages.append({"role": "assistant", "content": model_response.raw_text})
 
             row = {
                 "participant_id": participant.participant_id,
@@ -730,6 +751,131 @@ class TrialRunner:
 
         return rows, messages, current_rule_of_thumb
 
+    def _run_group_e_teaching_item_with_retries(
+        self,
+        participant: ParticipantConfig,
+        item: ExampleItem,
+        index: int,
+        total: int,
+        messages: list[dict[str, Any]],
+        base_user_content: list[dict[str, Any]],
+        current_rule_of_thumb: str | None,
+        modality_shown: str,
+    ) -> tuple[ModelResponse, str, list[dict[str, Any]]]:
+        """Run one group E teaching item with retain-action retries.
+
+        Args:
+            participant: Participant configuration.
+            item: Current teaching item.
+            index: Example index in the teaching sequence.
+            total: Number of teaching examples.
+            messages: Persistent participant chat history.
+            base_user_content: Standard user content for this example.
+            current_rule_of_thumb: Current group E rule-of-thumb before this item.
+            modality_shown: Modality label used for logging.
+
+        Returns:
+            Tuple with model response, updated rule-of-thumb and committed user content.
+
+        Raises:
+            GroupEProtocolError: If a non-retryable protocol error occurs or retries
+                for retain-rule mismatch are exhausted.
+        """
+        max_retries = self.config.group_e_retain_retry_attempts
+        total_attempts = max_retries + 1
+        retry_error_message: str | None = None
+
+        for attempt in range(1, total_attempts + 1):
+            if attempt == 1:
+                user_content = base_user_content
+            else:
+                retry_instruction = build_group_e_retry_correction_text(
+                    current_rule_of_thumb=(current_rule_of_thumb or "").strip(),
+                    error_message=retry_error_message
+                    or "Group E 'retain' action must keep rule_of_thumb unchanged.",
+                )
+                user_content = list(base_user_content)
+                user_content.append({"type": "text", "text": retry_instruction})
+
+            call_messages = list(messages)
+            call_messages.append({"role": "user", "content": user_content})
+            model_response = self.client.call(
+                call_messages,
+                verbose=self.verbose,
+                call_context={
+                    "participant_id": participant.participant_id,
+                    "phase": Phase.TEACHING.value,
+                    "group": participant.group.value,
+                    "item_id": item.item_id,
+                    "call_type": "teaching",
+                    "items_count": 1,
+                    "modality": modality_shown,
+                    "example_index": index,
+                    "examples_total": total,
+                    "example_retry_attempt": attempt,
+                    "example_retry_attempts_total": total_attempts,
+                },
+            )
+            try:
+                updated_rule_of_thumb = self._parse_group_e_rule_update(
+                    participant=participant,
+                    item=item,
+                    index=index,
+                    total=total,
+                    current_rule_of_thumb=current_rule_of_thumb,
+                    model_response=model_response,
+                    modality_shown=modality_shown,
+                    example_attempt=attempt,
+                    example_attempts_total=total_attempts,
+                )
+            except GroupEProtocolError as exc:
+                retryable_error = exc.error_type == "retain_rule_changed"
+                retries_remaining = max_retries - attempt + 1
+                if retryable_error and retries_remaining > 0:
+                    retry_error_message = str(exc)
+                    self._log_event(
+                        event="teaching.retry_scheduled",
+                        level=logging.WARNING,
+                        participant_id=participant.participant_id,
+                        phase=Phase.TEACHING.value,
+                        group=participant.group.value,
+                        item_id=item.item_id,
+                        call_type="teaching",
+                        modality=modality_shown,
+                        example_index=index,
+                        examples_total=total,
+                        example_retry_attempt=attempt,
+                        retries_remaining=retries_remaining,
+                        status="retrying",
+                        error_type=exc.error_type,
+                        error_message=str(exc),
+                    )
+                    continue
+                if retryable_error:
+                    self._log_event(
+                        event="teaching.retry_exhausted",
+                        level=logging.ERROR,
+                        participant_id=participant.participant_id,
+                        phase=Phase.TEACHING.value,
+                        group=participant.group.value,
+                        item_id=item.item_id,
+                        call_type="teaching",
+                        modality=modality_shown,
+                        example_index=index,
+                        examples_total=total,
+                        example_retry_attempt=attempt,
+                        retries_configured=max_retries,
+                        status="failed",
+                        error_type=exc.error_type,
+                        error_message=str(exc),
+                    )
+                raise
+
+            return model_response, updated_rule_of_thumb, user_content
+
+        msg = "Group E teaching retry loop reaches an invalid terminal state."
+        raise RuntimeError(msg)
+
     def _parse_group_e_rule_update(
         self,
         participant: ParticipantConfig,
@@ -739,6 +885,8 @@ class TrialRunner:
         current_rule_of_thumb: str | None,
         model_response: ModelResponse,
         modality_shown: str,
+        example_attempt: int = 1,
+        example_attempts_total: int = 1,
     ) -> str:
         """Parse and validate one group E rule-update response."""
         event_context = {
@@ -750,6 +898,8 @@ class TrialRunner:
             "modality": modality_shown,
             "example_index": index,
             "examples_total": total,
+            "example_retry_attempt": example_attempt,
+            "example_retry_attempts_total": example_attempts_total,
         }
 
         obj = self._extract_json_payload(model_response=model_response)
