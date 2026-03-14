@@ -494,6 +494,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--post_exam_batch_size",
+        type=int,
+        default=5,
+        help="Number of post-exam examples per model call batch.",
+    )
+    parser.add_argument(
+        "--post_exam_missing_repair_attempts",
+        type=int,
+        default=2,
+        help=(
+            "Maximum number of follow-up repair attempts per post-exam batch "
+            "when answers are missing."
+        ),
+    )
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=None,
@@ -505,14 +520,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--verbose",  # deprecated, use --log_level DEBUG instead
-        action="store_true",
-        help="Deprecated. Enables verbose logging and basic debugging output.",
-    )
-    parser.add_argument(
         "--log_level",
         type=str,
-        default="INFO",
+        default="ERROR",
         help="Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
     )
     parser.add_argument(
@@ -568,6 +578,8 @@ def main() -> None:
         api_retry_max_delay_seconds=args.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=args.api_retry_jitter_fraction,
         group_e_retain_retry_attempts=args.group_e_retain_retry_attempts,
+        post_exam_batch_size=args.post_exam_batch_size,
+        post_exam_missing_repair_attempts=args.post_exam_missing_repair_attempts,
     )
     events_log_file = args.events_log_file or (config.output_root / "experiment_events.jsonl")
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -638,6 +650,8 @@ def main() -> None:
         "model_name": config.model_name,
         "git_commit_hash": git_commit_hash,
         "group_e_retain_retry_attempts": config.group_e_retain_retry_attempts,
+        "post_exam_batch_size": config.post_exam_batch_size,
+        "post_exam_missing_repair_attempts": config.post_exam_missing_repair_attempts,
     }
     snapshot_path = _write_run_metadata_snapshot(
         output_root=config.output_root,
@@ -668,7 +682,8 @@ def main() -> None:
             "log_level=%s model_name=%s random_seed=%s output_root=%s "
             "logfile_path=%s events_log_file=%s "
             "conditions_requested=%s conditions_effective=%s git_commit_hash=%s "
-            "manifest_path=%s snapshot_path=%s group_e_retain_retry_attempts=%d",
+            "manifest_path=%s snapshot_path=%s group_e_retain_retry_attempts=%d "
+            "post_exam_batch_size=%d post_exam_missing_repair_attempts=%d",
             run_id,
             args.participants,
             args.dry_run,
@@ -684,6 +699,8 @@ def main() -> None:
             manifest_path,
             snapshot_path,
             config.group_e_retain_retry_attempts,
+            config.post_exam_batch_size,
+            config.post_exam_missing_repair_attempts,
         )
 
     client = OpenAIChatClient(
@@ -741,6 +758,8 @@ def main() -> None:
         api_retry_max_delay_seconds=config.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=config.api_retry_jitter_fraction,
         group_e_retain_retry_attempts=config.group_e_retain_retry_attempts,
+        post_exam_batch_size=config.post_exam_batch_size,
+        post_exam_missing_repair_attempts=config.post_exam_missing_repair_attempts,
     )
     event_logger.log(
         logger=logger,

@@ -27,6 +27,9 @@ class ExperimentConfig:
         model_name: Name of the OpenAI model to use.
         pre_exam_items: Number of pre-teaching exam items per trial.
         post_exam_items: Number of post-teaching exam items per trial.
+        post_exam_batch_size: Number of post-exam items per model call batch.
+        post_exam_missing_repair_attempts: Number of follow-up repair attempts
+            per post-exam batch when answers are missing.
         teaching_items: Number of teaching items per trial.
         random_seed: Base random seed used for reproducibility. Default is
             None so that repeated runs can append additional participants.
@@ -53,6 +56,8 @@ class ExperimentConfig:
     model_name: str = "gpt-5-mini"
     pre_exam_items: int = 30
     post_exam_items: int = 30
+    post_exam_batch_size: int = 5
+    post_exam_missing_repair_attempts: int = 2
     teaching_items: int = 60
     random_seed: int | None = None
     parallel_participants: int = 2
@@ -107,6 +112,12 @@ class ExperimentConfig:
             raise ValueError(msg)
         if self.group_e_retain_retry_attempts < 0:
             msg = "group_e_retain_retry_attempts must be 0 or greater."
+            raise ValueError(msg)
+        if self.post_exam_batch_size <= 0:
+            msg = "post_exam_batch_size must be greater than 0."
+            raise ValueError(msg)
+        if self.post_exam_missing_repair_attempts < 0:
+            msg = "post_exam_missing_repair_attempts must be 0 or greater."
             raise ValueError(msg)
 
         # Ensures the output directory exists.

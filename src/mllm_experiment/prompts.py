@@ -241,6 +241,34 @@ def build_exam_user_content(
     return content, modality_shown
 
 
+def build_exam_missing_answers_repair_content(
+    missing_item_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Build a repair prompt for unresolved exam item IDs.
+
+    Args:
+        missing_item_ids: Item IDs that still require guesses.
+
+    Returns:
+        Content parts for one follow-up user message.
+    """
+    missing_ids_csv = ", ".join(missing_item_ids)
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "Your previous response does not include valid answers for all required "
+                "item IDs in this batch. Return exactly one JSON object in this shape: "
+                "{'answers': [{'item_id': '<ITEM_ID>', 'guess': '<normal|abnormal>'}, ...]}. "
+                "Include entries only for these missing item IDs: "
+                f"{missing_ids_csv}. "
+                "Do not include already answered IDs. Do not include any text outside JSON."
+            ),
+        },
+    ]
+    return content
+
+
 def build_teaching_user_content(
     group: Group,
     item: ExampleItem,

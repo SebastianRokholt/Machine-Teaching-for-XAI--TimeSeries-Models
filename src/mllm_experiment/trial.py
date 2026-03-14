@@ -35,6 +35,7 @@ from .openai_client import (
 from .prompts import (
     build_group_e_retry_correction_text,
     build_exam_user_content,
+    build_exam_missing_answers_repair_content,
     build_teaching_user_content,
     exam_system_message,
 )
@@ -363,8 +364,10 @@ class TrialRunner:
         """
         if phase is Phase.PRE:
             exam_set_id = participant.exam_set_pre
+            item_limit = self.config.pre_exam_items
         else:
             exam_set_id = participant.exam_set_post
+            item_limit = self.config.post_exam_items
 
         items = list(self.exam_by_set[exam_set_id])
 
@@ -373,21 +376,19 @@ class TrialRunner:
 
         # resolve the correct image path for each example given the group
         item_paths: list[tuple[ExampleItem, Any]] = []
-        for item in items[: self.config.pre_exam_items]:
+        for item in items[:item_limit]:
             image_path = resolve_exam_image_path(
-                exam_root=self.config.exam_root, 
-                item=item, 
+                exam_root=self.config.exam_root,
+                item=item,
                 group=participant.group,
-                phase=phase)
+                phase=phase,
+            )
             item_paths.append((item, image_path))
 
-        user_content, modality_shown = build_exam_user_content(
+        modality_shown = self._resolve_exam_modality(
             group=participant.group,
             phase=phase,
-            exam_items=item_paths,
-            fixed_rule_of_thumb=fixed_rule_of_thumb,
         )
-        messages.append({"role": "user", "content": user_content})
         self._log_event(
             event="phase.exam.start",
             level=logging.INFO,
@@ -400,6 +401,403 @@ class TrialRunner:
             status="started",
         )
 
+        allowed_item_ids = {item.item_id for item, _path in item_paths}
+        answer_by_item: dict[str, str] = {}
+        answer_response_by_item: dict[str, ModelResponse] = {}
+        fallback_response_by_item: dict[str, ModelResponse] = {}
+        repair_attempts_used_total = 0
+        repaired_answers_count = 0
+        batch_count = 1
+
+        if phase is Phase.PRE:
+            user_content, returned_modality = build_exam_user_content(
+                group=participant.group,
+                phase=phase,
+                exam_items=item_paths,
+                fixed_rule_of_thumb=fixed_rule_of_thumb,
+            )
+            if returned_modality != modality_shown:
+                logger.warning(
+                    "[trial] resolved modality '%s' differs from prompt modality '%s'",
+                    modality_shown,
+                    returned_modality,
+                )
+            messages.append({"role": "user", "content": user_content})
+            self._log_exam_prompt_summary(
+                participant_id=participant.participant_id,
+                phase=phase,
+                exam_set_id=exam_set_id,
+                user_content=user_content,
+                item_paths=item_paths,
+            )
+
+            model_response: ModelResponse = self.client.call(
+                messages,
+                verbose=self.verbose,
+                call_context={
+                    "participant_id": participant.participant_id,
+                    "phase": phase.value,
+                    "group": participant.group.value,
+                    "exam_set_id": exam_set_id,
+                    "call_type": "exam",
+                    "items_count": len(item_paths),
+                    "item_ids": [item.item_id for item, _path in item_paths],
+                    "modality": modality_shown,
+                },
+            )
+            messages.append({"role": "assistant", "content": model_response.raw_text})
+
+            event_context = {
+                "participant_id": participant.participant_id,
+                "phase": phase.value,
+                "group": participant.group.value,
+                "exam_set_id": exam_set_id,
+                "call_type": "exam",
+                "modality": modality_shown,
+            }
+            parsed_answers = self._parse_exam_answers(
+                model_response=model_response,
+                expected_count=len(item_paths),
+                event_context=event_context,
+                allowed_item_ids=allowed_item_ids,
+            )
+            for item_id, guess in parsed_answers.items():
+                answer_by_item[item_id] = guess
+                answer_response_by_item[item_id] = model_response
+            for item, _ in item_paths:
+                fallback_response_by_item[item.item_id] = model_response
+        else:
+            frozen_messages = list(messages)
+            batches = self._chunk_exam_items(
+                item_paths=item_paths,
+                chunk_size=self.config.post_exam_batch_size,
+            )
+            batch_count = len(batches)
+            for batch_index, batch_item_paths in enumerate(batches, start=1):
+                batch_item_ids = [item.item_id for item, _ in batch_item_paths]
+                batch_user_content, returned_modality = build_exam_user_content(
+                    group=participant.group,
+                    phase=phase,
+                    exam_items=batch_item_paths,
+                    fixed_rule_of_thumb=fixed_rule_of_thumb,
+                )
+                if returned_modality != modality_shown:
+                    logger.warning(
+                        "[trial] resolved modality '%s' differs from prompt modality '%s'",
+                        modality_shown,
+                        returned_modality,
+                    )
+                self._log_exam_prompt_summary(
+                    participant_id=participant.participant_id,
+                    phase=phase,
+                    exam_set_id=exam_set_id,
+                    user_content=batch_user_content,
+                    item_paths=batch_item_paths,
+                    batch_index=batch_index,
+                    batches_total=batch_count,
+                )
+                self._log_event(
+                    event="phase.exam.batch.start",
+                    level=logging.INFO,
+                    participant_id=participant.participant_id,
+                    phase=phase.value,
+                    group=participant.group.value,
+                    exam_set_id=exam_set_id,
+                    modality=modality_shown,
+                    batch_index=batch_index,
+                    batches_total=batch_count,
+                    items_count=len(batch_item_paths),
+                    item_ids=batch_item_ids,
+                    status="started",
+                )
+
+                batch_messages = list(frozen_messages)
+                batch_messages.append({"role": "user", "content": batch_user_content})
+                batch_response = self.client.call(
+                    batch_messages,
+                    verbose=self.verbose,
+                    call_context={
+                        "participant_id": participant.participant_id,
+                        "phase": phase.value,
+                        "group": participant.group.value,
+                        "exam_set_id": exam_set_id,
+                        "call_type": "exam",
+                        "modality": modality_shown,
+                        "batch_index": batch_index,
+                        "batches_total": batch_count,
+                        "items_count": len(batch_item_paths),
+                        "item_ids": batch_item_ids,
+                    },
+                )
+                batch_messages.append({"role": "assistant", "content": batch_response.raw_text})
+                last_batch_response = batch_response
+
+                batch_event_context = {
+                    "participant_id": participant.participant_id,
+                    "phase": phase.value,
+                    "group": participant.group.value,
+                    "exam_set_id": exam_set_id,
+                    "call_type": "exam",
+                    "modality": modality_shown,
+                    "batch_index": batch_index,
+                    "batches_total": batch_count,
+                }
+                batch_answers = self._parse_exam_answers(
+                    model_response=batch_response,
+                    expected_count=len(batch_item_paths),
+                    event_context=batch_event_context,
+                    allowed_item_ids=set(batch_item_ids),
+                )
+                for item_id, guess in batch_answers.items():
+                    answer_by_item[item_id] = guess
+                    answer_response_by_item[item_id] = batch_response
+
+                missing_item_ids = [
+                    item_id for item_id in batch_item_ids if item_id not in batch_answers
+                ]
+                batch_repair_attempts_used = 0
+                batch_recovered_answers = 0
+
+                if missing_item_ids:
+                    self._log_event(
+                        event="exam.repair.scheduled",
+                        level=logging.WARNING,
+                        participant_id=participant.participant_id,
+                        phase=phase.value,
+                        group=participant.group.value,
+                        exam_set_id=exam_set_id,
+                        call_type="exam_repair",
+                        modality=modality_shown,
+                        batch_index=batch_index,
+                        batches_total=batch_count,
+                        missing_item_ids=list(missing_item_ids),
+                        missing_count=len(missing_item_ids),
+                        retries_configured=self.config.post_exam_missing_repair_attempts,
+                        status="scheduled",
+                    )
+
+                for repair_attempt in range(
+                    1,
+                    self.config.post_exam_missing_repair_attempts + 1,
+                ):
+                    if not missing_item_ids:
+                        break
+
+                    batch_repair_attempts_used += 1
+                    repair_attempts_used_total += 1
+                    repair_user_content = build_exam_missing_answers_repair_content(
+                        missing_item_ids=missing_item_ids,
+                    )
+                    batch_messages.append(
+                        {"role": "user", "content": repair_user_content},
+                    )
+                    self._log_event(
+                        event="exam.repair.attempt",
+                        level=logging.INFO,
+                        participant_id=participant.participant_id,
+                        phase=phase.value,
+                        group=participant.group.value,
+                        exam_set_id=exam_set_id,
+                        call_type="exam_repair",
+                        modality=modality_shown,
+                        batch_index=batch_index,
+                        batches_total=batch_count,
+                        repair_attempt=repair_attempt,
+                        repair_attempts_total=self.config.post_exam_missing_repair_attempts,
+                        missing_item_ids=list(missing_item_ids),
+                        missing_count=len(missing_item_ids),
+                        status="started",
+                    )
+                    repair_response = self.client.call(
+                        batch_messages,
+                        verbose=self.verbose,
+                        call_context={
+                            "participant_id": participant.participant_id,
+                            "phase": phase.value,
+                            "group": participant.group.value,
+                            "exam_set_id": exam_set_id,
+                            "call_type": "exam_repair",
+                            "modality": modality_shown,
+                            "batch_index": batch_index,
+                            "batches_total": batch_count,
+                            "repair_attempt": repair_attempt,
+                            "repair_attempts_total": (
+                                self.config.post_exam_missing_repair_attempts
+                            ),
+                            "items_count": len(missing_item_ids),
+                            "item_ids": list(missing_item_ids),
+                        },
+                    )
+                    batch_messages.append(
+                        {"role": "assistant", "content": repair_response.raw_text},
+                    )
+                    last_batch_response = repair_response
+
+                    repair_event_context = {
+                        "participant_id": participant.participant_id,
+                        "phase": phase.value,
+                        "group": participant.group.value,
+                        "exam_set_id": exam_set_id,
+                        "call_type": "exam_repair",
+                        "modality": modality_shown,
+                        "batch_index": batch_index,
+                        "batches_total": batch_count,
+                        "repair_attempt": repair_attempt,
+                        "repair_attempts_total": (
+                            self.config.post_exam_missing_repair_attempts
+                        ),
+                    }
+                    repair_answers = self._parse_exam_answers(
+                        model_response=repair_response,
+                        expected_count=len(missing_item_ids),
+                        event_context=repair_event_context,
+                        allowed_item_ids=set(missing_item_ids),
+                    )
+                    recovered_item_ids = [
+                        item_id
+                        for item_id in repair_answers
+                        if item_id in missing_item_ids
+                    ]
+                    for item_id, guess in repair_answers.items():
+                        answer_by_item[item_id] = guess
+                        answer_response_by_item[item_id] = repair_response
+                        batch_answers[item_id] = guess
+
+                    if recovered_item_ids:
+                        recovered_count = len(recovered_item_ids)
+                        batch_recovered_answers += recovered_count
+                        repaired_answers_count += recovered_count
+
+                    missing_item_ids = [
+                        item_id for item_id in batch_item_ids if item_id not in batch_answers
+                    ]
+                    if not missing_item_ids:
+                        self._log_event(
+                            event="exam.repair.complete",
+                            level=logging.INFO,
+                            participant_id=participant.participant_id,
+                            phase=phase.value,
+                            group=participant.group.value,
+                            exam_set_id=exam_set_id,
+                            call_type="exam_repair",
+                            modality=modality_shown,
+                            batch_index=batch_index,
+                            batches_total=batch_count,
+                            attempts_used=batch_repair_attempts_used,
+                            recovered_answers_count=batch_recovered_answers,
+                            status="completed",
+                        )
+                        break
+
+                if missing_item_ids:
+                    self._log_event(
+                        event="exam.repair.exhausted",
+                        level=logging.ERROR,
+                        participant_id=participant.participant_id,
+                        phase=phase.value,
+                        group=participant.group.value,
+                        exam_set_id=exam_set_id,
+                        call_type="exam_repair",
+                        modality=modality_shown,
+                        batch_index=batch_index,
+                        batches_total=batch_count,
+                        attempts_used=batch_repair_attempts_used,
+                        missing_item_ids=list(missing_item_ids),
+                        missing_count=len(missing_item_ids),
+                        recovered_answers_count=batch_recovered_answers,
+                        status="failed",
+                    )
+
+                for item_id in batch_item_ids:
+                    fallback_response_by_item[item_id] = last_batch_response
+
+                parsed_answers_count = sum(
+                    1 for item_id in batch_item_ids if item_id in batch_answers
+                )
+                self._log_event(
+                    event="phase.exam.batch.complete",
+                    level=logging.INFO,
+                    participant_id=participant.participant_id,
+                    phase=phase.value,
+                    group=participant.group.value,
+                    exam_set_id=exam_set_id,
+                    modality=modality_shown,
+                    batch_index=batch_index,
+                    batches_total=batch_count,
+                    items_count=len(batch_item_ids),
+                    parsed_answers_count=parsed_answers_count,
+                    expected_answers_count=len(batch_item_ids),
+                    repair_attempts_used=batch_repair_attempts_used,
+                    recovered_answers_count=batch_recovered_answers,
+                    status="completed",
+                )
+
+        rows, accuracy = self._build_exam_rows(
+            participant=participant,
+            phase=phase,
+            exam_set_id=exam_set_id,
+            modality_shown=modality_shown,
+            item_paths=item_paths,
+            answer_by_item=answer_by_item,
+            answer_response_by_item=answer_response_by_item,
+            fallback_response_by_item=fallback_response_by_item,
+        )
+
+        self._log_event(
+            event="phase.exam.complete",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            phase=phase.value,
+            group=participant.group.value,
+            exam_set_id=exam_set_id,
+            items_count=len(item_paths),
+            parsed_answers_count=len(answer_by_item),
+            expected_answers_count=len(item_paths),
+            modality=modality_shown,
+            batch_count=batch_count,
+            repair_attempts_used=repair_attempts_used_total,
+            repaired_answers_count=repaired_answers_count,
+            accuracy=round(accuracy, 6),
+            status="completed",
+        )
+
+        return rows, accuracy, messages
+
+    def _resolve_exam_modality(self, group: Group, phase: Phase) -> str:
+        """Resolve exam modality for one group and phase pair."""
+        if phase is Phase.PRE:
+            return "raw_only"
+        if group in (Group.A, Group.B):
+            return "overlay"
+        if group in (Group.D, Group.E):
+            return "simplified_only"
+        if group in (Group.C, Group.F):
+            return "raw_only"
+        msg = f"Unsupported phase/group combination: phase={phase} group={group}"
+        raise ValueError(msg)
+
+    def _chunk_exam_items(
+        self,
+        item_paths: list[tuple[ExampleItem, Any]],
+        chunk_size: int,
+    ) -> list[list[tuple[ExampleItem, Any]]]:
+        """Split exam item paths into fixed-size chunks."""
+        chunks: list[list[tuple[ExampleItem, Any]]] = []
+        for idx in range(0, len(item_paths), chunk_size):
+            chunks.append(item_paths[idx : idx + chunk_size])
+        return chunks
+
+    def _log_exam_prompt_summary(
+        self,
+        participant_id: str,
+        phase: Phase,
+        exam_set_id: str,
+        user_content: list[dict[str, Any]],
+        item_paths: list[tuple[ExampleItem, Any]],
+        batch_index: int | None = None,
+        batches_total: int | None = None,
+    ) -> None:
+        """Log one compact exam prompt summary."""
         text_part_count = sum(
             1
             for content in user_content
@@ -410,57 +808,57 @@ class TrialRunner:
             for content in user_content
             if isinstance(content, dict) and content.get("type") == "image_url"
         )
+        if batch_index is None or batches_total is None:
+            logger.debug(
+                "[trial] exam prompt summary participant_id=%s phase=%s exam_set_id=%s "
+                "items=%d text_parts=%d image_parts=%d item_ids=%s",
+                participant_id,
+                phase.value,
+                exam_set_id,
+                len(item_paths),
+                text_part_count,
+                image_part_count,
+                [item.item_id for item, _path in item_paths[:5]],
+            )
+            return
         logger.debug(
             "[trial] exam prompt summary participant_id=%s phase=%s exam_set_id=%s "
-            "items=%d text_parts=%d image_parts=%d item_ids=%s",
-            participant.participant_id,
+            "batch=%d/%d items=%d text_parts=%d image_parts=%d item_ids=%s",
+            participant_id,
             phase.value,
             exam_set_id,
+            batch_index,
+            batches_total,
             len(item_paths),
             text_part_count,
             image_part_count,
             [item.item_id for item, _path in item_paths[:5]],
         )
 
-        model_response: ModelResponse = self.client.call(
-            messages,
-            verbose=self.verbose,
-            call_context={
-                "participant_id": participant.participant_id,
-                "phase": phase.value,
-                "group": participant.group.value,
-                "exam_set_id": exam_set_id,
-                "call_type": "exam",
-                "items_count": len(item_paths),
-                "item_ids": [item.item_id for item, _path in item_paths],
-                "modality": modality_shown,
-            },
-        )
-
-        # append assistant reply to history
-        messages.append({"role": "assistant", "content": model_response.raw_text})
-
-        event_context = {
-            "participant_id": participant.participant_id,
-            "phase": phase.value,
-            "group": participant.group.value,
-            "exam_set_id": exam_set_id,
-            "call_type": "exam",
-            "modality": modality_shown,
-        }
-        answers = self._parse_exam_answers(
-            model_response=model_response,
-            expected_count=len(item_paths),
-            event_context=event_context,
-        )
+    def _build_exam_rows(
+        self,
+        participant: ParticipantConfig,
+        phase: Phase,
+        exam_set_id: str,
+        modality_shown: str,
+        item_paths: list[tuple[ExampleItem, Any]],
+        answer_by_item: dict[str, str],
+        answer_response_by_item: dict[str, ModelResponse],
+        fallback_response_by_item: dict[str, ModelResponse],
+    ) -> tuple[list[dict[str, Any]], float]:
+        """Build per-item exam rows and compute phase accuracy."""
         rows: list[dict[str, Any]] = []
         correct = 0
 
         for item, _path in item_paths:
-            guess = answers.get(item.item_id)
+            guess = answer_by_item.get(item.item_id)
             is_correct = guess == item.ai_class
             if is_correct:
                 correct += 1
+
+            response = answer_response_by_item.get(item.item_id)
+            if response is None:
+                response = fallback_response_by_item.get(item.item_id)
 
             row = {
                 "participant_id": participant.participant_id,
@@ -474,36 +872,24 @@ class TrialRunner:
                 "modality_shown": modality_shown,
                 "learner_guess": guess,
                 "is_correct": int(is_correct),
-                "response_time_ms": model_response.latency_ms,
-                "prompt_tokens": model_response.prompt_tokens,
-                "completion_tokens": model_response.completion_tokens,
-                "raw_response": model_response.raw_text,
+                "response_time_ms": response.latency_ms if response is not None else None,
+                "prompt_tokens": response.prompt_tokens if response is not None else None,
+                "completion_tokens": (
+                    response.completion_tokens if response is not None else None
+                ),
+                "raw_response": response.raw_text if response is not None else "",
             }
             rows.append(row)
 
         accuracy = correct / len(item_paths) if item_paths else 0.0
-        self._log_event(
-            event="phase.exam.complete",
-            level=logging.INFO,
-            participant_id=participant.participant_id,
-            phase=phase.value,
-            group=participant.group.value,
-            exam_set_id=exam_set_id,
-            items_count=len(item_paths),
-            parsed_answers_count=len(answers),
-            expected_answers_count=len(item_paths),
-            modality=modality_shown,
-            accuracy=round(accuracy, 6),
-            status="completed",
-        )
-
-        return rows, accuracy, messages
+        return rows, accuracy
 
     def _parse_exam_answers(
         self,
         model_response: ModelResponse,
         expected_count: int,
         event_context: dict[str, Any],
+        allowed_item_ids: set[str] | None = None,
     ) -> dict[str, str]:
         """Parse the model's JSON exam answers into a dictionary.
 
@@ -511,6 +897,7 @@ class TrialRunner:
             model_response: ModelResponse returned by the OpenAI client.
             expected_count: Expected number of answers.
             event_context: Context fields used for structured events.
+            allowed_item_ids: Optional item ID whitelist for filtering.
 
         Returns:
             Dictionary mapping item_id to guessed class.
@@ -555,7 +942,18 @@ class TrialRunner:
         for entry in answers_list:
             if not isinstance(entry, dict):
                 continue
-            item_id = str(entry.get("item_id"))
+            raw_item_id = entry.get("item_id")
+            if raw_item_id is None:
+                continue
+            item_id = str(raw_item_id).strip()
+            if not item_id:
+                continue
+            if allowed_item_ids is not None and item_id not in allowed_item_ids:
+                logger.warning(
+                    "[trial] ignoring answer for out-of-scope item_id=%s",
+                    item_id,
+                )
+                continue
             guess = str(entry.get("guess")).lower()
             if guess not in ("normal", "abnormal"):
                 logger.warning("[trial] invalid guess label '%s' for item_id=%s", guess, item_id)
