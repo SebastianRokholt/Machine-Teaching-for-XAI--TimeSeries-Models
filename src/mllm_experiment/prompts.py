@@ -321,3 +321,27 @@ def build_teaching_user_content(
         )
 
     return content
+
+
+def build_group_e_retry_correction_text(
+    current_rule_of_thumb: str,
+    error_message: str,
+) -> str:
+    """Build correction guidance for one group E teaching retry.
+
+    Args:
+        current_rule_of_thumb: Current rule-of-thumb before the retry.
+        error_message: Protocol violation from the previous attempt.
+
+    Returns:
+        Retry instruction text for the next response.
+    """
+    prior_rule = current_rule_of_thumb.strip()
+    return (
+        "Retry this same teaching example. "
+        f'The previous response violates the protocol: "{error_message}". '
+        "If rule_action is 'retain', the returned 'rule_of_thumb' must match "
+        "the current rule-of-thumb exactly. "
+        f'The current rule-of-thumb is: "{prior_rule}". '
+        "Respond again with exactly one JSON object and no other text."
+    )

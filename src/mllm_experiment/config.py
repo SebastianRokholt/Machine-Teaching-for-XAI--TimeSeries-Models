@@ -42,15 +42,18 @@ class ExperimentConfig:
         api_retry_base_delay_seconds: Base delay for exponential backoff.
         api_retry_max_delay_seconds: Maximum delay for exponential backoff.
         api_retry_jitter_fraction: Fractional jitter added to backoff.
+        group_e_retain_retry_attempts: Number of retries for one group E
+            teaching example when the response uses retain but changes the
+            rule-of-thumb.
     """
     teaching_root: Path
     exam_root: Path
     metadata_root: Path
     output_root: Path
     model_name: str = "gpt-5-mini"
-    pre_exam_items: int = 20
-    post_exam_items: int = 20
-    teaching_items: int = 50
+    pre_exam_items: int = 30
+    post_exam_items: int = 30
+    teaching_items: int = 60
     random_seed: int | None = None
     parallel_participants: int = 2
     max_requests_per_minute: int = 500
@@ -61,6 +64,7 @@ class ExperimentConfig:
     api_retry_base_delay_seconds: float = 2.0
     api_retry_max_delay_seconds: float = 120.0
     api_retry_jitter_fraction: float = 0.2
+    group_e_retain_retry_attempts: int = 4
     logfile_path: Path | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
@@ -100,6 +104,9 @@ class ExperimentConfig:
             raise ValueError(msg)
         if self.api_retry_jitter_fraction < 0:
             msg = "api_retry_jitter_fraction must be 0 or greater."
+            raise ValueError(msg)
+        if self.group_e_retain_retry_attempts < 0:
+            msg = "group_e_retain_retry_attempts must be 0 or greater."
             raise ValueError(msg)
 
         # Ensures the output directory exists.

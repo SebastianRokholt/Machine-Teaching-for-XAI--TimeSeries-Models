@@ -485,6 +485,15 @@ def parse_args() -> argparse.Namespace:
         help="Fractional jitter applied to retry delay.",
     )
     parser.add_argument(
+        "--group_e_retain_retry_attempts",
+        type=int,
+        default=4,
+        help=(
+            "Number of retries for one group E teaching example when retain "
+            "changes the rule-of-thumb."
+        ),
+    )
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=None,
@@ -558,6 +567,7 @@ def main() -> None:
         api_retry_base_delay_seconds=args.api_retry_base_delay_seconds,
         api_retry_max_delay_seconds=args.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=args.api_retry_jitter_fraction,
+        group_e_retain_retry_attempts=args.group_e_retain_retry_attempts,
     )
     events_log_file = args.events_log_file or (config.output_root / "experiment_events.jsonl")
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -627,6 +637,7 @@ def main() -> None:
         "participant_seed_sequence": participant_seed_sequence,
         "model_name": config.model_name,
         "git_commit_hash": git_commit_hash,
+        "group_e_retain_retry_attempts": config.group_e_retain_retry_attempts,
     }
     snapshot_path = _write_run_metadata_snapshot(
         output_root=config.output_root,
@@ -657,7 +668,7 @@ def main() -> None:
             "log_level=%s model_name=%s random_seed=%s output_root=%s "
             "logfile_path=%s events_log_file=%s "
             "conditions_requested=%s conditions_effective=%s git_commit_hash=%s "
-            "manifest_path=%s snapshot_path=%s",
+            "manifest_path=%s snapshot_path=%s group_e_retain_retry_attempts=%d",
             run_id,
             args.participants,
             args.dry_run,
@@ -672,6 +683,7 @@ def main() -> None:
             git_commit_hash,
             manifest_path,
             snapshot_path,
+            config.group_e_retain_retry_attempts,
         )
 
     client = OpenAIChatClient(
@@ -728,6 +740,7 @@ def main() -> None:
         api_retry_base_delay_seconds=config.api_retry_base_delay_seconds,
         api_retry_max_delay_seconds=config.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=config.api_retry_jitter_fraction,
+        group_e_retain_retry_attempts=config.group_e_retain_retry_attempts,
     )
     event_logger.log(
         logger=logger,
