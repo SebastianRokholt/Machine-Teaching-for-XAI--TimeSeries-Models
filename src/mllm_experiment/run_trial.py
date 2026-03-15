@@ -485,15 +485,6 @@ def parse_args() -> argparse.Namespace:
         help="Fractional jitter applied to retry delay.",
     )
     parser.add_argument(
-        "--group_e_retain_retry_attempts",
-        type=int,
-        default=4,
-        help=(
-            "Number of retries for one group E teaching example when retain "
-            "changes the rule-of-thumb."
-        ),
-    )
-    parser.add_argument(
         "--group_e_teaching_context_window_examples",
         type=int,
         default=5,
@@ -502,6 +493,7 @@ def parse_args() -> argparse.Namespace:
             "group E context."
         ),
     )
+    # TODO: Expand context mode options and document them here when implemented.
     parser.add_argument(
         "--group_e_post_exam_context_mode",
         type=str,
@@ -520,13 +512,14 @@ def parse_args() -> argparse.Namespace:
             "(1-1000)."
         ),
     )
+    # TODO: Expand tie-breaker options
     parser.add_argument(
         "--group_e_post_exam_tie_breaker",
         type=str,
-        default="teaching_majority_label",
+        default="closest_matching_pattern",
         help=(
             "Group E tie-break strategy in the post-exam prompt. "
-            "Supported values: teaching_majority_label."
+            "Supported values: closest_matching_pattern."
         ),
     )
     parser.add_argument(
@@ -618,7 +611,6 @@ def main() -> None:
         api_retry_base_delay_seconds=args.api_retry_base_delay_seconds,
         api_retry_max_delay_seconds=args.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=args.api_retry_jitter_fraction,
-        group_e_retain_retry_attempts=args.group_e_retain_retry_attempts,
         group_e_teaching_context_window_examples=(
             args.group_e_teaching_context_window_examples
         ),
@@ -696,7 +688,6 @@ def main() -> None:
         "participant_seed_sequence": participant_seed_sequence,
         "model_name": config.model_name,
         "git_commit_hash": git_commit_hash,
-        "group_e_retain_retry_attempts": config.group_e_retain_retry_attempts,
         "group_e_teaching_context_window_examples": (
             config.group_e_teaching_context_window_examples
         ),
@@ -735,8 +726,7 @@ def main() -> None:
             "log_level=%s model_name=%s random_seed=%s output_root=%s "
             "logfile_path=%s events_log_file=%s "
             "conditions_requested=%s conditions_effective=%s git_commit_hash=%s "
-            "manifest_path=%s snapshot_path=%s group_e_retain_retry_attempts=%d "
-            "group_e_teaching_context_window_examples=%d "
+            "manifest_path=%s snapshot_path=%s group_e_teaching_context_window_examples=%d "
             "group_e_post_exam_context_mode=%s "
             "group_e_post_exam_rule_max_chars=%d "
             "group_e_post_exam_tie_breaker=%s "
@@ -755,7 +745,6 @@ def main() -> None:
             git_commit_hash,
             manifest_path,
             snapshot_path,
-            config.group_e_retain_retry_attempts,
             config.group_e_teaching_context_window_examples,
             config.group_e_post_exam_context_mode,
             config.group_e_post_exam_rule_max_chars,
@@ -818,7 +807,6 @@ def main() -> None:
         api_retry_base_delay_seconds=config.api_retry_base_delay_seconds,
         api_retry_max_delay_seconds=config.api_retry_max_delay_seconds,
         api_retry_jitter_fraction=config.api_retry_jitter_fraction,
-        group_e_retain_retry_attempts=config.group_e_retain_retry_attempts,
         group_e_teaching_context_window_examples=(
             config.group_e_teaching_context_window_examples
         ),

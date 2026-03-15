@@ -77,11 +77,10 @@ TEACHING_INTRO = (
     "specific charging sessions. For each example you will see one charging-chart "
     "image together with the AI's classification ('normal' or 'abnormal'). Study "
     "the relationship between the power curve(s) and the SOC curve carefully and "
-    "update your internal rule for how the AI seems to decide. After you have "
-    "looked at the image and read the label, respond with a JSON object of the "
-    "form {'acknowledged': true} and nothing else if you saw and understood the "
-    "image. If the image is missing, unreadable, or otherwise not understandable, "
-    "respond with {'acknowledged': false} instead."
+    "update your internal rule for how the AI seems to decide. Most examples require "
+    "an acknowledgement response. Every tenth example requires a structured checkpoint "
+    "JSON summary with normal cues, abnormal cues, exceptions, confidence and a "
+    "rule-of-thumb."
 )
 
 TEACHING_INTRO_SIMPLIFIED_ONLY = (
@@ -90,10 +89,9 @@ TEACHING_INTRO_SIMPLIFIED_ONLY = (
     "image together with the AI's classification ('normal' or 'abnormal'). The chart "
     "shows only simplified power and SOC. Study the relationship between the "
     "simplified power curve and the SOC curve carefully and update your internal rule "
-    "for how the AI seems to decide. After you have looked at the image and read the "
-    "label, respond with a JSON object of the form {'acknowledged': true} and nothing "
-    "else if you saw and understood the image. If the image is missing, unreadable, or "
-    "otherwise not understandable, respond with {'acknowledged': false} instead."
+    "for how the AI seems to decide. Most examples require an acknowledgement response. "
+    "Every tenth example requires a structured checkpoint JSON summary with normal cues, "
+    "abnormal cues, exceptions, confidence and a rule-of-thumb."
 )
 
 TEACHING_INTRO_RULE_UPDATE = (
@@ -101,24 +99,27 @@ TEACHING_INTRO_RULE_UPDATE = (
     "specific charging sessions. For each example you will see one charging-chart "
     "image together with the AI's classification ('normal' or 'abnormal'). The chart "
     "shows only simplified power and SOC. After each example, respond with a single "
-    "JSON object that includes exactly three keys: "
+    "JSON object that includes exactly five keys: "
     "{'description_sentence': '<one sentence>', 'rule_action': '<write|retain|rephrase>', "
+    "'normal_cues': ['<cue>', '...'], 'abnormal_cues': ['<cue>', '...'], "
     "'rule_of_thumb': '<current rule>'}. The first example must use "
-    "'rule_action': 'write' to establish an initial rule."
+    "'rule_action': 'write' to establish an initial rule. Keep both cue arrays "
+    "non-empty. If one side has no clear cue, include a placeholder cue string instead "
+    "of leaving that array empty."
 )
 
 POST_EXAM_RULE_CARRYOVER_TEMPLATE = (
-    "You finished the teaching phase with this rule-of-thumb: \"{rule}\". "
-    "Do not update, rewrite, refine, or shorten this rule during the exam. "
-    "Use this fixed rule-of-thumb to label every example in the batch."
+    "You finished the teaching phase with this locked rule snapshot: \"{rule}\". "
+    "Do not update, rewrite, refine, or shorten this locked rule during the exam. "
+    "Use this fixed rule to label every example in the batch."
 )
 
 GROUP_E_POST_EXAM_TIE_BREAKER_TEXT = {
-    "teaching_majority_label": (
+    "closest_matching_pattern": (
         "If the fixed rule is ambiguous for one item, use this tie-break rule. "
-        "Choose the label that appears most consistent with the dominant pattern in the "
-        "teaching examples that shaped your fixed rule. Keep this tie-break behaviour "
-        "consistent for all ambiguous items in the batch."
+        "Choose the label whose locked cue pattern is the closest match to the current "
+        "example. Keep this tie-break behaviour consistent for all ambiguous items in "
+        "the batch."
     ),
 }
 
@@ -154,7 +155,7 @@ def build_exam_user_content(
     phase: Phase,
     exam_items: list[tuple[ExampleItem, Path]],
     fixed_rule_of_thumb: str | None = None,
-    group_e_post_exam_tie_breaker: str = "teaching_majority_label",
+    group_e_post_exam_tie_breaker: str = "closest_matching_pattern",
 ) -> tuple[list[dict[str, Any]], str]:
     """Build multimodal user content for a pre- or post-teaching exam.
 
@@ -166,8 +167,8 @@ def build_exam_user_content(
         group: Participant group (A, B, C, D, E or F).
         phase: Experimental phase (PRE or POST).
         exam_items: List of (ExampleItem, image_path) pairs.
-        fixed_rule_of_thumb: Optional fixed rule-of-thumb for group E
-            in the post-exam phase.
+        fixed_rule_of_thumb: Optional fixed locked rule text for
+            groups A-E in the post-exam phase.
         group_e_post_exam_tie_breaker: Tie-break strategy for group E
             post-exam prompts.
 
@@ -197,23 +198,29 @@ def build_exam_user_content(
 
     content: list[dict[str, Any]] = [{"type": "text", "text": intro}]
 
-    if phase is Phase.POST and group is Group.E:
+    if phase is Phase.POST and group in (Group.A, Group.B, Group.C, Group.D, Group.E):
         rule_text = (fixed_rule_of_thumb or "").strip()
         if not rule_text:
             msg = (
-                "Group E post-exam prompts require a non-empty fixed_rule_of_thumb."
+                "Post-exam prompts for groups A-E require a non-empty fixed_rule_of_thumb."
             )
             raise ValueError(msg)
         carryover_text = POST_EXAM_RULE_CARRYOVER_TEMPLATE.format(rule=rule_text)
-        tie_breaker_text = GROUP_E_POST_EXAM_TIE_BREAKER_TEXT.get(
-            group_e_post_exam_tie_breaker,
-        )
-        if tie_breaker_text is None:
-            msg = (
-                "Group E post-exam prompts require a supported "
-                "group_e_post_exam_tie_breaker value."
+        if group is Group.E:
+            tie_breaker_text = GROUP_E_POST_EXAM_TIE_BREAKER_TEXT.get(
+                group_e_post_exam_tie_breaker,
             )
-            raise ValueError(msg)
+            if tie_breaker_text is None:
+                msg = (
+                    "Group E post-exam prompts require a supported "
+                    "group_e_post_exam_tie_breaker value."
+                )
+                raise ValueError(msg)
+        else:
+            tie_breaker_text = (
+                "If the fixed rule is ambiguous for one item, choose the label "
+                "whose locked cue pattern is the closest match."
+            )
         decision_scaffolding_text = (
             "Use this decision checklist for every item in the batch. "
             "1. Do not rewrite, refine, or shorten the fixed rule. "
@@ -299,6 +306,7 @@ def build_teaching_user_content(
     image_path: Path,
     index: int,
     total: int,
+    teaching_step_type: str = "example",
     current_rule_of_thumb: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build multimodal user content for a single teaching example.
@@ -309,7 +317,9 @@ def build_teaching_user_content(
         image_path: Path to the teaching image.
         index: Position of this example in the teaching sequence (1-based).
         total: Total number of teaching examples in the sequence.
-        current_rule_of_thumb: Current rule-of-thumb state for group E.
+        teaching_step_type: Teaching step type.
+        current_rule_of_thumb: Current rule-of-thumb state for the
+            current group.
 
     Returns:
         List of content parts for the user message.
@@ -341,36 +351,68 @@ def build_teaching_user_content(
     if group is Group.E:
         if index == 1:
             instruction = (
-                "Respond with exactly one JSON object and no other text: "
-                "{"
-                "'description_sentence': '<one sentence description of this example>', "
-                "'rule_action': 'write', "
-                "'rule_of_thumb': '<your initial rule>'"
-                "}."
+                "Respond with exactly one JSON object and no other text. "
+                "Use this copyable template exactly: "
+                "{\"description_sentence\":\"<one sentence description of this example>\","
+                "\"rule_action\":\"write\","
+                "\"normal_cues\":[\"<normal cue>\",\"...\"],"
+                "\"abnormal_cues\":[\"<abnormal cue>\",\"...\"],"
+                "\"rule_of_thumb\":\"<your initial rule>\"}. "
+                "Both cue arrays must be non-empty. If this single example gives no clear "
+                "cue for one side, include a placeholder such as "
+                "\"no_clear_normal_cue_from_this_example\" or "
+                "\"no_clear_abnormal_cue_from_this_example\"."
             )
         else:
             prior_rule = (current_rule_of_thumb or "").strip()
             instruction = (
                 "Your current rule-of-thumb before this example is: "
                 f"\"{prior_rule}\". "
-                "Respond with exactly one JSON object and no other text: "
-                "{"
-                "'description_sentence': '<one sentence description of this example>', "
-                "'rule_action': '<write|retain|rephrase>', "
-                "'rule_of_thumb': '<your updated or retained rule>'"
-                "}."
+                "Respond with exactly one JSON object and no other text. "
+                "Use this copyable template exactly: "
+                "{\"description_sentence\":\"<one sentence description of this example>\","
+                "\"rule_action\":\"<write|retain|rephrase>\","
+                "\"normal_cues\":[\"<normal cue>\",\"...\"],"
+                "\"abnormal_cues\":[\"<abnormal cue>\",\"...\"],"
+                "\"rule_of_thumb\":\"<your updated or retained rule>\"}. "
+                "Both cue arrays must be non-empty. If this single example gives no clear "
+                "cue for one side, include a placeholder such as "
+                "\"no_clear_normal_cue_from_this_example\" or "
+                "\"no_clear_abnormal_cue_from_this_example\"."
             )
         content.append({"type": "text", "text": instruction})
     else:
-        content.append(
-            {
-                "type": "text",
-                "text": (
-                    'Once you have studied this example, respond with {"acknowledged": true} '
-                    "and nothing else."
-                ),
-            }
-        )
+        if teaching_step_type == "checkpoint":
+            prior_rule = (current_rule_of_thumb or "").strip()
+            checkpoint_instruction = (
+                "This example is a checkpoint. Respond with exactly one JSON object and "
+                "no other text. Use this copyable template exactly: "
+                "{\"acknowledged\":true,"
+                "\"normal_cues\":[\"<normal cue>\",\"...\"],"
+                "\"abnormal_cues\":[\"<abnormal cue>\",\"...\"],"
+                "\"exceptions\":[\"<exception cue>\",\"...\"],"
+                "\"confidence\":<float between 0 and 1>,"
+                "\"rule_of_thumb\":\"<current rule>\"}. "
+                "Both cue arrays must be non-empty. If one side has no clear cue yet, "
+                "add a placeholder such as \"no_clear_normal_cue_at_checkpoint\" or "
+                "\"no_clear_abnormal_cue_at_checkpoint\"."
+            )
+            if prior_rule:
+                checkpoint_instruction += (
+                    " The previous checkpoint rule-of-thumb is: "
+                    f"\"{prior_rule}\"."
+                )
+            content.append({"type": "text", "text": checkpoint_instruction})
+        else:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        'Once you have studied this example, respond with {"acknowledged": true} '
+                        "and nothing else."
+                    ),
+                }
+            )
 
     return content
 
@@ -393,7 +435,108 @@ def build_group_e_retry_correction_text(
         "Retry this same teaching example. "
         f'The previous response violates the protocol: "{error_message}". '
         "If rule_action is 'retain', the returned 'rule_of_thumb' must match "
-        "the current rule-of-thumb exactly. "
+        "the current rule-of-thumb exactly. Keep non-empty normal_cues and "
+        "abnormal_cues arrays in the JSON. If one side has no clear cue in this "
+        "single example, include a placeholder cue string instead of leaving the "
+        "array empty. Use this template exactly: "
+        "{\"description_sentence\":\"<one sentence>\","
+        "\"rule_action\":\"<write|retain|rephrase>\","
+        "\"normal_cues\":[\"<normal cue or placeholder>\",\"...\"],"
+        "\"abnormal_cues\":[\"<abnormal cue or placeholder>\",\"...\"],"
+        "\"rule_of_thumb\":\"<rule>\"}. "
         f'The current rule-of-thumb is: "{prior_rule}". '
         "Respond again with exactly one JSON object and no other text."
+    )
+
+
+def build_checkpoint_retry_correction_text(error_message: str) -> str:
+    """Build correction guidance for one non-E teaching checkpoint retry.
+
+    Args:
+        error_message: Protocol violation from the previous attempt.
+
+    Returns:
+        Retry instruction text for the next response.
+    """
+    return (
+        "Retry this same teaching checkpoint example. "
+        f'The previous response violates the protocol: "{error_message}". '
+        "Respond again with exactly one JSON object and no other text. "
+        "Use this template exactly: "
+        "{\"acknowledged\":true,"
+        "\"normal_cues\":[\"<normal cue or placeholder>\",\"...\"],"
+        "\"abnormal_cues\":[\"<abnormal cue or placeholder>\",\"...\"],"
+        "\"exceptions\":[\"<exception cue>\",\"...\"],"
+        "\"confidence\":<float between 0 and 1>,"
+        "\"rule_of_thumb\":\"<current rule>\"}. "
+        "Both cue arrays must be non-empty. If one side has no clear cue, include "
+        "a placeholder cue string."
+    )
+
+
+def build_rule_lock_user_content(
+    group: Group,
+    teaching_examples_seen: int,
+    current_rule_of_thumb: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build user content for the final locked-rule snapshot.
+
+    Args:
+        group: Participant group (A-E).
+        teaching_examples_seen: Number of teaching examples shown.
+        current_rule_of_thumb: Optional current rule-of-thumb before lock.
+
+    Returns:
+        List of content parts for the user message.
+    """
+    prior_rule = (current_rule_of_thumb or "").strip()
+    group_text = (
+        "overlay charts (raw, simplified and SOC)"
+        if group in (Group.A, Group.B)
+        else (
+            "raw-only charts"
+            if group is Group.C
+            else "simplified-only charts"
+        )
+    )
+    base_text = (
+        "Teaching phase is complete. You have now seen "
+        f"{teaching_examples_seen} labelled examples using {group_text}. "
+        "Create one final locked rule snapshot that will be reused unchanged during the "
+        "post-exam. This lock is strict, so do not leave out any required keys."
+    )
+    if prior_rule:
+        base_text += f' Current rule-of-thumb before lock: "{prior_rule}".'
+
+    schema_text = (
+        "Respond with exactly one JSON object and no other text: "
+        "{"
+        "'locked_rule_of_thumb': '<final fixed rule>', "
+        "'normal_cues': ['<normal cue>', '...'], "
+        "'abnormal_cues': ['<abnormal cue>', '...'], "
+        "'exceptions': ['<exception cue>', '...'], "
+        "'confidence': <float between 0 and 1>"
+        "}."
+    )
+    return [
+        {"type": "text", "text": base_text},
+        {"type": "text", "text": schema_text},
+    ]
+
+
+def build_rule_lock_retry_correction_text(error_message: str) -> str:
+    """Build correction guidance for one final rule-lock retry.
+
+    Args:
+        error_message: Protocol violation from the previous attempt.
+
+    Returns:
+        Retry instruction text for the next response.
+    """
+    return (
+        "Retry the final rule-lock response. "
+        f'The previous response violates the protocol: "{error_message}". '
+        "Respond again with exactly one JSON object with the required keys "
+        "locked_rule_of_thumb, normal_cues, abnormal_cues, exceptions and confidence, "
+        "and no other text."
     )

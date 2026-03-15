@@ -34,15 +34,24 @@ from .openai_client import (
     ModelResponse,
 )
 from .prompts import (
+    build_checkpoint_retry_correction_text,
     build_group_e_retry_correction_text,
     build_exam_user_content,
     build_exam_missing_answers_repair_content,
+    build_rule_lock_retry_correction_text,
+    build_rule_lock_user_content,
     build_teaching_user_content,
     exam_system_message,
 )
 from .config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
+TEACHING_CHECKPOINT_INTERVAL = 10
+STRICT_PROTOCOL_RETRY_ATTEMPTS = 2
+GROUP_E_NORMAL_CUE_PLACEHOLDER = "No explicit normal cue is provided in this response."
+GROUP_E_ABNORMAL_CUE_PLACEHOLDER = "No explicit abnormal cue is provided in this response."
+CHECKPOINT_NORMAL_CUE_PLACEHOLDER = "No explicit normal cue is provided in this checkpoint response."
+CHECKPOINT_ABNORMAL_CUE_PLACEHOLDER = "No explicit abnormal cue is provided in this checkpoint response."
 
 
 @dataclass(slots=True)
@@ -198,7 +207,7 @@ class TrialRunner:
                 phase=Phase.POST,
                 messages=messages,
                 fixed_rule_of_thumb=final_rule_of_thumb,
-                group_e_teaching_examples_seen=len(teaching_rows),
+                teaching_examples_seen=len(teaching_rows),
             )
             log_exam_results(post_rows, self.config.output_root)
 
@@ -347,7 +356,7 @@ class TrialRunner:
         phase: Phase,
         messages: list[dict[str, Any]],
         fixed_rule_of_thumb: str | None = None,
-        group_e_teaching_examples_seen: int = 0,
+        teaching_examples_seen: int = 0,
     ) -> tuple[list[dict[str, Any]], float, list[dict[str, Any]]]:
         """Run either the pre- or post-teaching exam phase.
 
@@ -357,10 +366,10 @@ class TrialRunner:
             phase: Phase.PRE or Phase.POST.
             messages: Current chat message history.
             fixed_rule_of_thumb: Optional fixed rule-of-thumb string
-                used for group E post-exam prompts.
-            group_e_teaching_examples_seen: Number of teaching examples
+                used for groups A-E post-exam prompts.
+            teaching_examples_seen: Number of teaching examples
                 completed before the post exam. Used for context
-                compaction diagnostics in group E.
+                compaction diagnostics.
 
         Returns:
             Tuple containing:
@@ -402,19 +411,25 @@ class TrialRunner:
         context_examples_dropped: int | None = None
         rule_chars: int | None = None
 
-        if phase is Phase.POST and participant.group is Group.E:
+        if phase is Phase.POST and participant.group in (
+            Group.A,
+            Group.B,
+            Group.C,
+            Group.D,
+            Group.E,
+        ):
             context_mode = self.config.group_e_post_exam_context_mode
             effective_fixed_rule_of_thumb = self._compact_group_e_rule_of_thumb(
                 fixed_rule_of_thumb=fixed_rule_of_thumb,
             )
             rule_chars = len(effective_fixed_rule_of_thumb)
             if context_mode == "rule_only":
-                context_policy = "group_e_post_exam_rule_only"
+                context_policy = "post_exam_rule_only"
                 context_window_examples = 0
                 context_examples_retained = 0
-                context_examples_dropped = max(0, group_e_teaching_examples_seen)
+                context_examples_dropped = max(0, teaching_examples_seen)
             else:
-                context_policy = f"group_e_post_exam_{context_mode}"
+                context_policy = f"post_exam_{context_mode}"
 
         self._log_event(
             event="phase.exam.start",
@@ -858,10 +873,7 @@ class TrialRunner:
         Returns:
             List of baseline messages reused for each post-exam batch.
         """
-        if participant.group is not Group.E:
-            return list(prior_messages)
-
-        if self.config.group_e_post_exam_context_mode == "rule_only":
+        if participant.group in (Group.A, Group.B, Group.C, Group.D, Group.E):
             return [exam_system_message()]
 
         return list(prior_messages)
@@ -870,13 +882,13 @@ class TrialRunner:
         self,
         fixed_rule_of_thumb: str | None,
     ) -> str:
-        """Compact one group E rule-of-thumb to configured length.
+        """Compact one fixed rule text to configured length.
 
         Args:
-            fixed_rule_of_thumb: Final teaching rule-of-thumb.
+            fixed_rule_of_thumb: Final teaching rule text.
 
         Returns:
-            Compact rule-of-thumb text.
+            Compact rule text.
         """
         rule_text = (fixed_rule_of_thumb or "").strip()
         if not rule_text:
@@ -888,7 +900,7 @@ class TrialRunner:
 
         compact_rule = rule_text[:max_chars].rstrip()
         logger.debug(
-            "[trial] compacted group E rule-of-thumb original_chars=%d compact_chars=%d",
+            "[trial] compacted post-exam rule original_chars=%d compact_chars=%d",
             len(rule_text),
             len(compact_rule),
         )
@@ -1168,7 +1180,7 @@ class TrialRunner:
             Tuple containing:
                 - list of teaching result rows,
                 - updated message history including all teaching replies.
-                - final rule-of-thumb for group E, otherwise None.
+                - final locked rule-of-thumb for groups A-E, otherwise None.
         """
         if participant.group is Group.F:
             modality_shown = "none"
@@ -1229,6 +1241,7 @@ class TrialRunner:
 
         rows: list[dict[str, Any]] = []
         current_rule_of_thumb: str | None = None
+        latest_checkpoint_rule_of_thumb: str | None = None
         group_e_recent_examples: deque[tuple[list[dict[str, Any]], str]] | None = None
         group_e_committed_examples_total = 0
         if participant.group is Group.E:
@@ -1246,13 +1259,24 @@ class TrialRunner:
         )
         for idx, item in progress:
             image_path = resolve_teaching_image_path(self.config.teaching_root, item)
+            is_checkpoint = (
+                participant.group in (Group.A, Group.B, Group.C, Group.D)
+                and idx % TEACHING_CHECKPOINT_INTERVAL == 0
+            )
+            teaching_step_type = "checkpoint" if is_checkpoint else "example"
+            prior_rule = (
+                current_rule_of_thumb
+                if participant.group is Group.E
+                else latest_checkpoint_rule_of_thumb
+            )
             base_user_content = build_teaching_user_content(
                 group=participant.group,
                 item=item,
                 image_path=image_path,
                 index=idx,
                 total=len(teaching_items),
-                current_rule_of_thumb=current_rule_of_thumb,
+                teaching_step_type=teaching_step_type,
+                current_rule_of_thumb=prior_rule,
             )
 
             if participant.group is Group.E:
@@ -1290,11 +1314,22 @@ class TrialRunner:
                 )
                 group_e_committed_examples_total += 1
             else:
-                messages.append({"role": "user", "content": base_user_content})
-                model_response = self.client.call(
-                    messages,
-                    verbose=self.verbose,
-                    call_context={
+                if is_checkpoint:
+                    model_response, checkpoint_rule_of_thumb = (
+                        self._run_non_e_checkpoint_item_with_retries(
+                            participant=participant,
+                            item=item,
+                            index=idx,
+                            total=len(teaching_items),
+                            messages=messages,
+                            base_user_content=base_user_content,
+                            modality_shown=modality_shown,
+                        )
+                    )
+                    latest_checkpoint_rule_of_thumb = checkpoint_rule_of_thumb
+                else:
+                    messages.append({"role": "user", "content": base_user_content})
+                    call_context = {
                         "participant_id": participant.participant_id,
                         "phase": Phase.TEACHING.value,
                         "group": participant.group.value,
@@ -1302,10 +1337,54 @@ class TrialRunner:
                         "call_type": "teaching",
                         "items_count": 1,
                         "modality": modality_shown,
-                    },
-                )
-                # append assistant reply to history
-                messages.append({"role": "assistant", "content": model_response.raw_text})
+                        "teaching_step_type": teaching_step_type,
+                    }
+                    try:
+                        model_response = self.client.call(
+                            messages,
+                            verbose=self.verbose,
+                            call_context=call_context,
+                        )
+                    except ModelCallRetriesExhaustedError as exc:
+                        if not exc.is_parse_body_bad_request:
+                            raise
+                        model_response = ModelResponse(
+                            raw_text='{"acknowledged": true}',
+                            parsed_json={"acknowledged": True},
+                            latency_ms=0.0,
+                            prompt_tokens=None,
+                            completion_tokens=None,
+                        )
+                        self._log_event(
+                            event="teaching.parse_body_fallback",
+                            level=logging.WARNING,
+                            participant_id=participant.participant_id,
+                            phase=Phase.TEACHING.value,
+                            group=participant.group.value,
+                            item_id=item.item_id,
+                            call_type="teaching",
+                            modality=modality_shown,
+                            teaching_step_type=teaching_step_type,
+                            example_index=idx,
+                            examples_total=len(teaching_items),
+                            status="fallback",
+                            fallback_type="synthetic_acknowledged",
+                            attempts=exc.attempts,
+                            error_type=exc.last_error_type,
+                            error_message=str(exc.last_error),
+                            error_status_code=exc.last_status_code,
+                            error_is_parse_body_bad_request=exc.is_parse_body_bad_request,
+                        )
+                        logger.warning(
+                            "[trial] using synthetic acknowledgement fallback "
+                            "participant_id=%s group=%s item_id=%s attempts=%d",
+                            participant.participant_id,
+                            participant.group.value,
+                            item.item_id,
+                            exc.attempts,
+                        )
+                    # append assistant reply to history
+                    messages.append({"role": "assistant", "content": model_response.raw_text})
 
             row = {
                 "participant_id": participant.participant_id,
@@ -1320,8 +1399,30 @@ class TrialRunner:
                 "prompt_tokens": model_response.prompt_tokens,
                 "completion_tokens": model_response.completion_tokens,
                 "raw_response": model_response.raw_text,
+                "teaching_step_type": teaching_step_type,
             }
             rows.append(row)
+
+        if participant.group is Group.E and not current_rule_of_thumb:
+            msg = "Group E teaching session completes without a valid final rule-of-thumb."
+            raise GroupEProtocolError(
+                error_type="missing_final_rule",
+                message=msg,
+            )
+
+        locked_rule_for_post = self._run_final_rule_lock_with_retries(
+            participant=participant,
+            messages=messages,
+            modality_shown=modality_shown,
+            teaching_examples_seen=len(teaching_items),
+            current_rule_of_thumb=(
+                current_rule_of_thumb
+                if participant.group is Group.E
+                else latest_checkpoint_rule_of_thumb
+            ),
+            group_e_recent_examples=group_e_recent_examples,
+            group_e_committed_examples_total=group_e_committed_examples_total,
+        )
 
         self._log_event(
             event="phase.teaching.complete",
@@ -1331,17 +1432,260 @@ class TrialRunner:
             group=participant.group.value,
             items_count=len(rows),
             modality=modality_shown,
+            rule_chars=len(locked_rule_for_post or ""),
             status="completed",
         )
+        return rows, messages, locked_rule_for_post
 
-        if participant.group is Group.E and not current_rule_of_thumb:
-            msg = "Group E teaching session completes without a valid final rule-of-thumb."
-            raise GroupEProtocolError(
-                error_type="missing_final_rule",
-                message=msg,
+    def _run_non_e_checkpoint_item_with_retries(
+        self,
+        participant: ParticipantConfig,
+        item: ExampleItem,
+        index: int,
+        total: int,
+        messages: list[dict[str, Any]],
+        base_user_content: list[dict[str, Any]],
+        modality_shown: str,
+    ) -> tuple[ModelResponse, str]:
+        """Run one non-E checkpoint item with strict retries."""
+        max_retries = STRICT_PROTOCOL_RETRY_ATTEMPTS
+        total_attempts = max_retries + 1
+        retry_error_message: str | None = None
+
+        for attempt in range(1, total_attempts + 1):
+            if attempt == 1:
+                user_content = base_user_content
+            else:
+                retry_instruction = build_checkpoint_retry_correction_text(
+                    error_message=retry_error_message
+                    or "Checkpoint response violates the required JSON schema.",
+                )
+                user_content = list(base_user_content)
+                user_content.append({"type": "text", "text": retry_instruction})
+
+            messages.append({"role": "user", "content": user_content})
+            model_response = self.client.call(
+                messages,
+                verbose=self.verbose,
+                call_context={
+                    "participant_id": participant.participant_id,
+                    "phase": Phase.TEACHING.value,
+                    "group": participant.group.value,
+                    "item_id": item.item_id,
+                    "call_type": "teaching",
+                    "items_count": 1,
+                    "modality": modality_shown,
+                    "teaching_step_type": "checkpoint",
+                    "example_index": index,
+                    "examples_total": total,
+                    "example_retry_attempt": attempt,
+                    "example_retry_attempts_total": total_attempts,
+                },
             )
+            messages.append({"role": "assistant", "content": model_response.raw_text})
+            try:
+                checkpoint_rule_of_thumb = self._parse_non_e_checkpoint_response(
+                    participant=participant,
+                    item=item,
+                    index=index,
+                    total=total,
+                    model_response=model_response,
+                    modality_shown=modality_shown,
+                    example_attempt=attempt,
+                    example_attempts_total=total_attempts,
+                )
+            except GroupEProtocolError as exc:
+                retries_remaining = max_retries - attempt + 1
+                if retries_remaining > 0:
+                    retry_error_message = str(exc)
+                    self._log_event(
+                        event="teaching.checkpoint.retry_scheduled",
+                        level=logging.WARNING,
+                        participant_id=participant.participant_id,
+                        phase=Phase.TEACHING.value,
+                        group=participant.group.value,
+                        item_id=item.item_id,
+                        call_type="teaching",
+                        modality=modality_shown,
+                        teaching_step_type="checkpoint",
+                        example_index=index,
+                        examples_total=total,
+                        example_retry_attempt=attempt,
+                        retries_remaining=retries_remaining,
+                        status="retrying",
+                        error_type=exc.error_type,
+                        error_message=str(exc),
+                    )
+                    continue
+                self._log_event(
+                    event="teaching.checkpoint.retry_exhausted",
+                    level=logging.ERROR,
+                    participant_id=participant.participant_id,
+                    phase=Phase.TEACHING.value,
+                    group=participant.group.value,
+                    item_id=item.item_id,
+                    call_type="teaching",
+                    modality=modality_shown,
+                    teaching_step_type="checkpoint",
+                    example_index=index,
+                    examples_total=total,
+                    example_retry_attempt=attempt,
+                    retries_configured=max_retries,
+                    status="failed",
+                    error_type=exc.error_type,
+                    error_message=str(exc),
+                )
+                raise
 
-        return rows, messages, current_rule_of_thumb
+            return model_response, checkpoint_rule_of_thumb
+
+        msg = "Checkpoint retry loop reaches an invalid terminal state."
+        raise RuntimeError(msg)
+
+    def _run_final_rule_lock_with_retries(
+        self,
+        participant: ParticipantConfig,
+        messages: list[dict[str, Any]],
+        modality_shown: str,
+        teaching_examples_seen: int,
+        current_rule_of_thumb: str | None,
+        group_e_recent_examples: deque[tuple[list[dict[str, Any]], str]] | None,
+        group_e_committed_examples_total: int,
+    ) -> str:
+        """Run the final locked-rule snapshot with strict retries."""
+        max_retries = STRICT_PROTOCOL_RETRY_ATTEMPTS
+        total_attempts = max_retries + 1
+        retry_error_message: str | None = None
+        context_messages: list[dict[str, Any]]
+        context_examples_retained: int | None = None
+        context_examples_dropped: int | None = None
+
+        if participant.group is Group.E:
+            if group_e_recent_examples is None:
+                msg = "Group E final rule lock requires a context buffer."
+                raise RuntimeError(msg)
+            (
+                context_messages,
+                context_examples_retained,
+                context_examples_dropped,
+            ) = self._build_group_e_teaching_context_messages(
+                base_messages=messages,
+                recent_examples=group_e_recent_examples,
+                current_rule_of_thumb=current_rule_of_thumb,
+                committed_examples_total=group_e_committed_examples_total,
+            )
+        else:
+            context_messages = list(messages)
+
+        self._log_event(
+            event="phase.teaching.rule_lock.start",
+            level=logging.INFO,
+            participant_id=participant.participant_id,
+            phase=Phase.TEACHING.value,
+            group=participant.group.value,
+            call_type="rule_lock",
+            modality=modality_shown,
+            items_count=0,
+            context_examples_retained=context_examples_retained,
+            context_examples_dropped=context_examples_dropped,
+            status="started",
+        )
+
+        for attempt in range(1, total_attempts + 1):
+            user_content = build_rule_lock_user_content(
+                group=participant.group,
+                teaching_examples_seen=teaching_examples_seen,
+                current_rule_of_thumb=current_rule_of_thumb,
+            )
+            if attempt > 1:
+                retry_instruction = build_rule_lock_retry_correction_text(
+                    error_message=retry_error_message
+                    or "Rule-lock response violates the required JSON schema.",
+                )
+                user_content.append({"type": "text", "text": retry_instruction})
+
+            call_messages = list(context_messages)
+            call_messages.append({"role": "user", "content": user_content})
+            model_response = self.client.call(
+                call_messages,
+                verbose=self.verbose,
+                call_context={
+                    "participant_id": participant.participant_id,
+                    "phase": Phase.TEACHING.value,
+                    "group": participant.group.value,
+                    "call_type": "rule_lock",
+                    "items_count": 0,
+                    "modality": modality_shown,
+                    "example_retry_attempt": attempt,
+                    "example_retry_attempts_total": total_attempts,
+                    "context_examples_retained": context_examples_retained,
+                    "context_examples_dropped": context_examples_dropped,
+                },
+            )
+            try:
+                locked_rule_payload = self._parse_locked_rule_snapshot(
+                    participant=participant,
+                    model_response=model_response,
+                    modality_shown=modality_shown,
+                    example_attempt=attempt,
+                    example_attempts_total=total_attempts,
+                )
+            except GroupEProtocolError as exc:
+                retries_remaining = max_retries - attempt + 1
+                if retries_remaining > 0:
+                    retry_error_message = str(exc)
+                    self._log_event(
+                        event="teaching.rule_lock.retry_scheduled",
+                        level=logging.WARNING,
+                        participant_id=participant.participant_id,
+                        phase=Phase.TEACHING.value,
+                        group=participant.group.value,
+                        call_type="rule_lock",
+                        modality=modality_shown,
+                        example_retry_attempt=attempt,
+                        retries_remaining=retries_remaining,
+                        status="retrying",
+                        error_type=exc.error_type,
+                        error_message=str(exc),
+                    )
+                    continue
+                self._log_event(
+                    event="teaching.rule_lock.retry_exhausted",
+                    level=logging.ERROR,
+                    participant_id=participant.participant_id,
+                    phase=Phase.TEACHING.value,
+                    group=participant.group.value,
+                    call_type="rule_lock",
+                    modality=modality_shown,
+                    example_retry_attempt=attempt,
+                    retries_configured=max_retries,
+                    status="failed",
+                    error_type=exc.error_type,
+                    error_message=str(exc),
+                )
+                raise
+
+            locked_rule_text = self._format_locked_rule_for_exam(locked_rule_payload)
+            compact_locked_rule_text = self._compact_group_e_rule_of_thumb(locked_rule_text)
+            self._log_event(
+                event="phase.teaching.rule_lock.complete",
+                level=logging.INFO,
+                participant_id=participant.participant_id,
+                phase=Phase.TEACHING.value,
+                group=participant.group.value,
+                call_type="rule_lock",
+                modality=modality_shown,
+                normal_cues_count=len(locked_rule_payload["normal_cues"]),
+                abnormal_cues_count=len(locked_rule_payload["abnormal_cues"]),
+                exceptions_count=len(locked_rule_payload["exceptions"]),
+                confidence=locked_rule_payload["confidence"],
+                rule_chars=len(compact_locked_rule_text),
+                status="completed",
+            )
+            return compact_locked_rule_text
+
+        msg = "Final rule-lock retry loop reaches an invalid terminal state."
+        raise RuntimeError(msg)
 
     def _run_group_e_teaching_item_with_retries(
         self,
@@ -1377,7 +1721,7 @@ class TrialRunner:
             GroupEProtocolError: If a non-retryable protocol error occurs or retries
                 for retain-rule mismatch are exhausted.
         """
-        max_retries = self.config.group_e_retain_retry_attempts
+        max_retries = STRICT_PROTOCOL_RETRY_ATTEMPTS
         total_attempts = max_retries + 1
         retry_error_message: str | None = None
 
@@ -1407,6 +1751,7 @@ class TrialRunner:
                     "call_type": "teaching",
                     "items_count": 1,
                     "modality": modality_shown,
+                    "teaching_step_type": "example",
                     "example_index": index,
                     "examples_total": total,
                     "example_retry_attempt": attempt,
@@ -1433,9 +1778,8 @@ class TrialRunner:
                     example_attempts_total=total_attempts,
                 )
             except GroupEProtocolError as exc:
-                retryable_error = exc.error_type == "retain_rule_changed"
                 retries_remaining = max_retries - attempt + 1
-                if retryable_error and retries_remaining > 0:
+                if retries_remaining > 0:
                     retry_error_message = str(exc)
                     self._log_event(
                         event="teaching.retry_scheduled",
@@ -1455,24 +1799,23 @@ class TrialRunner:
                         error_message=str(exc),
                     )
                     continue
-                if retryable_error:
-                    self._log_event(
-                        event="teaching.retry_exhausted",
-                        level=logging.ERROR,
-                        participant_id=participant.participant_id,
-                        phase=Phase.TEACHING.value,
-                        group=participant.group.value,
-                        item_id=item.item_id,
-                        call_type="teaching",
-                        modality=modality_shown,
-                        example_index=index,
-                        examples_total=total,
-                        example_retry_attempt=attempt,
-                        retries_configured=max_retries,
-                        status="failed",
-                        error_type=exc.error_type,
-                        error_message=str(exc),
-                    )
+                self._log_event(
+                    event="teaching.retry_exhausted",
+                    level=logging.ERROR,
+                    participant_id=participant.participant_id,
+                    phase=Phase.TEACHING.value,
+                    group=participant.group.value,
+                    item_id=item.item_id,
+                    call_type="teaching",
+                    modality=modality_shown,
+                    example_index=index,
+                    examples_total=total,
+                    example_retry_attempt=attempt,
+                    retries_configured=max_retries,
+                    status="failed",
+                    error_type=exc.error_type,
+                    error_message=str(exc),
+                )
                 raise
 
             return model_response, updated_rule_of_thumb, user_content
@@ -1522,6 +1865,26 @@ class TrialRunner:
         description_sentence = str(obj.get("description_sentence", "")).strip()
         rule_action = str(obj.get("rule_action", "")).strip().lower()
         rule_of_thumb = str(obj.get("rule_of_thumb", "")).strip()
+        normal_cues, normal_cues_autofill = self._parse_text_list_with_autofill(
+            obj=obj,
+            key="normal_cues",
+            fallback_value=GROUP_E_NORMAL_CUE_PLACEHOLDER,
+        )
+        abnormal_cues, abnormal_cues_autofill = self._parse_text_list_with_autofill(
+            obj=obj,
+            key="abnormal_cues",
+            fallback_value=GROUP_E_ABNORMAL_CUE_PLACEHOLDER,
+        )
+        cue_autofill_reasons: dict[str, str] = {}
+        if normal_cues_autofill is not None:
+            cue_autofill_reasons["normal_cues"] = normal_cues_autofill
+        if abnormal_cues_autofill is not None:
+            cue_autofill_reasons["abnormal_cues"] = abnormal_cues_autofill
+        self._log_protocol_autofill(
+            event_context=event_context,
+            autofill_reasons_by_key=cue_autofill_reasons,
+            raw_text=model_response.raw_text,
+        )
 
         if not description_sentence:
             msg = "Group E response is missing a non-empty description_sentence."
@@ -1556,14 +1919,37 @@ class TrialRunner:
             raise GroupEProtocolError("invalid_rule_action", msg)
 
         if not rule_of_thumb:
-            msg = "Group E response is missing a non-empty rule_of_thumb."
+            prior_rule = (current_rule_of_thumb or "").strip()
+            if rule_action == "retain" and prior_rule:
+                rule_of_thumb = prior_rule
+                rule_autofill_source = "retain_prior_rule"
+            else:
+                rule_of_thumb = self._synthesise_rule_of_thumb_from_cues(
+                    normal_cues=normal_cues,
+                    abnormal_cues=abnormal_cues,
+                )
+                rule_autofill_source = "synthesised_from_cues"
+            self._log_event(
+                event="teaching.rule_autofill",
+                level=logging.WARNING,
+                **event_context,
+                status="autofilled",
+                autofill_source=rule_autofill_source,
+                rule_action=rule_action,
+                rule_of_thumb=rule_of_thumb,
+            )
+        if self._contains_disallowed_default_fallback(rule_of_thumb):
+            msg = (
+                "Group E rule_of_thumb must not use default fallback wording such as "
+                "'abnormal otherwise' or 'otherwise abnormal'."
+            )
             self._log_teaching_parse_failure(
                 event_context=event_context,
-                error_type="missing_rule_of_thumb",
+                error_type="disallowed_default_fallback",
                 error_message=msg,
                 raw_text=model_response.raw_text,
             )
-            raise GroupEProtocolError("missing_rule_of_thumb", msg)
+            raise GroupEProtocolError("disallowed_default_fallback", msg)
 
         if index == 1 and rule_action != "write":
             msg = (
@@ -1610,8 +1996,371 @@ class TrialRunner:
             rule_action=rule_action,
             rule_of_thumb=rule_of_thumb,
             description_sentence=description_sentence,
+            normal_cues_count=len(normal_cues),
+            abnormal_cues_count=len(abnormal_cues),
         )
         return rule_of_thumb
+
+    def _parse_non_e_checkpoint_response(
+        self,
+        participant: ParticipantConfig,
+        item: ExampleItem,
+        index: int,
+        total: int,
+        model_response: ModelResponse,
+        modality_shown: str,
+        example_attempt: int = 1,
+        example_attempts_total: int = 1,
+    ) -> str:
+        """Parse and validate one non-E checkpoint response."""
+        event_context = {
+            "participant_id": participant.participant_id,
+            "phase": Phase.TEACHING.value,
+            "group": participant.group.value,
+            "item_id": item.item_id,
+            "call_type": "teaching",
+            "modality": modality_shown,
+            "teaching_step_type": "checkpoint",
+            "example_index": index,
+            "examples_total": total,
+            "example_retry_attempt": example_attempt,
+            "example_retry_attempts_total": example_attempts_total,
+        }
+
+        obj = self._extract_json_payload(model_response=model_response)
+        if not isinstance(obj, dict):
+            msg = "Checkpoint response is not a valid JSON object."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_checkpoint_json",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_checkpoint_json", msg)
+
+        acknowledged = obj.get("acknowledged")
+        if acknowledged is not True:
+            msg = "Checkpoint response requires acknowledged to be true."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_checkpoint_acknowledged",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_checkpoint_acknowledged", msg)
+
+        normal_cues, normal_cues_autofill = self._parse_text_list_with_autofill(
+            obj=obj,
+            key="normal_cues",
+            fallback_value=CHECKPOINT_NORMAL_CUE_PLACEHOLDER,
+        )
+        abnormal_cues, abnormal_cues_autofill = self._parse_text_list_with_autofill(
+            obj=obj,
+            key="abnormal_cues",
+            fallback_value=CHECKPOINT_ABNORMAL_CUE_PLACEHOLDER,
+        )
+        cue_autofill_reasons: dict[str, str] = {}
+        if normal_cues_autofill is not None:
+            cue_autofill_reasons["normal_cues"] = normal_cues_autofill
+        if abnormal_cues_autofill is not None:
+            cue_autofill_reasons["abnormal_cues"] = abnormal_cues_autofill
+        self._log_protocol_autofill(
+            event_context=event_context,
+            autofill_reasons_by_key=cue_autofill_reasons,
+            raw_text=model_response.raw_text,
+        )
+        exceptions = self._parse_text_list(
+            obj=obj,
+            key="exceptions",
+            event_context=event_context,
+            raw_text=model_response.raw_text,
+            error_type="invalid_checkpoint_exceptions",
+            error_message="Checkpoint response requires exceptions as a text list.",
+        )
+        confidence = self._parse_confidence_value(
+            obj=obj,
+            key="confidence",
+            event_context=event_context,
+            raw_text=model_response.raw_text,
+            error_type="invalid_checkpoint_confidence",
+            error_message="Checkpoint response requires confidence between 0 and 1.",
+        )
+        rule_of_thumb = str(obj.get("rule_of_thumb", "")).strip()
+        if not rule_of_thumb:
+            msg = "Checkpoint response is missing a non-empty rule_of_thumb."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="missing_checkpoint_rule_of_thumb",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("missing_checkpoint_rule_of_thumb", msg)
+
+        self._log_event(
+            event="phase.teaching.checkpoint",
+            level=logging.INFO,
+            **event_context,
+            status="completed",
+            normal_cues_count=len(normal_cues),
+            abnormal_cues_count=len(abnormal_cues),
+            exceptions_count=len(exceptions),
+            confidence=confidence,
+            rule_of_thumb=rule_of_thumb,
+        )
+        return rule_of_thumb
+
+    def _parse_locked_rule_snapshot(
+        self,
+        participant: ParticipantConfig,
+        model_response: ModelResponse,
+        modality_shown: str,
+        example_attempt: int = 1,
+        example_attempts_total: int = 1,
+    ) -> dict[str, Any]:
+        """Parse and validate one final locked-rule snapshot response."""
+        event_context = {
+            "participant_id": participant.participant_id,
+            "phase": Phase.TEACHING.value,
+            "group": participant.group.value,
+            "call_type": "rule_lock",
+            "modality": modality_shown,
+            "example_retry_attempt": example_attempt,
+            "example_retry_attempts_total": example_attempts_total,
+        }
+        obj = self._extract_json_payload(model_response=model_response)
+        if not isinstance(obj, dict):
+            msg = "Final rule-lock response is not a valid JSON object."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="invalid_rule_lock_json",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("invalid_rule_lock_json", msg)
+
+        locked_rule_of_thumb = str(obj.get("locked_rule_of_thumb", "")).strip()
+        if not locked_rule_of_thumb:
+            msg = "Final rule-lock response is missing locked_rule_of_thumb."
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="missing_locked_rule_of_thumb",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("missing_locked_rule_of_thumb", msg)
+        if participant.group is Group.E and self._contains_disallowed_default_fallback(
+            locked_rule_of_thumb,
+        ):
+            msg = (
+                "Final group E locked rule must not use default fallback wording such as "
+                "'abnormal otherwise' or 'otherwise abnormal'."
+            )
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type="disallowed_locked_rule_default_fallback",
+                error_message=msg,
+                raw_text=model_response.raw_text,
+            )
+            raise GroupEProtocolError("disallowed_locked_rule_default_fallback", msg)
+
+        normal_cues = self._parse_non_empty_text_list(
+            obj=obj,
+            key="normal_cues",
+            event_context=event_context,
+            raw_text=model_response.raw_text,
+            error_type="missing_locked_normal_cues",
+            error_message="Final rule-lock response is missing non-empty normal_cues.",
+        )
+        abnormal_cues = self._parse_non_empty_text_list(
+            obj=obj,
+            key="abnormal_cues",
+            event_context=event_context,
+            raw_text=model_response.raw_text,
+            error_type="missing_locked_abnormal_cues",
+            error_message="Final rule-lock response is missing non-empty abnormal_cues.",
+        )
+        exceptions = self._parse_text_list(
+            obj=obj,
+            key="exceptions",
+            event_context=event_context,
+            raw_text=model_response.raw_text,
+            error_type="invalid_locked_exceptions",
+            error_message="Final rule-lock response requires exceptions as a text list.",
+        )
+        confidence = self._parse_confidence_value(
+            obj=obj,
+            key="confidence",
+            event_context=event_context,
+            raw_text=model_response.raw_text,
+            error_type="invalid_locked_confidence",
+            error_message="Final rule-lock response requires confidence between 0 and 1.",
+        )
+        return {
+            "locked_rule_of_thumb": locked_rule_of_thumb,
+            "normal_cues": normal_cues,
+            "abnormal_cues": abnormal_cues,
+            "exceptions": exceptions,
+            "confidence": confidence,
+        }
+
+    def _format_locked_rule_for_exam(self, payload: dict[str, Any]) -> str:
+        """Format one locked-rule payload into compact exam carryover text."""
+        locked_rule = str(payload.get("locked_rule_of_thumb", "")).strip()
+        normal_cues = payload.get("normal_cues", [])
+        abnormal_cues = payload.get("abnormal_cues", [])
+        exceptions = payload.get("exceptions", [])
+        confidence = payload.get("confidence")
+        return (
+            f"locked_rule_of_thumb={locked_rule}; "
+            f"normal_cues={normal_cues}; "
+            f"abnormal_cues={abnormal_cues}; "
+            f"exceptions={exceptions}; "
+            f"confidence={confidence}"
+        )
+
+    def _synthesise_rule_of_thumb_from_cues(
+        self,
+        normal_cues: list[str],
+        abnormal_cues: list[str],
+    ) -> str:
+        """Build one fallback rule-of-thumb from parsed cue lists."""
+        normal_text = ", ".join(normal_cues)
+        abnormal_text = ", ".join(abnormal_cues)
+        return f"Normal cues: {normal_text}. Abnormal cues: {abnormal_text}."
+
+    def _log_protocol_autofill(
+        self,
+        event_context: dict[str, Any],
+        autofill_reasons_by_key: dict[str, str],
+        raw_text: str,
+    ) -> None:
+        """Record one structured autofill event for recoverable protocol issues."""
+        if not autofill_reasons_by_key:
+            return
+        self._log_event(
+            event="teaching.protocol_autofill",
+            level=logging.WARNING,
+            **event_context,
+            status="autofilled",
+            autofilled_keys=sorted(autofill_reasons_by_key.keys()),
+            autofill_reasons=autofill_reasons_by_key,
+            response_preview=self._response_preview(raw_text=raw_text),
+            response_length=len(raw_text),
+        )
+
+    def _parse_text_list_with_autofill(
+        self,
+        obj: dict[str, Any],
+        key: str,
+        fallback_value: str,
+    ) -> tuple[list[str], str | None]:
+        """Parse one text list and autofill when the list is missing or empty."""
+        raw_values = obj.get(key)
+        if not isinstance(raw_values, list):
+            return [fallback_value], "missing_or_invalid_list"
+        values: list[str] = []
+        for raw_value in raw_values:
+            text = str(raw_value).strip()
+            if text:
+                values.append(text)
+        if values:
+            return values, None
+        return [fallback_value], "empty_list"
+
+    def _parse_non_empty_text_list(
+        self,
+        obj: dict[str, Any],
+        key: str,
+        event_context: dict[str, Any],
+        raw_text: str,
+        error_type: str,
+        error_message: str,
+    ) -> list[str]:
+        """Parse one required non-empty list of non-empty strings."""
+        values = self._parse_text_list(
+            obj=obj,
+            key=key,
+            event_context=event_context,
+            raw_text=raw_text,
+            error_type=error_type,
+            error_message=error_message,
+        )
+        if not values:
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type=error_type,
+                error_message=error_message,
+                raw_text=raw_text,
+            )
+            raise GroupEProtocolError(error_type, error_message)
+        return values
+
+    def _parse_text_list(
+        self,
+        obj: dict[str, Any],
+        key: str,
+        event_context: dict[str, Any],
+        raw_text: str,
+        error_type: str,
+        error_message: str,
+    ) -> list[str]:
+        """Parse one list of non-empty strings."""
+        raw_values = obj.get(key)
+        if not isinstance(raw_values, list):
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type=error_type,
+                error_message=error_message,
+                raw_text=raw_text,
+            )
+            raise GroupEProtocolError(error_type, error_message)
+        values: list[str] = []
+        for raw_value in raw_values:
+            text = str(raw_value).strip()
+            if text:
+                values.append(text)
+        return values
+
+    def _parse_confidence_value(
+        self,
+        obj: dict[str, Any],
+        key: str,
+        event_context: dict[str, Any],
+        raw_text: str,
+        error_type: str,
+        error_message: str,
+    ) -> float:
+        """Parse one confidence value in the closed interval [0, 1]."""
+        raw_value = obj.get(key)
+        try:
+            confidence = float(raw_value)
+        except (TypeError, ValueError):
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type=error_type,
+                error_message=error_message,
+                raw_text=raw_text,
+            )
+            raise GroupEProtocolError(error_type, error_message) from None
+        if confidence < 0.0 or confidence > 1.0:
+            self._log_teaching_parse_failure(
+                event_context=event_context,
+                error_type=error_type,
+                error_message=error_message,
+                raw_text=raw_text,
+            )
+            raise GroupEProtocolError(error_type, error_message)
+        return confidence
+
+    def _contains_disallowed_default_fallback(self, rule_of_thumb: str) -> bool:
+        """Check whether one rule uses disallowed default fallback wording."""
+        text = rule_of_thumb.lower()
+        return (
+            "abnormal otherwise" in text
+            or "normal otherwise" in text
+            or "otherwise abnormal" in text
+            or "otherwise normal" in text
+        )
 
     def _extract_json_payload(self, model_response: ModelResponse) -> Any | None:
         """Extract JSON payload from a model response."""

@@ -26,6 +26,23 @@ from openai import (
 from .utils import ExperimentEventLogger
 
 logger = logging.getLogger(__name__)
+PARSE_BODY_BAD_REQUEST_HINTS = (
+    "could not parse the json body of your request",
+    "expects a json payload",
+    "what was sent was not valid json",
+)
+RATE_LIMIT_RETRY_WINDOW_SECONDS = 30.0 * 60.0
+RATE_LIMIT_RETRY_MESSAGE_PATTERN = re.compile(
+    r"try again in\s*([0-9]*\.?[0-9]+)\s*(?:s|sec|secs|second|seconds)?",
+    flags=re.IGNORECASE,
+)
+RATE_LIMIT_RESET_HEADER_KEYS = (
+    "x-ratelimit-reset-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-token",
+    "x-ratelimit-reset-request",
+    "x-ratelimit-reset",
+)
 
 
 @dataclass(slots=True)
@@ -54,15 +71,27 @@ class ModelResponse:
 class ModelCallRetriesExhaustedError(RuntimeError):
     """Signal that all API retry attempts are exhausted."""
 
-    def __init__(self, attempts: int, last_error: Exception) -> None:
+    def __init__(
+        self,
+        attempts: int,
+        last_error: Exception,
+        last_status_code: int | None = None,
+        is_parse_body_bad_request: bool = False,
+    ) -> None:
         self.attempts = attempts
         self.last_error = last_error
         self.last_error_type = type(last_error).__name__
+        self.last_status_code = last_status_code
+        self.is_parse_body_bad_request = is_parse_body_bad_request
         message = (
             "OpenAI API retries are exhausted "
             f"after {attempts} attempts. "
             f"Last error type is {self.last_error_type}."
         )
+        if self.last_status_code is not None:
+            message += f" Last status code is {self.last_status_code}."
+        if self.is_parse_body_bad_request:
+            message += " Last error matches parse-body bad request."
         super().__init__(message)
 
 
@@ -96,6 +125,26 @@ class _SharedRateLimiter:
         self._request_timestamps: deque[float] = deque()
         self._token_events: deque[tuple[float, int]] = deque()
         self._provisional_tokens = 0
+        self._cooldown_until = 0.0
+
+    def register_cooldown(self, cooldown_seconds: float) -> float:
+        """Register one shared cooldown window after a rate-limit response.
+
+        Args:
+            cooldown_seconds: Requested cooldown period in seconds.
+
+        Returns:
+            Active cooldown duration from now in seconds.
+        """
+        cooldown_seconds = max(0.0, float(cooldown_seconds))
+        now = time.monotonic()
+        with self._condition:
+            cooldown_deadline = now + cooldown_seconds
+            if cooldown_deadline > self._cooldown_until:
+                self._cooldown_until = cooldown_deadline
+            active_cooldown = max(0.0, self._cooldown_until - now)
+            self._condition.notify_all()
+            return active_cooldown
 
     def acquire(self, reserved_tokens: int) -> tuple[_RateLimitReservation, float]:
         """Acquire budget capacity for one API call.
@@ -120,7 +169,8 @@ class _SharedRateLimiter:
                     now=now,
                     reserved_tokens=reserved_tokens,
                 )
-                wait_seconds = max(request_wait, token_wait)
+                cooldown_wait = self._cooldown_wait_seconds(now=now)
+                wait_seconds = max(request_wait, token_wait, cooldown_wait)
 
                 if wait_seconds <= 0.0:
                     self._request_timestamps.append(now)
@@ -192,6 +242,10 @@ class _SharedRateLimiter:
         """Return used plus provisional tokens in the current window."""
         completed_tokens = sum(tokens for _ts, tokens in self._token_events)
         return completed_tokens + self._provisional_tokens
+
+    def _cooldown_wait_seconds(self, now: float) -> float:
+        """Return remaining shared cooldown wait time."""
+        return max(0.0, self._cooldown_until - now)
 
 
 @dataclass(slots=True)
@@ -266,11 +320,24 @@ class OpenAIChatClient:
                 logger.critical(msg)
                 raise RuntimeError(msg)
 
+        self._initialise_openai_client()
+        logger.debug("OpenAIChatClient initialised with model %s", self.model)
+
+    def _initialise_openai_client(self) -> None:
+        """Initialise one OpenAI SDK client instance."""
         self.client = OpenAI(
             timeout=self.timeout_seconds,
             max_retries=0,
         )
-        logger.debug("OpenAIChatClient initialised with model %s", self.model)
+
+    def _refresh_api_client_transport(self) -> None:
+        """Refresh the OpenAI SDK client transport after parse failures."""
+        if self.use_dummy:
+            return
+        self._initialise_openai_client()
+        logger.warning(
+            "[openai_client] refreshed OpenAI SDK client transport after parse-body bad request",
+        )
 
     def call(
         self,
@@ -337,12 +404,16 @@ class OpenAIChatClient:
             raise ModelCallRetriesExhaustedError(
                 attempts=1,
                 last_error=exc,
+                last_status_code=self._status_code_from_error(exc),
+                is_parse_body_bad_request=False,
             ) from exc
 
         estimated_tokens = self._estimate_call_tokens(messages=messages)
+        attempt = 1
+        rate_limit_retry_started_at: float | None = None
 
-        for attempt_idx in range(self.retry_attempts + 1):
-            attempt = attempt_idx + 1
+        while True:
+            attempt_idx = attempt - 1
             if self.rate_limiter is None:
                 msg = "Rate limiter is not initialised."
                 raise RuntimeError(msg)
@@ -360,35 +431,105 @@ class OpenAIChatClient:
 
             start = time.perf_counter()
             try:
+                if self.client is None:
+                    msg = "OpenAI client is not initialised."
+                    raise RuntimeError(msg)
                 response = self.client.chat.completions.create(**kwargs)
             except APIStatusError as exc:
                 self.rate_limiter.finalise(
                     reservation=reservation,
                     actual_tokens=None,
                 )
+                parse_body_bad_request = self._is_parse_body_bad_request_status_error(
+                    error=exc,
+                )
                 if self._is_retryable_status_error(exc):
-                    if attempt > self.retry_attempts:
+                    is_rate_limit = self._is_rate_limit_status_error(exc)
+                    rate_limit_elapsed_seconds: float | None = None
+                    if is_rate_limit:
+                        now = time.monotonic()
+                        if rate_limit_retry_started_at is None:
+                            rate_limit_retry_started_at = now
+                        rate_limit_elapsed_seconds = max(
+                            0.0,
+                            now - rate_limit_retry_started_at,
+                        )
+                    retry_allowed = is_rate_limit or attempt <= self.retry_attempts
+                    if is_rate_limit and rate_limit_elapsed_seconds is not None:
+                        if rate_limit_elapsed_seconds > RATE_LIMIT_RETRY_WINDOW_SECONDS:
+                            retry_allowed = False
+                    if not retry_allowed:
+                        failure_extra_fields = dict(request_diagnostics)
+                        if rate_limit_elapsed_seconds is not None:
+                            failure_extra_fields.update(
+                                {
+                                    "rate_limit_retry_elapsed_seconds": round(
+                                        rate_limit_elapsed_seconds,
+                                        3,
+                                    ),
+                                    "rate_limit_retry_window_seconds": RATE_LIMIT_RETRY_WINDOW_SECONDS,
+                                }
+                            )
                         self._log_model_call_failed(
                             call_context=call_context,
                             error=exc,
                             attempts=attempt,
-                            extra_fields=request_diagnostics,
+                            extra_fields=failure_extra_fields,
                         )
                         raise ModelCallRetriesExhaustedError(
                             attempts=attempt,
                             last_error=exc,
+                            last_status_code=self._status_code_from_error(exc),
+                            is_parse_body_bad_request=parse_body_bad_request,
                         ) from exc
-                    delay_seconds = self._retry_delay_seconds(
+                    delay_seconds, retry_delay_source = self._retry_delay_seconds(
                         attempt_idx=attempt_idx,
                         error=exc,
                     )
+                    retry_extra_fields: dict[str, Any] = {
+                        "retry_delay_source": retry_delay_source,
+                    }
+                    if rate_limit_elapsed_seconds is not None:
+                        retry_extra_fields.update(
+                            {
+                                "rate_limit_retry_elapsed_seconds": round(
+                                    rate_limit_elapsed_seconds,
+                                    3,
+                                ),
+                                "rate_limit_retry_window_seconds": RATE_LIMIT_RETRY_WINDOW_SECONDS,
+                            }
+                        )
+                        active_cooldown = delay_seconds
+                        if self.rate_limiter is not None:
+                            active_cooldown = self.rate_limiter.register_cooldown(
+                                cooldown_seconds=delay_seconds,
+                            )
+                        self._log_model_call_cooldown(
+                            call_context=call_context,
+                            error=exc,
+                            attempt=attempt,
+                            cooldown_seconds=active_cooldown,
+                            cooldown_source=retry_delay_source,
+                        )
                     self._log_model_call_retry(
                         call_context=call_context,
                         error=exc,
                         attempt=attempt,
                         retry_delay_seconds=delay_seconds,
+                        extra_fields=retry_extra_fields,
                     )
+                    if parse_body_bad_request:
+                        try:
+                            self._refresh_api_client_transport()
+                        except Exception as refresh_exc:
+                            logger.warning(
+                                "[openai_client] OpenAI SDK transport refresh fails "
+                                "after parse-body bad request error_type=%s error_message=%s",
+                                type(refresh_exc).__name__,
+                                str(refresh_exc),
+                            )
                     time.sleep(delay_seconds)
+                    attempt += 1
                     continue
 
                 self._log_model_call_failed(
@@ -403,29 +544,85 @@ class OpenAIChatClient:
                     reservation=reservation,
                     actual_tokens=None,
                 )
-                if attempt > self.retry_attempts:
+                is_rate_limit = isinstance(exc, RateLimitError) or self._is_rate_limit_status_error(
+                    error=exc,
+                )
+                rate_limit_elapsed_seconds: float | None = None
+                if is_rate_limit:
+                    now = time.monotonic()
+                    if rate_limit_retry_started_at is None:
+                        rate_limit_retry_started_at = now
+                    rate_limit_elapsed_seconds = max(
+                        0.0,
+                        now - rate_limit_retry_started_at,
+                    )
+                retry_allowed = is_rate_limit or attempt <= self.retry_attempts
+                if is_rate_limit and rate_limit_elapsed_seconds is not None:
+                    if rate_limit_elapsed_seconds > RATE_LIMIT_RETRY_WINDOW_SECONDS:
+                        retry_allowed = False
+                if not retry_allowed:
+                    failure_extra_fields = dict(request_diagnostics)
+                    if rate_limit_elapsed_seconds is not None:
+                        failure_extra_fields.update(
+                            {
+                                "rate_limit_retry_elapsed_seconds": round(
+                                    rate_limit_elapsed_seconds,
+                                    3,
+                                ),
+                                "rate_limit_retry_window_seconds": RATE_LIMIT_RETRY_WINDOW_SECONDS,
+                            }
+                        )
                     self._log_model_call_failed(
                         call_context=call_context,
                         error=exc,
                         attempts=attempt,
-                        extra_fields=request_diagnostics,
+                        extra_fields=failure_extra_fields,
                     )
                     raise ModelCallRetriesExhaustedError(
                         attempts=attempt,
                         last_error=exc,
+                        last_status_code=self._status_code_from_error(exc),
+                        is_parse_body_bad_request=False,
                     ) from exc
 
-                delay_seconds = self._retry_delay_seconds(
+                delay_seconds, retry_delay_source = self._retry_delay_seconds(
                     attempt_idx=attempt_idx,
                     error=exc,
                 )
+                retry_extra_fields: dict[str, Any] = {
+                    "retry_delay_source": retry_delay_source,
+                }
+                if rate_limit_elapsed_seconds is not None:
+                    retry_extra_fields.update(
+                        {
+                            "rate_limit_retry_elapsed_seconds": round(
+                                rate_limit_elapsed_seconds,
+                                3,
+                            ),
+                            "rate_limit_retry_window_seconds": RATE_LIMIT_RETRY_WINDOW_SECONDS,
+                        }
+                    )
+                    active_cooldown = delay_seconds
+                    if self.rate_limiter is not None:
+                        active_cooldown = self.rate_limiter.register_cooldown(
+                            cooldown_seconds=delay_seconds,
+                        )
+                    self._log_model_call_cooldown(
+                        call_context=call_context,
+                        error=exc,
+                        attempt=attempt,
+                        cooldown_seconds=active_cooldown,
+                        cooldown_source=retry_delay_source,
+                    )
                 self._log_model_call_retry(
                     call_context=call_context,
                     error=exc,
                     attempt=attempt,
                     retry_delay_seconds=delay_seconds,
+                    extra_fields=retry_extra_fields,
                 )
                 time.sleep(delay_seconds)
+                attempt += 1
                 continue
             except Exception as exc:
                 self.rate_limiter.finalise(
@@ -518,7 +715,8 @@ class OpenAIChatClient:
         {"answers": [{"item_id": "...", "guess": "normal"}, ...]} where
         item identifiers are extracted from the prompt.
 
-        For teaching phases, it returns {"acknowledged": true}.
+        For teaching and rule-lock phases, it returns schema-matching
+        synthetic JSON objects.
 
         Args:
             messages: Full chat history including system, user and
@@ -575,7 +773,7 @@ class OpenAIChatClient:
         if call_type == "exam":
             exam_prompt = True
             detection_source = "call_context"
-        elif call_type == "teaching":
+        elif call_type in ("teaching", "rule_lock"):
             exam_prompt = False
             detection_source = "call_context"
         else:
@@ -610,30 +808,78 @@ class OpenAIChatClient:
             parsed = {"answers": answers}
         else:
             group_value = str((call_context or {}).get("group", "")).strip().upper()
-            if call_type == "teaching" and group_value == "E":
+            teaching_step_type = str(
+                (call_context or {}).get("teaching_step_type", ""),
+            ).strip().lower()
+            if call_type == "rule_lock":
+                parsed = {
+                    "locked_rule_of_thumb": (
+                        "Normal requires smooth SOC increase with smooth power behaviour. "
+                        "Abnormal requires abrupt spikes, dropouts or jagged transitions."
+                    ),
+                    "normal_cues": [
+                        "SOC rises smoothly",
+                        "power curve changes gradually",
+                    ],
+                    "abnormal_cues": [
+                        "abrupt spikes or drops",
+                        "repeated jagged oscillations",
+                    ],
+                    "exceptions": [
+                        "one mild transient can still be normal if remaining shape is smooth",
+                    ],
+                    "confidence": 0.72,
+                }
+                raw_text = json.dumps(parsed)
+            elif call_type == "teaching" and group_value == "E":
                 example_index = self._teaching_example_index(text_parts=text_parts)
                 if example_index is None:
                     example_index = 1
 
+                shared_rule = (
+                    "Normal requires smooth SOC increase with smooth power behaviour. "
+                    "Abnormal requires abrupt spikes, dropouts or jagged transitions."
+                )
                 if example_index == 1:
                     rule_action = "write"
-                    rule_of_thumb = (
-                        "The AI labels a charging session as abnormal when simplified "
-                        "power or SOC shows clear abrupt deviations from smooth behaviour."
-                    )
                 else:
-                    rule_action = "rephrase"
-                    rule_of_thumb = (
-                        "The AI tends to classify as abnormal when simplified power or "
-                        "SOC departs sharply from a smooth charging profile."
-                    )
+                    rule_action = "retain"
                 description_sentence = (
                     "The simplified power and SOC curves show one clear charging behaviour pattern."
                 )
                 parsed = {
                     "description_sentence": description_sentence,
                     "rule_action": rule_action,
-                    "rule_of_thumb": rule_of_thumb,
+                    "normal_cues": [
+                        "SOC rises smoothly",
+                        "power curve remains smooth",
+                    ],
+                    "abnormal_cues": [
+                        "abrupt spikes",
+                        "sharp dropouts",
+                    ],
+                    "rule_of_thumb": shared_rule,
+                }
+                raw_text = json.dumps(parsed)
+            elif call_type == "teaching" and teaching_step_type == "checkpoint":
+                parsed = {
+                    "acknowledged": True,
+                    "normal_cues": [
+                        "SOC rises steadily",
+                        "power curve is smooth",
+                    ],
+                    "abnormal_cues": [
+                        "abrupt spikes",
+                        "abrupt drops",
+                    ],
+                    "exceptions": [
+                        "single mild transition can remain normal",
+                    ],
+                    "confidence": 0.68,
+                    "rule_of_thumb": (
+                        "Normal when SOC and power evolve smoothly. "
+                        "Abnormal when abrupt transitions dominate."
+                    ),
                 }
                 raw_text = json.dumps(parsed)
             else:
@@ -869,45 +1115,153 @@ class OpenAIChatClient:
     def _is_retryable_status_error(self, error: APIStatusError) -> bool:
         """Return True for retryable status-code errors."""
         status_code = getattr(error, "status_code", None)
+        if status_code == 429:
+            return True
         if isinstance(status_code, int) and status_code >= 500:
+            return True
+        if self._is_parse_body_bad_request_status_error(error=error):
             return True
         return False
 
-    def _retry_delay_seconds(self, attempt_idx: int, error: Exception) -> float:
+    def _is_rate_limit_status_error(self, error: Exception) -> bool:
+        """Return True when one error represents an HTTP 429 rate limit."""
+        if isinstance(error, RateLimitError):
+            return True
+        return self._status_code_from_error(error) == 429
+
+    def _is_parse_body_bad_request_status_error(self, error: APIStatusError) -> bool:
+        """Return True when a 400 error reports an invalid JSON request body."""
+        status_code = self._status_code_from_error(error)
+        if status_code != 400:
+            return False
+
+        message = str(error).lower()
+        return any(hint in message for hint in PARSE_BODY_BAD_REQUEST_HINTS)
+
+    def _status_code_from_error(self, error: Exception) -> int | None:
+        """Extract HTTP status code from API errors when available."""
+        status_code = getattr(error, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        return None
+
+    def _error_diagnostics(self, error: Exception) -> dict[str, Any]:
+        """Build structured diagnostics for retry and failure events."""
+        parse_body_bad_request = False
+        if isinstance(error, APIStatusError):
+            parse_body_bad_request = self._is_parse_body_bad_request_status_error(
+                error=error,
+            )
+        return {
+            "error_status_code": self._status_code_from_error(error),
+            "error_is_parse_body_bad_request": parse_body_bad_request,
+        }
+
+    def _retry_delay_seconds(self, attempt_idx: int, error: Exception) -> tuple[float, str]:
         """Calculate retry backoff with jitter and Retry-After support."""
         backoff = self.retry_base_delay_seconds * (2 ** attempt_idx)
         capped = min(backoff, self.retry_max_delay_seconds)
         jitter = capped * self.retry_jitter_fraction * random.random()
         delay_seconds = capped + jitter
+        delay_source = "exponential_backoff"
 
-        retry_after = self._retry_after_seconds(error=error)
+        retry_after, retry_after_source = self._retry_after_seconds(error=error)
         if retry_after is not None:
-            delay_seconds = max(delay_seconds, retry_after)
+            if retry_after >= delay_seconds:
+                delay_seconds = retry_after
+                delay_source = retry_after_source or "retry_after"
 
-        return max(0.0, delay_seconds)
+        return max(0.0, delay_seconds), delay_source
 
-    def _retry_after_seconds(self, error: Exception) -> float | None:
-        """Extract Retry-After from API error headers when available."""
+    def _retry_after_seconds(self, error: Exception) -> tuple[float | None, str | None]:
+        """Extract one retry-after duration from headers or error text."""
         response = getattr(error, "response", None)
-        if response is None:
-            return None
+        now_unix_seconds = time.time()
+        if response is not None:
+            headers = getattr(response, "headers", None)
+            retry_after_header = self._header_lookup(
+                headers=headers,
+                key="retry-after",
+            )
+            if retry_after_header is not None:
+                retry_after_seconds = self._parse_retry_after_seconds_value(
+                    raw_value=retry_after_header,
+                    now_unix_seconds=now_unix_seconds,
+                )
+                if retry_after_seconds is not None:
+                    return retry_after_seconds, "retry-after-header"
 
-        headers = getattr(response, "headers", None)
-        if headers is None:
-            return None
+            for header_key in RATE_LIMIT_RESET_HEADER_KEYS:
+                header_value = self._header_lookup(headers=headers, key=header_key)
+                if header_value is None:
+                    continue
+                retry_after_seconds = self._parse_retry_after_seconds_value(
+                    raw_value=header_value,
+                    now_unix_seconds=now_unix_seconds,
+                )
+                if retry_after_seconds is not None:
+                    return retry_after_seconds, f"{header_key}-header"
 
-        value = headers.get("retry-after")
-        if value is None:
-            return None
+        match = RATE_LIMIT_RETRY_MESSAGE_PATTERN.search(str(error))
+        if match is None:
+            return None, None
 
         try:
-            retry_after = float(str(value).strip())
+            retry_after_seconds = float(match.group(1))
+        except ValueError:
+            return None, None
+
+        if retry_after_seconds < 0:
+            return None, None
+        return retry_after_seconds, "error-message"
+
+    def _header_lookup(self, headers: Any, key: str) -> Any | None:
+        """Lookup one HTTP header value using case-insensitive matching."""
+        if headers is None:
+            return None
+        value = headers.get(key)
+        if value is not None:
+            return value
+        key_lower = key.lower()
+        try:
+            header_items = headers.items()
+        except Exception:
+            return None
+        for header_key, header_value in header_items:
+            if str(header_key).lower() == key_lower:
+                return header_value
+        return None
+
+    def _parse_retry_after_seconds_value(
+        self,
+        raw_value: Any,
+        now_unix_seconds: float,
+    ) -> float | None:
+        """Parse one retry-after value from seconds, milliseconds or unix timestamp."""
+        text = str(raw_value).strip().lower().strip("\"'")
+        if not text:
+            return None
+        multiplier = 1.0
+        if text.endswith("ms"):
+            multiplier = 0.001
+            text = text[:-2].strip()
+        elif text.endswith("s"):
+            text = text[:-1].strip()
+
+        try:
+            numeric_value = float(text)
         except ValueError:
             return None
-
-        if retry_after < 0:
+        if not math.isfinite(numeric_value):
             return None
-        return retry_after
+
+        seconds = numeric_value * multiplier
+        if multiplier == 1.0 and numeric_value > 10_000_000:
+            seconds = numeric_value - now_unix_seconds
+
+        if seconds < 0:
+            return None
+        return seconds
 
     def _log_model_call_complete(
         self,
@@ -984,6 +1338,7 @@ class OpenAIChatClient:
         error: Exception,
         attempt: int,
         retry_delay_seconds: float,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         """Emit one structured retry event."""
         if self.event_logger is None:
@@ -1000,9 +1355,44 @@ class OpenAIChatClient:
                 "error_message": str(error),
             }
         )
+        if extra_fields is not None:
+            fields.update(extra_fields)
+        fields.update(self._error_diagnostics(error=error))
         self.event_logger.log(
             logger=logger,
             event="model.call.retry",
+            level=logging.WARNING,
+            **fields,
+        )
+
+    def _log_model_call_cooldown(
+        self,
+        call_context: dict[str, Any] | None,
+        error: Exception,
+        attempt: int,
+        cooldown_seconds: float,
+        cooldown_source: str,
+    ) -> None:
+        """Emit one structured cooldown event for rate-limit recovery."""
+        if self.event_logger is None:
+            return
+
+        fields = dict(call_context or {})
+        fields.update(
+            {
+                "status": "cooldown",
+                "mode": "dummy" if self.use_dummy else "api",
+                "attempt": attempt,
+                "cooldown_seconds": round(cooldown_seconds, 3),
+                "cooldown_source": cooldown_source,
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            }
+        )
+        fields.update(self._error_diagnostics(error=error))
+        self.event_logger.log(
+            logger=logger,
+            event="model.call.cooldown",
             level=logging.WARNING,
             **fields,
         )
@@ -1030,6 +1420,7 @@ class OpenAIChatClient:
                 "error_message": str(error),
             }
         )
+        fields.update(self._error_diagnostics(error=error))
         self.event_logger.log(
             logger=logger,
             event="model.call.failed",
