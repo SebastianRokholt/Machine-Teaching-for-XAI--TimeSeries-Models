@@ -8,3 +8,9 @@ version = "1.0.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["mt4xai", "mt4xai.*", "mllm_experiment", "mllm_experiment.*"]
+
+[project.scripts]
+mllm-run-trial = "mllm_experiment.run_trial:main"
+exp-build-teaching-sets = "mllm_experiment.build_teaching_sets:main"
+exp-build-exam-sets = "mllm_experiment.build_exam_sets:main"
