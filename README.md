@@ -14,8 +14,8 @@ The repository covers the full pipeline:
 - Charging curve simplification and curriculum-oriented teaching set construction.
 - Automated machine teaching experiment on multimodal LLMs
 
-Primary thesis draft:
-- `Docs/INF399___MT4XAI_Master_s_Project-12-03-2026.pdf`
+The thesis can be read at:
+- `Docs/INF399___MT4XAI_Master_s_Project.pdf`
 
 ## Repository Structure
 ```text
