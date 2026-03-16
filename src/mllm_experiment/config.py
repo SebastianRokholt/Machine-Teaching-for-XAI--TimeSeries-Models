@@ -5,7 +5,7 @@ from typing_extensions import Literal
 
 
 GroupEPostExamContextMode = Literal["rule_only"]
-GroupEPostExamTieBreaker = Literal["teaching_majority_label"]
+GroupEPostExamTieBreaker = Literal["closest_matching_pattern"]
 
 
 TEACHING_METADATA_FILENAME = "teaching_items.csv"
@@ -49,9 +49,6 @@ class ExperimentConfig:
         api_retry_base_delay_seconds: Base delay for exponential backoff.
         api_retry_max_delay_seconds: Maximum delay for exponential backoff.
         api_retry_jitter_fraction: Fractional jitter added to backoff.
-        group_e_retain_retry_attempts: Number of retries for one group E
-            teaching example when the response uses retain but changes the
-            rule-of-thumb.
         group_e_teaching_context_window_examples: Number of latest
             committed teaching examples retained in group E context.
         group_e_post_exam_context_mode: Group E post-exam memory mode.
@@ -82,11 +79,10 @@ class ExperimentConfig:
     api_retry_base_delay_seconds: float = 2.0
     api_retry_max_delay_seconds: float = 120.0
     api_retry_jitter_fraction: float = 0.2
-    group_e_retain_retry_attempts: int = 4
     group_e_teaching_context_window_examples: int = 5
     group_e_post_exam_context_mode: GroupEPostExamContextMode = "rule_only"
     group_e_post_exam_rule_max_chars: int = 1000
-    group_e_post_exam_tie_breaker: GroupEPostExamTieBreaker = "teaching_majority_label"
+    group_e_post_exam_tie_breaker: GroupEPostExamTieBreaker = "closest_matching_pattern"
     logfile_path: Path | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
@@ -127,9 +123,6 @@ class ExperimentConfig:
         if self.api_retry_jitter_fraction < 0:
             msg = "api_retry_jitter_fraction must be 0 or greater."
             raise ValueError(msg)
-        if self.group_e_retain_retry_attempts < 0:
-            msg = "group_e_retain_retry_attempts must be 0 or greater."
-            raise ValueError(msg)
         if self.group_e_teaching_context_window_examples < 0:
             msg = "group_e_teaching_context_window_examples must be 0 or greater."
             raise ValueError(msg)
@@ -145,10 +138,10 @@ class ExperimentConfig:
         if self.group_e_post_exam_rule_max_chars > 1000:
             msg = "group_e_post_exam_rule_max_chars must be less than or equal to 1000."
             raise ValueError(msg)
-        if self.group_e_post_exam_tie_breaker not in ("teaching_majority_label",):
+        if self.group_e_post_exam_tie_breaker not in ("closest_matching_pattern",):
             msg = (
                 "group_e_post_exam_tie_breaker must be one of: "
-                "teaching_majority_label."
+                "closest_matching_pattern."
             )
             raise ValueError(msg)
         if self.post_exam_batch_size <= 0:
