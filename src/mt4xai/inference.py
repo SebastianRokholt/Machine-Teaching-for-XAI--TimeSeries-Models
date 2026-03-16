@@ -14,7 +14,7 @@ import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch import nn
 from .model import horizon_weights
-from .data import SessionPredsBundle, ChargingSessionDataset, reconstruct_abs_from_bundle, session_collate_fn
+from .data import SessionPredsBundle, ChargingSessionDataset, reconstruct_abs_from_bundle, session_collate_fn, build_loader
 
 _RWSE_CACHE: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
 _EPS: float = 1e-8
@@ -345,6 +345,9 @@ def fit_rwse_robust_scalers(
     horizon: int,
     t_min_eval: int = 1,
     session_ids: Iterable[int] | None = None,
+    soc_scaler: MinMaxScaler | None = None,
+    idx_soc_inp: int | None = None,
+    cache_key: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fits robust location and scale parameters for RWSE on power residuals.
 
@@ -363,6 +366,9 @@ def fit_rwse_robust_scalers(
         horizon: forecast horizon H.
         t_min_eval: minimum time index t included in the residuals.
         session_ids: optional subset of charging ids to use.
+        soc_scaler: optional MinMaxScaler for SOC. Used for bundle construction only.
+        idx_soc_inp: optional index of soc in the input feature vector. Used for bundle construction only.
+        cache_key: optional compatibility key. It is currently ignored.
 
     Returns:
         m: median of residuals for the power channel, shape (1,).
@@ -372,8 +378,13 @@ def fit_rwse_robust_scalers(
         session_ids = list(list_unique_session_ids(df_scaled))
     else:
         session_ids = list(map(int, session_ids))
+    _ = cache_key
 
     resid_all: list[np.ndarray] = []
+    # RWSE uses power residuals only. These fallbacks satisfy bundle construction when
+    # soc metadata is intentionally not supplied by callers.
+    soc_scaler_eff = soc_scaler if soc_scaler is not None else power_scaler
+    idx_soc_inp_eff = idx_soc_inp if idx_soc_inp is not None else idx_power_inp
 
     for sid in session_ids:
         bundle = make_bundle_from_session_df(
@@ -384,26 +395,17 @@ def fit_rwse_robust_scalers(
             input_features=input_features,
             target_features=target_features,
             horizon=horizon,
-        )
-
-        # single-session batch for reuse of reconstruction helper
-        X = bundle.X_sample.unsqueeze(0)          # [1, T, C_in]
-        P_res = bundle.P_sample.unsqueeze(0)      # [1, T, H, 1]
-        Y_res = bundle.Y_sample.unsqueeze(0)      # [1, T, H, 1]
-        lengths = torch.tensor([bundle.length], dtype=torch.long)
-
-        P_abs, Y_abs = reconstruct_abs_from_residuals_batch(
-            X_batch=X,
-            P_batch=P_res,
-            Y_batch=Y_res,
-            lengths=lengths,
+            power_scaler=power_scaler,
+            soc_scaler=soc_scaler_eff,
             idx_power_inp=idx_power_inp,
-            power_min=float(power_scaler.data_min_[0]),
-            power_max=float(power_scaler.data_max_[0]),
+            idx_soc_inp=idx_soc_inp_eff,
         )
-        # drop batch and channel dims -> [T_common, H]
-        P = P_abs[0, :, :, 0].cpu().numpy()
-        Y = Y_abs[0, :, :, 0].cpu().numpy()
+
+        P, Y = _reconstruct_bundle_power_abs_kw(
+            bundle=bundle,
+            power_scaler=power_scaler,
+            idx_power_inp=idx_power_inp,
+        )
 
         if P.shape[0] <= t_min_eval:
             continue
@@ -424,6 +426,45 @@ def fit_rwse_robust_scalers(
     # avoid zero MAD which would blow up scaling
     mad = np.where(mad < 1e-6, 1.0, mad)
     return m.astype(float), mad.astype(float)
+
+
+def _reconstruct_bundle_power_abs_kw(
+    bundle: SessionPredsBundle,
+    power_scaler: MinMaxScaler,
+    idx_power_inp: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reconstructs absolute power predictions and targets in kW for one session bundle."""
+    X = bundle.X_sample.unsqueeze(0)      # [1, T, C_in]
+    P_res = bundle.P_sample.unsqueeze(0)  # [1, T, H, 1]
+    Y_res = bundle.Y_sample.unsqueeze(0)  # [1, T, H, 1]
+
+    if P_res.dim() == 3:
+        P_res = P_res.unsqueeze(-1)
+    if Y_res.dim() == 3:
+        Y_res = Y_res.unsqueeze(-1)
+
+    P_abs_scaled = reconstruct_abs_from_residuals_batch(
+        P_res=P_res,
+        X=X,
+        idx_power=idx_power_inp,
+        idx_soc=None,
+    )
+    if P_abs_scaled.dim() == 3:
+        P_abs_scaled = P_abs_scaled.unsqueeze(-1)
+
+    base_power = X[..., [idx_power_inp]].unsqueeze(2)  # [1, T, 1, 1]
+    Y_abs_scaled = base_power + Y_res
+
+    T_common = min(P_abs_scaled.shape[1], Y_abs_scaled.shape[1])
+    if T_common <= 0:
+        return np.zeros((0, bundle.horizon), dtype=float), np.zeros((0, bundle.horizon), dtype=float)
+
+    P_scaled = P_abs_scaled[0, :T_common, :, 0].detach().cpu().numpy()
+    Y_scaled = Y_abs_scaled[0, :T_common, :, 0].detach().cpu().numpy()
+
+    P_kw = power_scaler.inverse_transform(P_scaled.reshape(-1, 1)).reshape(P_scaled.shape)
+    Y_kw = power_scaler.inverse_transform(Y_scaled.reshape(-1, 1)).reshape(Y_scaled.shape)
+    return P_kw, Y_kw
 
 
 def rwse_score_from_bundle(
@@ -462,22 +503,11 @@ def rwse_score_from_bundle(
     if T <= t_min_eval + 1:
         return 0.0, 0
 
-    X = bundle.X_sample.unsqueeze(0)         # [1, T, C_in]
-    P_res = bundle.P_sample.unsqueeze(0)     # [1, T, H, 1]
-    Y_res = bundle.Y_sample.unsqueeze(0)     # [1, T, H, 1]
-    lengths = torch.tensor([bundle.length], dtype=torch.long)
-
-    P_abs, Y_abs = reconstruct_abs_from_residuals_batch(
-        X_batch=X,
-        P_batch=P_res,
-        Y_batch=Y_res,
-        lengths=lengths,
+    P, Y = _reconstruct_bundle_power_abs_kw(
+        bundle=bundle,
+        power_scaler=power_scaler,
         idx_power_inp=idx_power_inp,
-        power_min=float(power_scaler.data_min_[0]),
-        power_max=float(power_scaler.data_max_[0]),
     )
-    P = P_abs[0, :, :, 0].cpu().numpy()   # [T_common, H]
-    Y = Y_abs[0, :, :, 0].cpu().numpy()
 
     if P.shape[0] <= t_min_eval:
         return 0.0, 0
@@ -511,14 +541,17 @@ def compute_session_RWSE(
     input_features: list[str],
     target_features: list[str],
     power_scaler: MinMaxScaler,
-    idx_power_inp: int,
-    m: np.ndarray,
-    mad: np.ndarray,
-    horizon: int,
+    *args,
+    idx_power_inp: int | None = None,
+    m: np.ndarray | None = None,
+    mad: np.ndarray | None = None,
+    horizon: int | None = None,
     horizon_weights_decay: float = 0.4,
     cap: float = 5.0,
     t_min_eval: int = 1,
     session_ids: Iterable[int] | None = None,
+    soc_scaler: MinMaxScaler | None = None,
+    idx_soc_inp: int | None = None,
 ) -> pd.DataFrame:
     """Computes RWSE per charging session for a power-only residual model.
 
@@ -537,10 +570,54 @@ def compute_session_RWSE(
         cap: cap on |scaled residual| in RWSE.
         t_min_eval: minimum time index t used in the score.
         session_ids: optional subset of charging ids to evaluate.
+        soc_scaler: optional MinMaxScaler for SOC. Used for bundle construction only.
+        idx_soc_inp: optional index of soc in the input feature vector. Used for bundle construction only.
 
     Returns:
         DataFrame with columns: charging_id, length, error (RWSE).
     """
+    if args:
+        if idx_power_inp is None:
+            if len(args) >= 6 and not isinstance(args[0], (int, np.integer)):
+                # Legacy positional layout:
+                # (soc_scaler, idx_power_inp, idx_soc_inp, m, mad, horizon[, decay, cap, t_min_eval, session_ids])
+                soc_scaler = args[0]
+                idx_power_inp = int(args[1])
+                idx_soc_inp = int(args[2])
+                m = args[3]
+                mad = args[4]
+                horizon = int(args[5])
+                rem = args[6:]
+            else:
+                if len(args) < 4:
+                    raise TypeError(
+                        "compute_session_RWSE positional layout requires at least "
+                        "idx_power_inp, m, mad and horizon."
+                    )
+                # Current positional layout:
+                # (idx_power_inp, m, mad, horizon[, decay, cap, t_min_eval, session_ids])
+                idx_power_inp = int(args[0])
+                m = args[1]
+                mad = args[2]
+                horizon = int(args[3])
+                rem = args[4:]
+
+            if len(rem) >= 1:
+                horizon_weights_decay = float(rem[0])
+            if len(rem) >= 2:
+                cap = float(rem[1])
+            if len(rem) >= 3:
+                t_min_eval = int(rem[2])
+            if len(rem) >= 4:
+                session_ids = rem[3]
+        else:
+            raise TypeError("compute_session_RWSE received incompatible positional arguments.")
+
+    if idx_power_inp is None or m is None or mad is None or horizon is None:
+        raise TypeError(
+            "compute_session_RWSE requires idx_power_inp, m, mad and horizon."
+        )
+
     rows: list[dict] = []
 
     if not session_ids:
@@ -549,6 +626,8 @@ def compute_session_RWSE(
         session_ids = list(map(int, session_ids))
 
     w_h = make_horizon_weights(horizon, decay=horizon_weights_decay)
+    soc_scaler_eff = soc_scaler if soc_scaler is not None else power_scaler
+    idx_soc_inp_eff = idx_soc_inp if idx_soc_inp is not None else idx_power_inp
 
     for sid in session_ids:
         bundle = make_bundle_from_session_df(
@@ -559,6 +638,10 @@ def compute_session_RWSE(
             input_features=input_features,
             target_features=target_features,
             horizon=horizon,
+            power_scaler=power_scaler,
+            soc_scaler=soc_scaler_eff,
+            idx_power_inp=idx_power_inp,
+            idx_soc_inp=idx_soc_inp_eff,
         )
         s, L = rwse_score_from_bundle(
             bundle=bundle,
@@ -587,9 +670,11 @@ def compute_session_MRMSE(
     loader: Iterable[Tuple[List[int], Tensor, Tensor, Tensor]],
     device: torch.device,
     power_scaler: MinMaxScaler,
-    idx_power_inp: int,
-    t_min_eval: int,
-    horizon_weights_decay: float,
+    *args,
+    idx_power_inp: int | None = None,
+    t_min_eval: int = 1,
+    horizon_weights_decay: float = 0.4,
+    **kwargs,
 ) -> pd.DataFrame:
     """computes per-session macro-RMSE (kW) for a single-target power forecaster.
 
@@ -611,6 +696,36 @@ def compute_session_MRMSE(
     returns:
         dataframe with columns ["charging_id", "error", "length"].
     """
+    # Accepts both new and legacy call patterns.
+    _ = kwargs.pop("soc_scaler", None)
+    _ = kwargs.pop("power_weight", None)
+    _ = kwargs.pop("idx_soc_inp", None)
+
+    if args:
+        if len(args) >= 5 and idx_power_inp is None:
+            # Legacy positional layout:
+            # (soc_scaler, power_weight, idx_power_inp, idx_soc_inp, t_min_eval[, horizon_weights_decay])
+            idx_power_inp = int(args[2])
+            t_min_eval = int(args[4])
+            if len(args) >= 6:
+                horizon_weights_decay = float(args[5])
+        elif idx_power_inp is None:
+            # Current positional layout:
+            # (idx_power_inp[, t_min_eval[, horizon_weights_decay]])
+            idx_power_inp = int(args[0])
+            if len(args) >= 2:
+                t_min_eval = int(args[1])
+            if len(args) >= 3:
+                horizon_weights_decay = float(args[2])
+        else:
+            raise TypeError("compute_session_MRMSE received incompatible positional arguments.")
+
+    if kwargs:
+        bad = ", ".join(sorted(kwargs.keys()))
+        raise TypeError(f"compute_session_MRMSE got unexpected keyword arguments: {bad}")
+    if idx_power_inp is None:
+        raise TypeError("compute_session_MRMSE requires idx_power_inp.")
+
     model.eval()
     rows: list[dict[str, float | int]] = []
 
@@ -688,50 +803,10 @@ def compute_session_MRMSE(
     return pd.DataFrame(rows)
 
 
-def compute_session_RWSE(model, df_scaled: pd.DataFrame, 
-                         device, input_features: list[str], target_features: list[str], 
-                         power_scaler, soc_scaler, idx_power_inp: int, idx_soc_inp: int, m: np.ndarray, 
-                         mad: np.ndarray, horizon: int, horizon_weights_decay: float=0.4, 
-                         cap: float = 5.0, t_min_eval: int = 1, 
-                         session_ids: Iterable[int] | None = None) -> pd.DataFrame:
-    """Return a DataFrame with columns: charging_id, length, error (RWSE)."""
-    rows: list[dict] = []
-
-    if not session_ids:
-        session_ids = list(list_unique_session_ids(df_scaled))
-    else: 
-        session_ids = list(map(int, session_ids))
-
-    # Calculate horizon and feature weights
-    w_h = make_horizon_weights(horizon, decay=horizon_weights_decay)
-    w_c = make_feature_weights(target_features)
-
-    for sid in session_ids:
-        b = make_bundle_from_session_df(
-            model=model, df_scaled=df_scaled, sid=int(sid), device=device,
-            input_features=input_features, target_features=target_features, horizon=horizon,
-            power_scaler=power_scaler, soc_scaler=soc_scaler,
-            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp)
-        s, L = rwse_score_from_bundle(
-            b, m, mad,
-            power_scaler=power_scaler, soc_scaler=soc_scaler,
-            idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp,
-            w_h=w_h, w_c=w_c, cap=cap, t_min_eval=t_min_eval,
-        )
-        rows.append({"charging_id": int(sid), "length": int(L), "error": float(s)})
-    return pd.DataFrame(rows)
-
-
 def make_horizon_weights(H: int, decay: float = 0.4) -> np.ndarray:
     """Returns length-H exponential horizon weights that sum to 1."""
     w = np.exp(-decay * np.arange(int(H), dtype=float))
     return (w / w.sum()).astype(float)
-
-def make_feature_weights(target_features: list[str]) -> np.ndarray:
-    """Returns uniform feature weights over target features that sum to 1."""
-    C = int(len(target_features))
-    return np.ones(C, dtype=float) / float(C)
-
 
 def compute_bundle_error(bundle: SessionPredsBundle,
                          power_scaler, soc_scaler,
@@ -809,47 +884,49 @@ def classify_session(
     t_min_eval: int = 1, # currently matched by macro_rmse_per_session's behaviour
     threshold: float = 10.0,
 ) -> tuple[int, float]:
-    """Classify a single session as normal (0) or abnormal (1) using Macro-RMSE.
+    """Classifies one session using the standard macro-RMSE pipeline.
 
-    Works for power-only or power+SOC models; only the power channel contributes
-    to the error. The decision rule is error > threshold.
+    This helper delegates scoring to compute_session_MRMSE on a one-session
+    loader, so it follows the same semantics as notebook-wide scoring.
+    power_weight, soc_scaler, and idx_soc_inp remain compatibility parameters
+    for existing call sites and are currently ignored.
     """
-    # build a prediction bundle for this session
-    bundle = make_bundle_from_session_df(
-        model=model, df_scaled=df_scaled, sid=int(sid), device=device,
-        input_features=input_features, target_features=target_features, horizon=horizon,
-        power_scaler=power_scaler, soc_scaler=soc_scaler,
-        idx_power_inp=idx_power_inp, idx_soc_inp=idx_soc_inp
+    sid_int = int(sid)
+    _ = power_weight
+    _ = soc_scaler
+    _ = idx_soc_inp
+
+    if "charging_id" not in df_scaled.columns:
+        raise ValueError("df_scaled must include a 'charging_id' column.")
+
+    df_one = df_scaled.loc[df_scaled["charging_id"] == sid_int].copy()
+    if df_one.empty:
+        raise ValueError(f"session_id {sid_int} is not present in df_scaled.")
+
+    loader_one = build_loader(
+        df_one,
+        input_features=input_features,
+        target_features=target_features,
+        horizon=horizon,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
     )
 
-    X = bundle.X_sample  # (T,F)
-    Y_res = bundle.Y_sample  # (T,H,C)
-    P_res = bundle.P_sample  # (T,H,C)
-
-    if Y_res.ndim == 2:
-        Y_res = Y_res[..., None]
-    if P_res.ndim == 2:
-        P_res = P_res[..., None]
-
-    T, H, C = Y_res.shape
-
-    # absolute preds/targets in scaled space for power channel only
-    base_power = X[:, idx_power_inp].unsqueeze(-1).unsqueeze(1)   # (T,1,1)
-    Y_abs_scaled = base_power + Y_res[..., 0:1]   # (T,H,1)
-    P_abs_scaled = base_power + P_res[..., 0:1]  
-
-    # wrap to batch dimension for reuse of macro_rmse_per_session
-    P_abs_b = P_abs_scaled.unsqueeze(0)  # (1,T,H,1)
-    Y_abs_b = Y_abs_scaled.unsqueeze(0)  
-    lengths = torch.tensor([T], dtype=torch.long)
-
-    power_min = torch.tensor(float(power_scaler.data_min_[0]))
-    power_max = torch.tensor(float(power_scaler.data_max_[0]))
-
-    err_tensor = macro_rmse_per_session(
-        P_abs_b, Y_abs_b, lengths, power_min, power_max, decay, t_min_eval
+    df_err = compute_session_MRMSE(
+        model=model,
+        loader=loader_one,
+        device=device,
+        power_scaler=power_scaler,
+        idx_power_inp=idx_power_inp,
+        t_min_eval=t_min_eval,
+        horizon_weights_decay=decay,
     )
-    error = float(err_tensor[0].item())
+    if df_err.empty:
+        raise ValueError(
+            f"macro-RMSE computation produced no rows for session_id {sid_int}."
+        )
+
+    error = float(df_err["error"].iloc[0])
     label = int(error > float(threshold))
     return label, error
-
