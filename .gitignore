@@ -31,7 +31,6 @@ Data/exam_teaching_pool/*
 *.csv
 
 # Models
-/Models
 bohb_*_tuning*/
 
 # Notebook backups
