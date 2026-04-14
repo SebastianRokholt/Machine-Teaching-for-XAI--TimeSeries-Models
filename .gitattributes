@@ -1,0 +1,2 @@
+Data/etron55-charging-sessions-public.parquet filter=lfs diff=lfs merge=lfs -text
+Data/etron55-charging-sessions-public-processed.parquet filter=lfs diff=lfs merge=lfs -text
