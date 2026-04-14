@@ -1,5 +1,6 @@
 # Environment vars
 *.env
+!example.env
 
 # Python stuff
 venv/
