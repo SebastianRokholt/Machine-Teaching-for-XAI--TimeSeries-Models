@@ -15,6 +15,8 @@ Data/map_data_for_plotting/
 Data/teaching_pool/*
 Data/exam_teaching_pool/*
 *.parquet
+!Data/etron55-charging-sessions-public.parquet
+!Data/etron55-charging-sessions-public-processed.parquet
 *.png
 *.gif
 *.cpg
@@ -29,6 +31,16 @@ Data/exam_teaching_pool/*
 *.db-wal
 *.db-shm
 *.csv
+*Zone.Identifier
+!Docs/Diagrams/MT4XAI Experimental System Pipeline Diagram.png
+!Docs/Diagrams/MT4XAI Pipeline with Detailed Teaching Set Construction Diagram.png
+!Docs/Diagrams/MT4XAI Target Production System Pipeline Diagram.png
+!Docs/Example Images/LSTM-forecast-session-10574479.png
+!Docs/Example Images/Interactive-simplification-plot.png
+!Docs/Example Images/LSTM-forecast-session-10574479.png
+!Docs/Example Images/A_ex_59_abnormal_k2__4499048.png
+!Docs/Example Images/A_ex_5_normal_k2__11672841.png
+!Docs/Example Images/Interactive-anomaly-plot.png
 
 # Models
 bohb_*_tuning*/
