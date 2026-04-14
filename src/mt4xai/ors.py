@@ -20,27 +20,44 @@ from .inference import predict_residuals
 
 
 
+Stage1Mode = Literal["dp", "dp_prefix", "dp_prefix_v3", "rdp"]
+
+
 @dataclass
 class ORSParams:
-    """Configuration parameters for Optimal Robust Simplification (ORS).
+    """Stores configuration for Optimal Robust Simplification (ORS).
 
-    This dataclass separates parameters according to which Stage-1 generator uses them:
-    DP / DP-prefix only:
-      - dp_q: number of top-ranked pivot sets to keep in the heap (controls search breadth)
-      - dp_alpha: stage-1 weight on L2 error in α·err + β·k
-    RDP only:
-      - rdp_stage1_candidates: number of ε-probes (RDP runs) to try
-    Shared across all three modes:
-      - stage1_mode: which generator to use ("dp", "dp_prefix", "rdp")
-      - stage2_err_metric: metric for final selection in stage 2 of ORP ("l2" or "mrmse")
-      - beta, gamma: weights for k and fragility in the final objective
-      - R, epsilon_mode, epsilon_value: robustness sampling configuration
-      - seed, min_k, max_k, t_min_eval, model_id: misc. control parameters
-      - ...
-    
+    The stage-1 generator supports three DP variants:
+
+    - ``"dp"`` runs vanilla DP table construction and legacy ranking.
+    - ``"dp_prefix"`` runs the legacy prefix implementation kept for benchmarking.
+    - ``"dp_prefix_v3"`` runs the improved prefix implementation and is the default.
+    - ``"rdp"`` runs the heuristic RDP candidate generator.
+
+    Attributes:
+        stage1_mode: Stage-1 generator mode.
+        stage2_err_metric: Stage-2 error metric name.
+        dp_q: Number of top-ranked DP candidates kept in the heap.
+        dp_alpha: Stage-1 weight for L2 error in ``alpha * err + beta * k``.
+        rdp_stage1_candidates: Number of epsilon probes for Stage-1 RDP.
+        beta: Weight of segment count in objective.
+        gamma: Weight of fragility in objective.
+        R: Number of robustness perturbation samples.
+        epsilon_mode: Epsilon mode for robustness perturbation.
+        epsilon_value: Epsilon value in the selected mode.
+        random_seed: Random seed used in robustness sampling.
+        min_k: Lower segment-count bound for valid candidates.
+        max_k: Upper segment-count bound for valid candidates.
+        t_min_eval: First timestep included in classification evaluation.
+        anchor_endpoints: Endpoint policy for interpolation.
+        model_id: Optional model identifier used in metadata.
+        soc_stage1_mode: SOC simplification Stage-1 mode.
+        soc_rdp_epsilon: SOC RDP epsilon value.
+        soc_rdp_candidates: SOC RDP candidate count.
+        soc_rdp_eps_min: SOC RDP minimum epsilon.
+        soc_rdp_eps_max: SOC RDP maximum epsilon.
     """
-    # TODO: Finish docstring
-    stage1_mode: str = "dp_prefix"
+    stage1_mode: Stage1Mode = "dp_prefix_v3"
     stage2_err_metric: str = "l2"
     dp_q: int = 500
     dp_alpha: float = 0.01
@@ -305,6 +322,12 @@ def base_label_from_bundle(
 
 # ----------------------------------------- stage-1: dp and rdp ---------------------------------------- #
 
+# internal stage-1 candidate tuple:
+# (stage1_cost_es, pivot_indices, optional_pivot_values)
+# optional_pivot_values is used for candidates that cannot be represented
+# faithfully by y[pivots], such as both-ends single-line candidates.
+Stage1Candidate = Tuple[float, np.ndarray, Optional[np.ndarray]]
+
 def precompute_prefix_sums(y: np.ndarray) -> Tuple[np.ndarray, ...]:
     """Precompute prefix sums for O(1) segment SSE queries (DP-prefix)."""
     t = np.arange(len(y), dtype=float)
@@ -339,6 +362,42 @@ def line_through(i: int, yi: float, j: int, yj: float) -> Tuple[float, float]:
 def build_error_tables_with_prefix(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build err, err_left, err_right, err_all via prefix sums (DP-prefix)."""
     n = len(y)
+    S = precompute_prefix_sums(y)
+
+    err = np.zeros((n, n), dtype=float)
+    errL = np.zeros((n, n), dtype=float)
+    errR = np.zeros((n, n), dtype=float)
+    errA = np.zeros((n, n), dtype=float)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = line_through(i, y[i], j, y[j])
+            err[i, j] = seg_error_for_line(a, b, i, j, S)
+            # extended left [0..j]
+            errL[i, j] = seg_error_for_line(a, b, 0, j, S)
+            # extended right [i..n-1]
+            errR[i, j] = seg_error_for_line(a, b, i, n - 1, S)
+            # extended both ends [0..n-1]
+            errA[i, j] = seg_error_for_line(a, b, 0, n - 1, S)
+    return err, errL, errR, errA
+
+
+def build_error_tables_with_prefix_legacy(
+    y: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build err tables with the legacy prefix implementation.
+
+    This function keeps the historical v2 behaviour for benchmarking:
+    ``err`` uses prefix sums, while ``errL``, ``errR``, and ``errA`` use direct
+    summation over dense windows.
+
+    Args:
+        y: One-dimensional signal of length ``n``.
+
+    Returns:
+        Tuple of ``(err, errL, errR, errA)`` tables with shape ``(n, n)``.
+    """
+    n = len(y)
     t = np.arange(n, dtype=float)
     S = precompute_prefix_sums(y)
 
@@ -351,13 +410,10 @@ def build_error_tables_with_prefix(y: np.ndarray) -> Tuple[np.ndarray, np.ndarra
         for j in range(i + 1, n):
             a, b = line_through(i, y[i], j, y[j])
             err[i, j] = seg_error_for_line(a, b, i, j, S)
-            # extended left
             yhat = a * t[: j + 1] + b
             errL[i, j] = float(np.sum((y[: j + 1] - yhat) ** 2))
-            # extended right
             yhat = a * t[i:] + b
             errR[i, j] = float(np.sum((y[i:] - yhat) ** 2))
-            # extended both ends
             yhat = a * t + b
             errA[i, j] = float(np.sum((y - yhat) ** 2))
     return err, errL, errR, errA
@@ -392,9 +448,20 @@ def build_error_tables_no_prefix(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
     return err, errL, errR, errA
 
 
-def _dp_with_heaps_and_ranks(err: np.ndarray, errL: np.ndarray, errR: np.ndarray, errA: np.ndarray,
-                             alpha: float, beta: float, q: int) -> List[Tuple[float, np.ndarray]]:
-    """Stage-1 DP with heaps+ranks; returns top-q (cost_es, pivots)."""
+def _dp_with_heaps_and_ranks_legacy(
+    err: np.ndarray,
+    errL: np.ndarray,
+    errR: np.ndarray,
+    errA: np.ndarray,
+    alpha: float,
+    beta: float,
+    q: int,
+) -> List[Tuple[float, np.ndarray]]:
+    """Run the historical Stage-1 DP heap ranking.
+
+    This implementation keeps the original v1 and v2 behaviour, including
+    pseudo-pivot both-ends candidates represented as ``[0, k, n-1]``.
+    """
     n = err.shape[0]
     if n < 2:
         return [(0.0, np.array([0], dtype=int))]
@@ -411,6 +478,96 @@ def _dp_with_heaps_and_ranks(err: np.ndarray, errL: np.ndarray, errR: np.ndarray
         nonlocal uid
         uid += 1
         heapq.heappush(Hn, (float(cost), uid, int(i), int(r), tuple(int(x) for x in piv)))
+
+    for j in range(1, n):
+        Hj: List[Tuple[float, int, int, int, Tuple[int, ...]]] = []
+        cost0 = alpha * errL[0, j] + beta
+        push_Hj(Hj, cost0, 0, 0, np.array([0, j], dtype=int))
+
+        for i in range(1, j):
+            if not D[i]:
+                continue
+            prev_cost, prev_piv = D[i][0]
+            cost = prev_cost + alpha * err[i, j] + beta
+            push_Hj(Hj, cost, i, 1, np.append(prev_piv, j))
+
+        while Hj and len(D[j]) < q:
+            val, _, i, r, piv_t = heapq.heappop(Hj)
+            piv = np.array(piv_t, dtype=int)
+            D[j].append((float(val), piv))
+
+            if r >= 1 and r < len(D[i]):
+                next_prev_cost, next_prev_piv = D[i][r]
+                nxt_cost = next_prev_cost + alpha * err[i, j] + beta
+                push_Hj(Hj, nxt_cost, i, r + 1, np.append(next_prev_piv, j))
+
+    Hn: List[Tuple[float, int, int, int, Tuple[int, ...]]] = []
+    for i in range(1, n - 1):
+        if not D[i]:
+            continue
+        prev_cost, prev_piv = D[i][0]
+        cost = prev_cost + alpha * errR[i, n - 1] + beta
+        push_Hn(Hn, cost, i, 1, np.append(prev_piv, n - 1))
+
+    for i in range(0, n - 1):
+        for k in range(i + 1, n):
+            cost = alpha * errA[i, k] + beta
+            push_Hn(Hn, cost, -1, 0, np.array([0, k, n - 1], dtype=int))
+
+    finals: List[Tuple[float, np.ndarray]] = []
+    seen: set[Tuple[int, ...]] = set()
+    while Hn and len(finals) < q:
+        val, _, i, r, piv_t = heapq.heappop(Hn)
+        piv = np.array(piv_t, dtype=int)
+
+        piv = np.unique(np.clip(piv, 0, n - 1))
+        if piv[0] != 0:
+            piv = np.insert(piv, 0, 0)
+        if piv[-1] != n - 1:
+            piv = np.append(piv, n - 1)
+
+        key = tuple(piv.tolist())
+        if key not in seen:
+            finals.append((float(val), piv))
+            seen.add(key)
+
+        if i >= 1 and r < len(D[i]):
+            next_prev_cost, next_prev_piv = D[i][r]
+            nxt_cost = next_prev_cost + alpha * errR[i, n - 1] + beta
+            push_Hn(Hn, nxt_cost, i, r + 1, np.append(next_prev_piv, n - 1))
+
+    finals.sort(key=lambda x: x[0])
+    return finals[:q]
+
+
+def _dp_with_heaps_and_ranks_v3(
+    y: np.ndarray,
+    err: np.ndarray,
+    errL: np.ndarray,
+    errR: np.ndarray,
+    errA: np.ndarray,
+    alpha: float,
+    beta: float,
+    q: int,
+) -> List[Stage1Candidate]:
+    """Run Stage-1 DP heap ranking with cost-consistent both-ends candidates."""
+    n = err.shape[0]
+    if n < 2:
+        return [(0.0, np.array([0], dtype=int), None)]
+
+    D: List[List[Tuple[float, np.ndarray]]] = [[] for _ in range(n)]
+    uid = 0
+
+    def push_Hj(Hj, cost: float, i: int, r: int, piv: np.ndarray) -> None:
+        nonlocal uid
+        uid += 1
+        heapq.heappush(Hj, (float(cost), uid, int(i), int(r), tuple(int(x) for x in piv)))
+
+    def push_Hn(Hn, cost: float, i: int, r: int, piv: np.ndarray, vals: Optional[np.ndarray]) -> None:
+        nonlocal uid
+        uid += 1
+        vals_t = None if vals is None else tuple(float(v) for v in vals)
+        heapq.heappush(Hn, (float(cost), uid, int(i), int(r), tuple(int(x) for x in piv), vals_t))
 
     # D[j] build for j = 1..n-1
     for j in range(1, n):
@@ -445,54 +602,132 @@ def _dp_with_heaps_and_ranks(err: np.ndarray, errL: np.ndarray, errR: np.ndarray
             continue
         prev_cost, prev_piv = D[i][0]
         cost = prev_cost + alpha * errR[i, n - 1] + beta
-        push_Hn(Hn, cost, i, 1, np.append(prev_piv, n - 1))
+        push_Hn(Hn, cost, i, 1, np.append(prev_piv, n - 1), None)
 
-    # also consider single-line both-ends candidates
+    # both-ends single-line candidates with explicit endpoint values.
+    # this keeps stage-1 cost consistent with stage-2 reconstruction.
     for i in range(0, n - 1):
         for k in range(i + 1, n):
+            a, b = line_through(i, y[i], k, y[k])
             cost = alpha * errA[i, k] + beta
-            push_Hn(Hn, cost, -1, 0, np.array([0, k, n - 1], dtype=int))
+            vals = np.array([b, a * (n - 1) + b], dtype=float)
+            push_Hn(Hn, cost, -1, 0, np.array([0, n - 1], dtype=int), vals)
 
-    finals: List[Tuple[float, np.ndarray]] = []
-    seen: set[Tuple[int, ...]] = set()
+    finals: List[Stage1Candidate] = []
+    seen: set[Tuple] = set()
     while Hn and len(finals) < q:
-        val, _, i, r, piv_t = heapq.heappop(Hn)
+        val, _, i, r, piv_t, vals_t = heapq.heappop(Hn)
         piv = np.array(piv_t, dtype=int)
+        vals = None if vals_t is None else np.array(vals_t, dtype=float)
 
         piv = np.unique(np.clip(piv, 0, n - 1))
+        if vals is not None:
+            if piv.size != 2:
+                continue
         if piv[0] != 0:
             piv = np.insert(piv, 0, 0)
         if piv[-1] != n - 1:
             piv = np.append(piv, n - 1)
 
-        key = tuple(piv.tolist())
+        if vals is None:
+            key = ("piv", tuple(piv.tolist()))
+        else:
+            key = ("piv_vals", tuple(piv.tolist()), tuple(np.round(vals, 12).tolist()))
         if key not in seen:
-            finals.append((float(val), piv))
+            finals.append((float(val), piv, vals))
             seen.add(key)
 
         if i >= 1 and r < len(D[i]):
             next_prev_cost, next_prev_piv = D[i][r]
             nxt_cost = next_prev_cost + alpha * errR[i, n - 1] + beta
-            push_Hn(Hn, nxt_cost, i, r + 1, np.append(next_prev_piv, n - 1))
+            push_Hn(Hn, nxt_cost, i, r + 1, np.append(next_prev_piv, n - 1), None)
 
     finals.sort(key=lambda x: x[0])
     return finals[:q]
 
 
-def stage1_dp(y: np.ndarray, q: int, alpha: float, beta: float) -> List[Tuple[float, np.ndarray]]:
-    """Vanilla DP: build O(n^3) error tables; return top-q candidates under alpha*err + beta*k."""
+def stage1_dp(y: np.ndarray, q: int, alpha: float, beta: float) -> List[Stage1Candidate]:
+    """Run vanilla DP Stage-1 with legacy candidate semantics.
+
+    Args:
+        y: One-dimensional signal.
+        q: Number of top candidates to return.
+        alpha: Error weight in ``alpha * err + beta * k``.
+        beta: Segment-count weight in ``alpha * err + beta * k``.
+
+    Returns:
+        Ranked stage-1 candidates as ``(cost, pivots, values_or_none)``.
+    """
     if len(y) < 2:
-        return [(0.0, np.array([0], dtype=int))]
+        return [(0.0, np.array([0], dtype=int), None)]
     err, errL, errR, errA = build_error_tables_no_prefix(y)
-    return _dp_with_heaps_and_ranks(err, errL, errR, errA, alpha=alpha, beta=beta, q=q)
+    cands = _dp_with_heaps_and_ranks_legacy(
+        err,
+        errL,
+        errR,
+        errA,
+        alpha=alpha,
+        beta=beta,
+        q=q,
+    )
+    return [(float(cost), np.asarray(piv, dtype=int), None) for cost, piv in cands]
 
 
-def stage1_dp_prefix(y: np.ndarray, q: int, alpha: float, beta: float) -> List[Tuple[float, np.ndarray]]:
-    """Fast DP-prefix: same DP+heaps with prefix sums for O(1) segment SSE queries."""
+def stage1_dp_prefix(y: np.ndarray, q: int, alpha: float, beta: float) -> List[Stage1Candidate]:
+    """Run legacy DP-prefix Stage-1 kept for benchmarking.
+
+    This mode keeps the historical v2 behaviour and remains available so that
+    benchmark runs can compare v1, v2, and v3 in one module.
+
+    Args:
+        y: One-dimensional signal.
+        q: Number of top candidates to return.
+        alpha: Error weight in ``alpha * err + beta * k``.
+        beta: Segment-count weight in ``alpha * err + beta * k``.
+
+    Returns:
+        Ranked stage-1 candidates as ``(cost, pivots, values_or_none)``.
+    """
     if len(y) < 2:
-        return [(0.0, np.array([0], dtype=int))]
+        return [(0.0, np.array([0], dtype=int), None)]
+    err, errL, errR, errA = build_error_tables_with_prefix_legacy(y)
+    cands = _dp_with_heaps_and_ranks_legacy(
+        err,
+        errL,
+        errR,
+        errA,
+        alpha=alpha,
+        beta=beta,
+        q=q,
+    )
+    return [(float(cost), np.asarray(piv, dtype=int), None) for cost, piv in cands]
+
+
+def stage1_dp_prefix_v3(y: np.ndarray, q: int, alpha: float, beta: float) -> List[Stage1Candidate]:
+    """Run v3 DP-prefix Stage-1 with full prefix-sum table acceleration.
+
+    Args:
+        y: One-dimensional signal.
+        q: Number of top candidates to return.
+        alpha: Error weight in ``alpha * err + beta * k``.
+        beta: Segment-count weight in ``alpha * err + beta * k``.
+
+    Returns:
+        Ranked stage-1 candidates as ``(cost, pivots, values_or_none)``.
+    """
+    if len(y) < 2:
+        return [(0.0, np.array([0], dtype=int), None)]
     err, errL, errR, errA = build_error_tables_with_prefix(y)
-    return _dp_with_heaps_and_ranks(err, errL, errR, errA, alpha=alpha, beta=beta, q=q)
+    return _dp_with_heaps_and_ranks_v3(
+        y,
+        err,
+        errL,
+        errR,
+        errA,
+        alpha=alpha,
+        beta=beta,
+        q=q,
+    )
 
 
 def stage1_rdp(y: np.ndarray, stage1_candidates: int, beta: float) -> List[Tuple[float, np.ndarray]]:
@@ -526,16 +761,71 @@ def stage1_rdp(y: np.ndarray, stage1_candidates: int, beta: float) -> List[Tuple
     return out
 
 
-def ors_candidates(y: np.ndarray, params: ORSParams) -> Optional[List[Tuple[float, np.ndarray]]]:
-    """Dispatch Stage-1 candidate generation according to mode.
-    
-    The original ORS algorithm anchors the simplification to the first and last data point in the sequence. 
-    However, this is not optimal for our AD use case where model predictions for early t aren't y evaluated. 
-    This implementation optionally enforces an endpoint extrapolation technique for the early window t ∈ [0, t_min_eval). 
-    If the model is evaluated on whole-sequence prediction or ORSParams.anchor_endpoints = "both", candidates are generated
-    according to the ORS paper. If, however, ORSParams.t_min_eval > 0 and ORSParams.anchor_endpoints = "last", only the right 
-    endpoint is anchored. The left tail is extrapolated without a new pivot, i.e. the slope at t_min_eval is maintained towards the left. 
-    """
+def _eval_piecewise_with_linear_extrap(x: int, t: np.ndarray, y: np.ndarray) -> float:
+    """Evaluate piecewise linear curve with linear edge extrapolation at index x."""
+    xf = float(x)
+    if xf <= float(t[0]):
+        if t.size == 1 or int(t[1]) == int(t[0]):
+            return float(y[0])
+        m = (float(y[1]) - float(y[0])) / float(int(t[1]) - int(t[0]))
+        return float(y[0]) + m * (xf - float(t[0]))
+    if xf >= float(t[-1]):
+        if t.size == 1 or int(t[-1]) == int(t[-2]):
+            return float(y[-1])
+        m = (float(y[-1]) - float(y[-2])) / float(int(t[-1]) - int(t[-2]))
+        return float(y[-1]) + m * (xf - float(t[-1]))
+    return float(np.interp([xf], t.astype(float), y.astype(float))[0])
+
+
+def _postprocess_candidate(
+    piv_rel: np.ndarray,
+    values_rel: Optional[np.ndarray],
+    T: int,
+    offset: int,
+    anchor_endpoints: Literal["both", "last"],
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Shift candidate to absolute time and enforce endpoint policy with value consistency."""
+    p = np.asarray(piv_rel, dtype=int).reshape(-1) + int(offset)
+    v = None if values_rel is None else np.asarray(values_rel, dtype=float).reshape(-1)
+
+    if v is not None and p.size != v.size:
+        raise ValueError("pivot values must match pivot indices")
+
+    order = np.argsort(p, kind="stable")
+    p = p[order]
+    if v is not None:
+        v = v[order]
+
+    if v is None:
+        return _postprocess_pivots(p, T, 0, anchor_endpoints), None
+
+    dedup: Dict[int, float] = {}
+    for pi, vi in zip(p.tolist(), v.tolist()):
+        dedup[int(pi)] = float(vi)
+    p = np.array(sorted(dedup.keys()), dtype=int)
+    v = np.array([dedup[int(pi)] for pi in p], dtype=float)
+
+    if anchor_endpoints == "both" and (p.size == 0 or int(p[0]) != 0):
+        v0 = _eval_piecewise_with_linear_extrap(0, p, v)
+        p = np.r_[0, p]
+        v = np.r_[v0, v]
+
+    if p.size == 0 or int(p[-1]) != T - 1:
+        v_end = _eval_piecewise_with_linear_extrap(T - 1, p, v)
+        p = np.r_[p, T - 1]
+        v = np.r_[v, v_end]
+
+    p = np.clip(p, 0, T - 1).astype(int)
+    dedup2: Dict[int, float] = {}
+    for pi, vi in zip(p.tolist(), v.tolist()):
+        dedup2[int(pi)] = float(vi)
+    p = np.array(sorted(dedup2.keys()), dtype=int)
+    v = np.array([dedup2[int(pi)] for pi in p], dtype=float)
+    return p, v
+
+
+def _ors_candidates_with_values(y: np.ndarray, params: ORSParams) -> Optional[List[Stage1Candidate]]:
+    """Dispatch stage-1 candidate generation and preserve optional pivot values."""
     T = int(y.shape[0])
 
     # optionally slices original series to window where model predictions are evaluated
@@ -550,16 +840,42 @@ def ors_candidates(y: np.ndarray, params: ORSParams) -> Optional[List[Tuple[floa
         cand_rel = stage1_dp(piv_rel, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
     elif mode == "dp_prefix":
         cand_rel = stage1_dp_prefix(piv_rel, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
+    elif mode == "dp_prefix_v3":
+        cand_rel = stage1_dp_prefix_v3(piv_rel, q=params.dp_q, alpha=params.dp_alpha, beta=params.beta)
     elif mode == "rdp":
-        cand_rel = stage1_rdp(piv_rel, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
+        cands_plain = stage1_rdp(piv_rel, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
+        cand_rel = [(float(cost), np.asarray(piv, dtype=int), None) for cost, piv in cands_plain]
     else:
-        print(f"[ors] Warning: unknown stage1_mode: {params.stage1_mode}. Reverting to mode 'rdp'")
-        cand_rel = stage1_rdp(piv_rel, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
-    
-    # Shifts the relative pivots back to absolute time and enforce endpoint policy
-    cands_abs = [(float(cost), _postprocess_pivots(piv, T, offset, params.anchor_endpoints))
-                 for (cost, piv) in cand_rel]
+        print(
+            f"[ors] Warning: unknown stage1_mode: {params.stage1_mode}. "
+            "Valid modes are 'dp', 'dp_prefix', 'dp_prefix_v3', and 'rdp'. Reverting to mode 'rdp'."
+        )
+        cands_plain = stage1_rdp(piv_rel, stage1_candidates=params.rdp_stage1_candidates, beta=params.beta)
+        cand_rel = [(float(cost), np.asarray(piv, dtype=int), None) for cost, piv in cands_plain]
+
+    # shifts relative pivots back to absolute time and enforces endpoint policy
+    cands_abs: List[Stage1Candidate] = []
+    for cost, piv, vals in cand_rel:
+        p_abs, v_abs = _postprocess_candidate(
+            piv_rel=piv,
+            values_rel=vals,
+            T=T,
+            offset=offset,
+            anchor_endpoints=params.anchor_endpoints,
+        )
+        cands_abs.append((float(cost), p_abs, v_abs))
     return cands_abs
+
+
+def ors_candidates(y: np.ndarray, params: ORSParams) -> Optional[List[Tuple[float, np.ndarray]]]:
+    """Dispatch stage-1 candidate generation according to mode.
+
+    This public helper preserves the legacy return shape ``(cost, pivots)``.
+    """
+    cands = _ors_candidates_with_values(y, params)
+    if cands is None:
+        return None
+    return [(float(cost), piv) for (cost, piv, _vals) in cands]
 
 
 def _postprocess_pivots(piv_rel: np.ndarray, T: int, offset: int, anchor_endpoints: Literal["both","last"]) -> np.ndarray:
@@ -743,9 +1059,9 @@ def _epsilon_from_range(y_min: float, y_max: float, params: ORSParams) -> float:
         raise ValueError(f"unknown epsilon_mode: {params.epsilon_mode}")
 
 
-def _k_span(cands: Iterable[Tuple[float, np.ndarray]]) -> Tuple[Optional[int], Optional[int]]:
+def _k_span(cands: Iterable[Tuple]) -> Tuple[Optional[int], Optional[int]]:
     """Return (k_min, k_max) over a candidate iterable."""
-    ks = [int(len(p) - 1) for _, p in (cands or [])]
+    ks = [int(len(cand[1]) - 1) for cand in (cands or [])]
     return (min(ks), max(ks)) if ks else (None, None)
 
 
@@ -771,13 +1087,13 @@ def ors(bundle: SessionPredsBundle,
     """Run ORS end-to-end with fallbacks, keeping the label-consistency constraint.
 
     The pipeline:
-      1) Stage-1 candidate generation (DP/DP-prefix/RDP).
+      1) Stage-1 candidate generation (DP, legacy DP-prefix, v3 DP-prefix, or RDP).
       2) Base label on the original series.
       3) Filter candidates that do NOT keep the base label (constraint).
       4) Robustness estimation (uniform ±epsilon at pivots).
       5) Stage-2 selection with objective: alpha*err + beta*k + gamma*frag, where
-         - alpha = dp_alpha for DP modes; for RDP, alpha is implicit in stage-1
-           since its cost is l2 + beta*k (final selection still uses gamma*frag).
+         - alpha = dp_alpha for DP modes. For RDP, alpha is implicit in stage-1
+           because its cost is l2 + beta*k (final selection still uses gamma*frag).
 
     Fallbacks when no valid candidate survives the label/k filters:
       - Fallback #1: rerun Stage-1 with dp_q = dp_q * 2 (if DP mode) and beta = beta * 4.
@@ -821,7 +1137,7 @@ def ors(bundle: SessionPredsBundle,
 
 
     # ---- Stage-1 candidates (initial) ----
-    cands = ors_candidates(y, params)
+    cands = _ors_candidates_with_values(y, params)
     if cands is None:
         # explicit None: log + return degenerate k=1 for safety as requested
         print(f"[ORS][warn] sid={sid} got cands=None (mode={params.stage1_mode}, dp_q={params.dp_q}, "
@@ -853,16 +1169,17 @@ def ors(bundle: SessionPredsBundle,
             print(f"[ORS] warning: gamma={params.gamma:.4g} > gap d={d:.4g}; optimality not guaranteed. "
                   f"consider increasing dp_q or reducing gamma.")
 
-    def evaluate_candidates(cands_list: List[Tuple[float, np.ndarray]], p: ORSParams) -> Optional[Dict]:
+    def evaluate_candidates(cands_list: List[Stage1Candidate], p: ORSParams) -> Optional[Dict]:
         """evaluate stage-1 candidates under constraints; return best dict or None."""
         best: Optional[Dict] = None
-        for cost_es, piv in cands_list:
+        for cost_es, piv, piv_vals in cands_list:
             k = int(len(piv) - 1)
             if k < int(p.min_k) or k > int(p.max_k):
                 continue
 
+            knot_values = np.asarray(piv_vals, dtype=float) if piv_vals is not None else y[piv]
             sts = interpolate_from_pivots(
-                T, piv, y[piv], t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints
+                T, piv, knot_values, t_min_eval=p.t_min_eval, anchor_endpoints=p.anchor_endpoints
             )
             l2_err = float(np.sum((y - sts) ** 2))
 
@@ -934,10 +1251,10 @@ def ors(bundle: SessionPredsBundle,
           f"Trying fallback #1.")
 
     p_fb1 = replace(params, beta=params.beta * 4.0)
-    if params.stage1_mode in {"dp", "dp_prefix"}:
+    if params.stage1_mode in {"dp", "dp_prefix", "dp_prefix_v3"}:
         p_fb1 = replace(p_fb1, dp_q=max(1, params.dp_q * 2))
 
-    cands1 = ors_candidates(y, p_fb1)
+    cands1 = _ors_candidates_with_values(y, p_fb1)
     if cands1 is None:
         print(f"[ORS][warn] sid={sid} fallback #1 produced cands=None; proceeding to fallback #2.")
     else:
@@ -954,7 +1271,7 @@ def ors(bundle: SessionPredsBundle,
     rdp_count = max(200, 3 * (params.max_k - params.min_k + 1))
     p_fb2 = replace(params, stage1_mode="rdp", rdp_stage1_candidates=rdp_count)
 
-    cands2 = ors_candidates(y, p_fb2)
+    cands2 = _ors_candidates_with_values(y, p_fb2)
     if cands2 is None:
         print(f"[ORS][warn] sid={sid} fallback #2 (rdp) produced cands=None; giving up for this session.")
         return None

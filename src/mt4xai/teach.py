@@ -1030,7 +1030,7 @@ class TeachingPoolConfig:
     decay_lambda: Optional[float] = 0.2
     ors_params: ORSParams = field(
         default_factory=lambda: ORSParams(
-            stage1_mode="dp_prefix",
+            stage1_mode="dp_prefix_v3",
             stage2_err_metric="l2",
             dp_q=1000,
             rdp_stage1_candidates=100,
