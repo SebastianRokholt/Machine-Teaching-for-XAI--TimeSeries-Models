@@ -1,9 +1,13 @@
-# Machine Teaching for Explainable AI in Industry: A Novel Approach for Time Series Classifiers
-#### Machine-Teaching-for-XAI--TimeSeries-Models
+# Machine Teaching for Explainable AI in Industry
+### _A Novel Approach for Time Series Classifiers_
+_Master's thesis project in informatics (machine learning specialisation) 
 by Sebastian Einar Salas Røkholt
+at The University of Bergen
+Spring 2026
+Grade: A_
 
 ## Project Context
-This repository contains the implementation for the University of Bergen MSc thesis **Machine Teaching for Explainable AI in Industry: A Novel Approach for Time Series Classifiers** (March 2026).
+This repository contains the software implementation for the MSc thesis **Machine Teaching for Explainable AI in Industry: A Novel Approach for Time Series Classifiers**.
 
 The project builds an end to end MT4XAI pipeline for sequence level time series anomaly detection on EV charging sessions.
 
