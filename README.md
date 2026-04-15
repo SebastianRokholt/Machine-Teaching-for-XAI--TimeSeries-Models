@@ -1,15 +1,15 @@
-# Machine Teaching for Explainable AI in Industry
-### _A Novel Approach for Time Series Classifiers_
-_Master's thesis project in informatics (machine learning specialisation) 
-by Sebastian Einar Salas Røkholt
-at The University of Bergen
-Spring 2026
-Grade: A_
+# Machine Teaching for Explainable AI in Industry: </br>A Novel Approach for Time Series Classifiers
+_Master's thesis project in informatics (machine learning specialisation) </br>
+by Sebastian Einar Salas Røkholt_ </br>
+_Spring 2026_ </br>
 
 ## Project Context
-This repository contains the software implementation for the MSc thesis **Machine Teaching for Explainable AI in Industry: A Novel Approach for Time Series Classifiers**.
+This repository contains the software implementation for the MSc thesis paper titled _"Machine Teaching for Explainable AI in Industry: A Novel Approach for Time Series Classifiers"_, graded A in April 2026. 
+My thesis work is attached to "_[Machine Teaching for Explainable AI](https://xai.w.uib.no/)_" (MT4XAI), a joint research project between the Department of Informatics at the University of Bergen and The Valencian Research Institute for AI (VRAIN). 
 
-The project builds an end to end MT4XAI pipeline for sequence level time series anomaly detection on EV charging sessions.
+The scope of the the thesis project was to build an end-to-end MT4XAI pipeline for sequence level time series anomaly detection on electric vehicle (EV) charging sessions.
+It aims to answer the research question: _"How can techniques from MTXAI be applied to time series classifiers in order to generate simple, understandable and faithful explanations of model decisions in a real world industry setting?"_
+
 
 The implemented system currently covers:
 - forecasting based anomaly detection with LSTM and TCN modelling support
@@ -18,8 +18,7 @@ The implemented system currently covers:
 - machine teaching set construction with facility location selection and curriculum aware serving
 - MLLM based proxy learner experiments across conditions A to F
 
-Thesis PDF:
-- `Docs/INF399___MT4XAI_Master_s_Project.pdf`
+You can read the thesis paper here: [`Docs/INF399___MT4XAI_Master_s_Project.pdf`](https://github.com/SebastianRokholt/Machine-Teaching-for-XAI--TimeSeries-Models/blob/main/Docs/INF399___MT4XAI_Master_s_Project.pdf)
 
 ## Architecture and Pipeline
 This section documents the current and target pipeline architecture.
@@ -27,12 +26,12 @@ This section documents the current and target pipeline architecture.
 ### 1. MT4XAI Experimental System Pipeline Diagram (implemented)
 ![MT4XAI Experimental System Pipeline Diagram](Docs/Diagrams/MT4XAI%20Experimental%20System%20Pipeline%20Diagram.png)
 
-This diagram summarises the implemented offline experimental pipeline in this repository. Prepared charging session batches are used to train the forecasting model, select anomaly scoring configuration, generate ORS simplifications, construct teaching sets, and run the MLLM trial engine with groups A to F.
+This diagram summarises the implemented offline experimental pipeline in this repository. Most of these software components were implemented in Jupyter Notebooks (for ease of documentation) that heavily use assets from a shared Python package. An anonymised version of the dataset extracted from the database is available in the [`/Data/` folder](/Data). Prepared charging session batches are used to train the forecasting model, select anomaly scoring configuration, generate ORS simplifications, construct teaching sets, and run the MLLM trial engine with groups A to F.
 
 ### 2. MT4XAI Pipeline with Detailed Teaching Set Construction Diagram (implemented)
 ![MT4XAI Pipeline with Detailed Teaching Set Construction Diagram](Docs/Diagrams/MT4XAI%20Pipeline%20with%20Detailed%20Teaching%20Set%20Construction%20Diagram.png)
 
-This diagram expands the implemented teaching set flow. Simplification candidates are embedded, stratified by simplicity level and budget, then selected with a facility location objective to produce compact and diverse teaching sets used by conditions A to D, where group E reuses D assets and group F is a no teaching baseline.
+This diagram expands the implemented teaching set flow. Simplification candidates are embedded, stratified by simplicity level and budget, then selected with a facility location objective to produce compact and diverse teaching sets. The various teaching sets were used in the multimodal LLM experiment for experimental conditions/trial groups A to F. Trial group A-D use teaching sets A-D, respectively, while group E reuses D assets and group F gives the "no teaching"-baseline for hypothesis testing.
 
 ### 3. MT4XAI Target Production System Pipeline Diagram (future work)
 ![MT4XAI Target Production System Pipeline Diagram](Docs/Diagrams/MT4XAI%20Target%20Production%20System%20Pipeline%20Diagram.png)
@@ -72,7 +71,7 @@ Notebook execution is split into a reproducibility only step and a recommended m
 
 **Important**
 - `00__Data_Anonymisation.ipynb` depends on the private raw dataset and external weather APIs
-- readers without private raw data should start from `01__Data_Wrangling_and_FE.ipynb`
+- readers without private access to the PI-sensitive raw dataset should start from `01__Data_Wrangling_and_FE.ipynb`
 
 | Step | Notebook | Role in pipeline | Main outputs |
 |---|---|---|---|
